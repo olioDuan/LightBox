@@ -1,0 +1,42 @@
+Lightbox
+Copyright 2026 Lightbox Contributors
+
+This product is licensed under the Apache License, Version 2.0.
+
+========================================================================
+Third-Party Components and Notices
+========================================================================
+
+The following third-party components may be dynamically linked, bundled
+via Python wheels, or installed as optional extras:
+
+1. rawpy / LibRaw
+   - rawpy Python bindings: MIT License
+   - Bundled LibRaw library: LGPL-2.1-only OR CDDL-1.0
+   - https://www.libraw.org/
+
+2. InsightFace (antelopev2: det_10g.onnx / glintr100.onnx)
+   - Codebase license: MIT License
+   - Pretrained model weights: non-commercial research use only.
+   - Weights are NOT bundled or redistributed in this repository; they are
+     downloaded on demand by the user into `<APP_DATA_DIR>/models/`.
+   - https://github.com/deepinsight/insightface
+
+3. sqlite-vec
+   - License: MIT License OR Apache-2.0
+   - https://github.com/asg017/sqlite-vec
+
+4. ONNX Runtime
+   - License: MIT License
+   - https://github.com/microsoft/onnxruntime
+
+5. ExifTool (invoked only as an independent external subprocess)
+   - License: Artistic License / GPL (Perl standard terms)
+   - https://exiftool.org/
+
+6. Optional Extra: lightbox-cull[heic] (pillow-heif)
+   - pillow-heif Python wrapper: BSD-3-Clause
+   - Underlying libheif / libde265 codecs: LGPL-3.0-or-later
+   - Certain prebuilt wheels or system builds may include x265 (GPL-2.0)
+     for HEVC encoding. This extra is strictly optional and not installed
+     by default.

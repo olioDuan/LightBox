@@ -1,0 +1,133 @@
+[build-system]
+requires = ["hatchling>=1.26.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lightbox-cull"
+version = "0.1.0"
+description = "Local-first photo culling and intelligent selection system"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "exifread>=3.0.0",
+    "fastapi>=0.165.0",
+    "mcp>=1.9.0",
+    "numpy>=2.0.0",
+    "onnxruntime>=1.32.0",
+    "opencv-python-headless>=5.1.0.95",
+    "pillow>=11.0.0",
+    "platformdirs>=4.3.0",
+    "pydantic>=2.10.0",
+    "rawpy>=0.23.0",
+    "sqlite-vec>=0.1.6",
+    "structlog>=24.4.0",
+    "typer>=0.29.2",
+    "uvicorn>=0.54.0",
+]
+
+[project.optional-dependencies]
+heic = [
+    "pillow-heif>=0.20.0",
+]
+
+[project.scripts]
+lightbox = "lightbox.cli:main"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "import-linter>=2.1",
+    "mypy>=1.13.0",
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lightbox"]
+
+[tool.uv]
+python-preference = "only-managed"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "scripts", "eval"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "TID"]
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"os.remove".msg = "Hard deletion is forbidden in Lightbox (SPEC §10.2). Use SafeFS quarantine instead."
+"os.unlink".msg = "Hard deletion is forbidden in Lightbox (SPEC §10.2). Use SafeFS quarantine instead."
+"os.rmdir".msg = "Hard deletion is forbidden in Lightbox (SPEC §10.2). Use SafeFS quarantine instead."
+"os.rename".msg = "Raw os.rename silently overwrites on POSIX (SPEC §10.2(2)). Use SafeFS.rename_same_volume instead."
+"os.replace".msg = "Overwriting rename is forbidden in Lightbox (SPEC §10.2). Use SafeFS non-overwriting rename instead."
+"shutil.rmtree".msg = "Recursive deletion is forbidden in Lightbox (SPEC §10.2)."
+"shutil.move".msg = "Cross-volume copy+delete move is forbidden in Lightbox (SPEC §10.2). Use SafeFS.rename_same_volume instead."
+
+[tool.ruff.lint.per-file-ignores]
+# SafeFS is the sole module allowed to call os.rename (with prior non-overwrite check);
+# scripts/check_no_delete.py still blocks all other deletion/overwrite APIs inside safe_fs.py.
+"src/lightbox/fs/safe_fs.py" = ["TID251"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["lightbox"]
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "sqlite_vec",
+    "exifread",
+    "exifread.*",
+    "rawpy",
+    "rawpy.*",
+    "cv2",
+    "cv2.*",
+    "onnxruntime",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.importlinter]
+root_package = "lightbox"
+
+[[tool.importlinter.contracts]]
+name = "Infrastructure layers must not import upper layers"
+type = "forbidden"
+source_modules = [
+    "lightbox.core",
+    "lightbox.fs",
+    "lightbox.store",
+    "lightbox.models",
+]
+forbidden_modules = [
+    "lightbox.services",
+    "lightbox.agent",
+    "lightbox.tools",
+    "lightbox.mcp",
+    "lightbox.api",
+    "lightbox.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "Surfaces must not bypass services/tools to access store, fs, or core directly"
+type = "forbidden"
+allow_indirect_imports = true
+source_modules = [
+    "lightbox.api",
+    "lightbox.cli",
+    "lightbox.mcp",
+]
+forbidden_modules = [
+    "lightbox.store",
+    "lightbox.fs",
+    "lightbox.core",
+]

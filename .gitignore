@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+.env
+node_modules/
+.import_linter_cache/
+lightbox_dev_plan.md
+lightbox_dev_spec.md
+
