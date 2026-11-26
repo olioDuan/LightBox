@@ -6,11 +6,12 @@ import json
 import os
 import secrets
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import anyio
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     HTMLResponse,
@@ -34,8 +35,13 @@ from lightbox.paths import AppPaths, get_app_paths
 from lightbox.services import (
     BucketName,
     DestinationExistsError,
+    EmbedderError,
+    FaceEmbedderError,
     ImageSizeMode,
     LightboxServices,
+    MissingAPIKeyError,
+    ModelError,
+    PeopleError,
     PlanError,
     PlanStateError,
     SafeFSError,
@@ -62,6 +68,7 @@ class ScanRequest(BaseModel):
 
     folder_path: str
     sensitivity: Literal["conservative", "standard"] | None = None
+    enable_embed: bool = False
     wait: bool = True
     max_workers: int | None = Field(default=None, ge=1)
 
@@ -122,6 +129,56 @@ class RestorePlanRequest(BaseModel):
     photo_ids: list[str] | None = None
 
 
+class TriageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_photos: int = Field(default=50, ge=1, le=500)
+    dry_run: bool = True
+    profile: Literal["balanced", "best", "local"] | None = None
+    budget_usd: float | None = Field(default=None, ge=0.0)
+    wait: bool = False
+
+
+class PeopleIndexRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class FaceRefInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content_fp: str = Field(min_length=1)
+    face_idx: int = Field(ge=0)
+
+
+class PeopleLabelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["name", "merge", "ignore"]
+    name: str | None = None
+    is_self: bool = False
+    cluster_id: str | None = None
+    person_id: str | None = None
+    faces: list[FaceRefInput] | None = None
+    source_cluster_id: str | None = None
+    target_cluster_id: str | None = None
+    source_person_id: str | None = None
+    target_person_id: str | None = None
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class PeopleExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_dir: str = Field(min_length=1)
+    session_id: str | None = None
+    group_keys: list[str] | None = None
+    include_unnamed: bool = False
+    include_no_face: bool = False
+    lang: str = "zh-CN"
+
+
 def _serialize_plan(
     plan: Any,
     items: list[Any] | tuple[Any, ...],
@@ -165,6 +222,15 @@ def _serialize_plan(
 
 def _get_svcs(request: Request) -> Iterator[LightboxServices]:
     svcs = LightboxServices(app_paths=request.app.state.app_paths, migrate=False)
+    factory = getattr(request.app.state, "model_router_factory", None)
+    if factory is not None:
+        svcs.override_model_router(factory(svcs))
+    embedder_factory = getattr(request.app.state, "embedder_factory", None)
+    if embedder_factory is not None:
+        svcs.override_embedder(embedder_factory(svcs))
+    face_embedder_factory = getattr(request.app.state, "face_embedder_factory", None)
+    if face_embedder_factory is not None:
+        svcs.override_face_embedder(face_embedder_factory(svcs))
     try:
         yield svcs
     finally:
@@ -181,6 +247,9 @@ def create_app(
     bootstrap_token: str | None = None,
     instance_id: str | None = None,
     web_dist_dir: Path | None = None,
+    model_router_factory: Callable[[LightboxServices], Any] | None = None,
+    embedder_factory: Callable[[LightboxServices], Any] | None = None,
+    face_embedder_factory: Callable[[LightboxServices], Any] | None = None,
 ) -> FastAPI:
     """Create the local-only FastAPI app with DNS-rebinding, Cookie, CSRF, REST, and SSE."""
     resolved_paths = app_paths or get_app_paths()
@@ -212,6 +281,9 @@ def create_app(
     app.state.auth = auth
     app.state.event_bus = event_bus
     app.state.instance_id = resolved_instance_id
+    app.state.model_router_factory = model_router_factory
+    app.state.embedder_factory = embedder_factory
+    app.state.face_embedder_factory = face_embedder_factory
     app.add_middleware(LocalSecurityMiddleware, allowed_port=port, auth=auth)
 
     # --- Local Liveness Probe (Host-checked, zero user data) ---
@@ -319,6 +391,7 @@ def create_app(
                 folder,
                 sensitivity=body.sensitivity,
                 max_workers=body.max_workers,
+                enable_embed=body.enable_embed,
                 on_progress=lambda stage, done, total: event_bus.publish(
                     "job.progress",
                     {"stage": stage, "done": done, "total": total},
@@ -343,6 +416,7 @@ def create_app(
                 "counts_by_bucket": res.counts_by_bucket,
                 "burst_count": res.burst_count,
                 "cache_hits": res.cache_hits,
+                "embedded_count": res.embedded_count,
                 "elapsed_s": res.elapsed_s,
             }
 
@@ -351,6 +425,8 @@ def create_app(
 
         def _bg() -> None:
             with LightboxServices(app_paths=resolved_paths, migrate=False) as bg_svcs:
+                if embedder_factory is not None:
+                    bg_svcs.override_embedder(embedder_factory(bg_svcs))
                 _run_scan_with_events(bg_svcs)
 
         threading.Thread(target=_bg, daemon=True).start()
@@ -627,6 +703,245 @@ def create_app(
             headers={"Cache-Control": "private, max-age=3600"},
         )
 
+    # --- Semantic Search & Find Similar (PLAN T11) ---
+
+    @app.get("/api/search")
+    async def search_photos(
+        svcs: SvcsDep,
+        q: Annotated[str, Query()] = "",
+        query: Annotated[str | None, Query()] = None,
+        session_id: Annotated[str | None, Query()] = None,
+        date_from: Annotated[str | None, Query()] = None,
+        date_to: Annotated[str | None, Query()] = None,
+        camera: Annotated[str | None, Query()] = None,
+        light_bucket: Annotated[str | None, Query()] = None,
+        focal_min: Annotated[float | None, Query()] = None,
+        focal_max: Annotated[float | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 24,
+        lang: Annotated[str, Query()] = "zh-CN",
+    ) -> dict[str, Any]:
+        effective_query = q if q.strip() else (query or "")
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: svcs.search.search_photos(
+                    effective_query,
+                    session_id=session_id,
+                    date_from=date_from,
+                    date_to=date_to,
+                    camera=camera,
+                    light_bucket=light_bucket,
+                    focal_min=focal_min,
+                    focal_max=focal_max,
+                    limit=limit,
+                    lang=lang,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except EmbedderError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+        return {
+            "query": res.query,
+            "mode": res.mode,
+            "semantic_ready": res.semantic_ready,
+            "indexed_count": res.indexed_count,
+            "total_candidates": res.total_candidates,
+            "cameras": list(res.cameras),
+            "matches": [m.to_dict() for m in res.matches],
+        }
+
+    @app.get("/api/photos/{photo_id}/similar")
+    async def similar_photos(
+        photo_id: str,
+        svcs: SvcsDep,
+        limit: Annotated[int, Query(ge=1, le=30)] = 12,
+        session_id: Annotated[str | None, Query()] = None,
+        lang: Annotated[str, Query()] = "zh-CN",
+    ) -> dict[str, Any]:
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: svcs.search.find_similar(
+                    photo_id,
+                    limit=limit,
+                    session_id=session_id,
+                    lang=lang,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except EmbedderError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+        return {
+            "anchor": res.anchor.to_dict(),
+            "anchor_id": res.anchor_id,
+            "session_id": res.session_id,
+            "mode": res.mode,
+            "semantic_ready": res.semantic_ready,
+            "similar": [m.to_dict() for m in res.similar],
+        }
+
+    @app.post("/api/sessions/{session_id}/embed")
+    async def embed_session(
+        session_id: str,
+        svcs: SvcsDep,
+    ) -> dict[str, Any]:
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: svcs.search.index_session(
+                    session_id,
+                    on_progress=lambda stage, done, total: event_bus.publish(
+                        "job.progress",
+                        {"stage": stage, "done": done, "total": total},
+                        session_id=session_id,
+                    ),
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except EmbedderError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+        return {
+            "session_id": res.session_id,
+            "indexed_count": res.indexed_count,
+            "skipped_count": res.skipped_count,
+            "tagged_count": res.tagged_count,
+            "total_photos": res.total_photos,
+            "model_id": res.model_id,
+            "elapsed_s": res.elapsed_s,
+        }
+
+    # --- People Auto-Classification (PLAN T18) ---
+
+    @app.get("/api/photos/{photo_id}/face-crop")
+    def photo_face_crop(
+        photo_id: str,
+        svcs: SvcsDep,
+        face_idx: Annotated[int, Query(ge=0)] = 0,
+        size: Annotated[int, Query(ge=64, le=320)] = 160,
+    ) -> Response:
+        try:
+            data = svcs.people.get_face_crop_bytes(photo_id, face_idx, size=size)
+        except (PeopleError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        return Response(
+            content=data,
+            media_type="image/webp",
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+
+    @app.post("/api/sessions/{session_id}/people/index")
+    async def index_session_people(
+        session_id: str,
+        svcs: SvcsDep,
+        body: PeopleIndexRequest | None = None,
+    ) -> dict[str, Any]:
+        req = body or PeopleIndexRequest()
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: svcs.people.index_session(
+                    session_id,
+                    threshold=req.threshold,
+                )
+            )
+        except PeopleError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except FaceEmbedderError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+        return res.to_dict()
+
+    @app.get("/api/people")
+    def list_people_groups(
+        svcs: SvcsDep,
+        session_id: Annotated[str | None, Query()] = None,
+        group_person_id: Annotated[str | None, Query()] = None,
+    ) -> dict[str, Any]:
+        try:
+            res = svcs.people.get_people_groups(
+                session_id=session_id,
+                group_person_id=group_person_id,
+            )
+        except PeopleError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        return res.to_dict()
+
+    @app.post("/api/people/label")
+    def label_people(body: PeopleLabelRequest, svcs: SvcsDep) -> dict[str, Any]:
+        face_tuples = (
+            [(f.content_fp, f.face_idx) for f in body.faces]
+            if body.faces is not None
+            else None
+        )
+        try:
+            if body.action == "name":
+                if not body.name:
+                    raise PeopleError("`name` is required when action is 'name'.")
+                person = svcs.people.label_name(
+                    body.name,
+                    cluster_id=body.cluster_id,
+                    faces=face_tuples,
+                    person_id=body.person_id,
+                    is_self=body.is_self,
+                    threshold=body.threshold,
+                )
+                return {
+                    "action": "name",
+                    "person": {
+                        "id": person.id,
+                        "name": person.name,
+                        "is_self": person.is_self,
+                    },
+                }
+            if body.action == "merge":
+                merged = svcs.people.label_merge(
+                    source_cluster_id=body.source_cluster_id,
+                    target_cluster_id=body.target_cluster_id,
+                    source_person_id=body.source_person_id,
+                    target_person_id=body.target_person_id,
+                    threshold=body.threshold,
+                )
+                return {"action": "merge", **merged}
+            ignored_count = svcs.people.label_ignore(
+                faces=face_tuples,
+                cluster_id=body.cluster_id,
+            )
+            return {"action": "ignore", "ignored_count": ignored_count}
+        except PeopleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    @app.post("/api/people/export")
+    async def export_people_groups(
+        body: PeopleExportRequest,
+        svcs: SvcsDep,
+    ) -> dict[str, Any]:
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: svcs.people.export_groups(
+                    body.target_dir,
+                    session_id=body.session_id,
+                    group_keys=body.group_keys,
+                    include_unnamed=body.include_unnamed,
+                    include_no_face=body.include_no_face,
+                    lang=body.lang,
+                )
+            )
+        except PeopleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except SafeFSError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+        svcs.system.record_audit_log(
+            surface="web",
+            tool_name="people_export",
+            hook_decision="allow",
+            args_redacted={
+                "target_dir": res.target_dir,
+                "session_id": body.session_id,
+                "group_count": len(res.groups),
+            },
+            summary=f"Exported {res.exported_photos} photos ({res.exported_files} files)",
+        )
+        return res.to_dict()
+
     @app.post("/api/verdicts")
     def set_verdicts(body: VerdictRequest, svcs: SvcsDep) -> dict[str, Any]:
         updated: list[dict[str, Any]] = []
@@ -680,6 +995,146 @@ def create_app(
             "pick_photo_id": res.pick_photo_id,
             "non_pick_photo_ids": list(res.non_pick_photo_ids),
             "confirmed": res.confirmed,
+        }
+
+    # --- L3 VLM Batch Triage ---
+
+    @app.post("/api/sessions/{session_id}/triage")
+    async def triage_session(
+        session_id: str,
+        svcs: SvcsDep,
+        body: TriageRequest | None = None,
+    ) -> dict[str, Any]:
+        req = body or TriageRequest()
+        if req.dry_run:
+            try:
+                est = svcs.triage.estimate_triage(
+                    session_id,
+                    max_photos=req.max_photos,
+                    profile=req.profile,
+                    session_budget_usd=req.budget_usd,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+            except ModelError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            return {
+                "session_id": est.session_id,
+                "dry_run": True,
+                "yellow_count": est.yellow_count,
+                "burst_count": est.burst_count,
+                "total_yellow_available": est.total_yellow_available,
+                "total_bursts_available": est.total_bursts_available,
+                "skipped_bursts_due_to_limit": est.skipped_bursts_due_to_limit,
+                "note": est.note,
+                "total_units": est.total_units,
+                "est_usd": est.est_usd,
+                "profile": est.profile,
+                "model_alias": est.model_alias,
+                "model_id": est.model_id,
+                "provider": est.provider,
+                "vlm_backend_ready": est.vlm_backend_ready,
+                "session_spent_usd": est.session_spent_usd,
+                "session_budget_usd": est.session_budget_usd,
+                "monthly_spent_usd": est.monthly_spent_usd,
+                "monthly_budget_usd": est.monthly_budget_usd,
+            }
+
+        # Validate session & credentials synchronously before spawning worker thread
+        try:
+            job_id = svcs.triage.create_queued_job(
+                session_id,
+                profile=req.profile,
+                session_budget_usd=req.budget_usd,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except MissingAPIKeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except ModelError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
+
+        def _execute_triage_in_thread(target_svcs: LightboxServices) -> dict[str, Any]:
+            res = target_svcs.triage.run_triage_sync(
+                session_id,
+                max_photos=req.max_photos,
+                profile=req.profile,
+                session_budget_usd=req.budget_usd,
+                job_id=job_id,
+                on_progress=lambda stage, done, total: event_bus.publish(
+                    "job.progress",
+                    {"job_id": job_id, "stage": stage, "done": done, "total": total},
+                    session_id=session_id,
+                ),
+            )
+            event_bus.publish(
+                "job.progress",
+                {
+                    "job_id": res.job_id,
+                    "status": res.status,
+                    "paused_reason": res.paused_reason,
+                    "stage": "triage_vlm",
+                    "done": res.reviewed_yellow + res.reviewed_bursts + res.failed_count,
+                    "total": res.yellow_total + res.burst_total,
+                    "failed_count": res.failed_count,
+                },
+                session_id=session_id,
+            )
+            return {
+                "job_id": res.job_id,
+                "session_id": res.session_id,
+                "dry_run": False,
+                "status": res.status,
+                "paused_reason": res.paused_reason,
+                "yellow_total": res.yellow_total,
+                "burst_total": res.burst_total,
+                "reviewed_yellow": res.reviewed_yellow,
+                "reviewed_bursts": res.reviewed_bursts,
+                "failed_yellow": res.failed_yellow,
+                "failed_bursts": res.failed_bursts,
+                "failed_count": res.failed_count,
+                "cache_hits": res.cache_hits,
+                "paid_calls": res.paid_calls,
+                "fresh_calls": res.fresh_calls,
+                "spent_usd": res.spent_usd,
+                "model_id": res.model_id,
+                "provider": res.provider,
+            }
+
+        if req.wait:
+            # Run synchronous Pillow/SQLite triage work off the FastAPI event loop thread
+            try:
+                return await anyio.to_thread.run_sync(_execute_triage_in_thread, svcs)
+            except MissingAPIKeyError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            except ModelError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from None
+
+        def _bg_triage() -> None:
+            with LightboxServices(app_paths=resolved_paths, migrate=False) as bg_svcs:
+                if model_router_factory is not None:
+                    bg_svcs.override_model_router(model_router_factory(bg_svcs))
+                try:
+                    _execute_triage_in_thread(bg_svcs)
+                except Exception as exc:
+                    bg_svcs.job_runner.mark_failed(job_id, f"{type(exc).__name__}: {exc}")
+                    event_bus.publish(
+                        "job.progress",
+                        {
+                            "job_id": job_id,
+                            "status": "failed",
+                            "paused_reason": f"{type(exc).__name__}: {exc}",
+                            "stage": "triage_vlm",
+                        },
+                        session_id=session_id,
+                    )
+
+        threading.Thread(target=_bg_triage, daemon=True).start()
+        return {
+            "job_id": job_id,
+            "session_id": session_id,
+            "dry_run": False,
+            "status": "queued",
         }
 
     # --- Plans: Draft / Obvious Rejects / Approve-and-Apply / Restore ---
@@ -874,6 +1329,31 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"Folder does not exist: {folder}")
         opened = svcs.system.open_folder(folder)
         return {"opened": opened, "path": str(folder)}
+
+    # --- Shooting Digest / Insights (PLAN T17, SPEC §9.2 & §13(2)) ---
+
+    @app.get("/api/insights/digest")
+    def insights_digest(
+        svcs: SvcsDep,
+        session_id: Annotated[str | None, Query()] = None,
+        date_from: Annotated[str | None, Query()] = None,
+        date_to: Annotated[str | None, Query()] = None,
+        min_samples: Annotated[int, Query(ge=1, le=100)] = 5,
+        lang: Annotated[str, Query()] = "zh-CN",
+    ) -> dict[str, Any]:
+        try:
+            report = svcs.digest.generate_digest(
+                session_id=session_id,
+                date_from=date_from,
+                date_to=date_to,
+                min_samples=min_samples,
+                lang=lang,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            status = 404 if msg.startswith("Unknown session_id") else 400
+            raise HTTPException(status_code=status, detail=msg) from None
+        return report.to_dict()
 
     # --- Static Frontend Hosting (`web_dist/`) ---
 

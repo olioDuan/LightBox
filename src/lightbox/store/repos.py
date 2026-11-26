@@ -210,6 +210,107 @@ class OverrideRecord:
     created_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class LLMCallRecord:
+    id: str
+    cache_key: str | None
+    role: str
+    provider: str
+    model: str
+    in_tokens: int
+    out_tokens: int
+    cached_tokens: int
+    cost_usd: float
+    latency_ms: int
+    response_json: str | None
+    created_at: float
+    session_id: str | None = None
+    cache_hit: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PersonRecord:
+    id: str
+    name: str
+    is_self: bool = False
+    cover_content_fp: str | None = None
+    cover_face_idx: int | None = None
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class FaceEmbeddingRecord:
+    content_fp: str
+    face_idx: int
+    model_id: str
+    dim: int
+    embedding_blob: bytes
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class FaceAssignmentRecord:
+    content_fp: str
+    face_idx: int
+    person_id: str | None
+    status: str  # 'assigned' | 'unassigned' | 'ignored'
+    source: str  # 'user' | 'auto'
+    confidence: float | None = None
+    cluster_id: str | None = None
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class DigestOverviewRow:
+    total_shots: int
+    tech_reject: int
+    burst_cull: int
+    subjective_reject: int
+    kept: int
+    uncertain: int
+    session_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DigestBucketRow:
+    bucket_key: str
+    total: int
+    tech_reject: int
+    burst_cull: int
+    subjective_reject: int
+    kept: int
+    uncertain: int
+    top_reason_code: str | None = None
+    top_reason_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DigestMatrixRow:
+    focal_bucket: str
+    shutter_bucket: str
+    total: int
+    tech_reject: int
+    burst_cull: int
+    subjective_reject: int
+    kept: int
+    uncertain: int
+
+
+_DIGEST_ALLOWED_DIMENSIONS: frozenset[str] = frozenset(
+    {
+        "light_bucket",
+        "capture_local_hour",
+        "flash_fired",
+        "scene_tag",
+        "motion_state",
+        "lens_model",
+        "focal_bucket",
+        "shutter_vs_safe",
+        "iso_bucket",
+    }
+)
+
+
 def _row_to_root(row: sqlite3.Row) -> RootRecord:
     return RootRecord(
         id=str(row["id"]),
@@ -375,6 +476,62 @@ def _row_to_override(row: sqlite3.Row) -> OverrideRecord:
         feature_snapshot=json.loads(str(row["feature_snapshot_json"])),
         actor=str(row["actor"]),
         created_at=float(row["created_at"]),
+    )
+
+
+def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:
+    return LLMCallRecord(
+        id=str(row["id"]),
+        cache_key=str(row["cache_key"]) if row["cache_key"] is not None else None,
+        role=str(row["role"]),
+        provider=str(row["provider"]),
+        model=str(row["model"]),
+        in_tokens=int(row["in_tokens"] or 0),
+        out_tokens=int(row["out_tokens"] or 0),
+        cached_tokens=int(row["cached_tokens"] or 0),
+        cost_usd=float(row["cost_usd"] or 0.0),
+        latency_ms=int(row["latency_ms"] or 0),
+        response_json=str(row["response_json"]) if row["response_json"] is not None else None,
+        created_at=float(row["created_at"]),
+        session_id=str(row["session_id"]) if row["session_id"] is not None else None,
+        cache_hit=bool(row["cache_hit"]),
+    )
+
+
+def _row_to_person(row: sqlite3.Row) -> PersonRecord:
+    return PersonRecord(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        is_self=bool(row["is_self"]),
+        cover_content_fp=(
+            str(row["cover_content_fp"]) if row["cover_content_fp"] is not None else None
+        ),
+        cover_face_idx=int(row["cover_face_idx"]) if row["cover_face_idx"] is not None else None,
+        created_at=float(row["created_at"]),
+    )
+
+
+def _row_to_face_embedding(row: sqlite3.Row) -> FaceEmbeddingRecord:
+    return FaceEmbeddingRecord(
+        content_fp=str(row["content_fp"]),
+        face_idx=int(row["face_idx"]),
+        model_id=str(row["model_id"]),
+        dim=int(row["dim"]),
+        embedding_blob=bytes(row["embedding_blob"]),
+        created_at=float(row["created_at"]),
+    )
+
+
+def _row_to_face_assignment(row: sqlite3.Row) -> FaceAssignmentRecord:
+    return FaceAssignmentRecord(
+        content_fp=str(row["content_fp"]),
+        face_idx=int(row["face_idx"]),
+        person_id=str(row["person_id"]) if row["person_id"] is not None else None,
+        status=str(row["status"]),
+        source=str(row["source"]),
+        confidence=float(row["confidence"]) if row["confidence"] is not None else None,
+        cluster_id=str(row["cluster_id"]) if row["cluster_id"] is not None else None,
+        updated_at=float(row["updated_at"]),
     )
 
 
@@ -1481,18 +1638,642 @@ class LightboxRepository:
             )
             return int(cur.lastrowid or 0)
 
+    # --- LLM Calls & Cost Ledger ---
+
+    def get_llm_call_by_cache_key(self, cache_key: str) -> LLMCallRecord | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM llm_calls WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        return _row_to_llm_call(row) if row is not None else None
+
+    def add_llm_call(self, record: LLMCallRecord) -> None:
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO llm_calls(
+                    id, cache_key, role, provider, model,
+                    in_tokens, out_tokens, cached_tokens, cost_usd,
+                    latency_ms, response_json, created_at, session_id, cache_hit
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.cache_key,
+                    record.role,
+                    record.provider,
+                    record.model,
+                    record.in_tokens,
+                    record.out_tokens,
+                    record.cached_tokens,
+                    record.cost_usd,
+                    record.latency_ms,
+                    record.response_json,
+                    record.created_at,
+                    record.session_id,
+                    int(record.cache_hit),
+                ),
+            )
+
+    def sum_llm_cost(
+        self,
+        *,
+        session_id: str | None = None,
+        since_ts: float | None = None,
+    ) -> float:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if since_ts is not None:
+            clauses.append("created_at >= ?")
+            params.append(since_ts)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.db.conn.execute(
+            f"SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM llm_calls {where}",
+            tuple(params),
+        ).fetchone()
+        return float(row["total"]) if row is not None else 0.0
+
+    def list_llm_calls(
+        self,
+        *,
+        session_id: str | None = None,
+        limit: int = 100,
+    ) -> list[LLMCallRecord]:
+        clamped = max(1, min(limit, 1000))
+        if session_id is None:
+            rows = self.db.conn.execute(
+                "SELECT * FROM llm_calls ORDER BY created_at DESC LIMIT ?",
+                (clamped,),
+            ).fetchall()
+        else:
+            rows = self.db.conn.execute(
+                "SELECT * FROM llm_calls WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, clamped),
+            ).fetchall()
+        return [_row_to_llm_call(row) for row in rows]
+
+    # --- People & Face Classification (T18) ---
+
+    def upsert_person(self, person: PersonRecord) -> None:
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO people(
+                    id, name, is_self, cover_content_fp, cover_face_idx, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    is_self = excluded.is_self,
+                    cover_content_fp = COALESCE(excluded.cover_content_fp, people.cover_content_fp),
+                    cover_face_idx = COALESCE(excluded.cover_face_idx, people.cover_face_idx)
+                """,
+                (
+                    person.id,
+                    person.name,
+                    int(person.is_self),
+                    person.cover_content_fp,
+                    person.cover_face_idx,
+                    person.created_at or time.time(),
+                ),
+            )
+
+    def get_person(self, person_id: str) -> PersonRecord | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM people WHERE id = ?", (person_id,)
+        ).fetchone()
+        return _row_to_person(row) if row is not None else None
+
+    def get_person_by_name(self, name: str) -> PersonRecord | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM people WHERE name = ?", (name,)
+        ).fetchone()
+        return _row_to_person(row) if row is not None else None
+
+    def list_people(self) -> list[PersonRecord]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM people ORDER BY is_self DESC, name COLLATE NOCASE ASC, id ASC"
+        ).fetchall()
+        return [_row_to_person(row) for row in rows]
+
+    def delete_person(self, person_id: str) -> None:
+        with self.db.transaction() as cur:
+            cur.execute("DELETE FROM people WHERE id = ?", (person_id,))
+
+    def upsert_face_embeddings(self, records: Sequence[FaceEmbeddingRecord]) -> None:
+        if not records:
+            return
+        now = time.time()
+        with self.db.transaction() as cur:
+            for rec in records:
+                cur.execute(
+                    """
+                    INSERT INTO face_embeddings(
+                        content_fp, face_idx, model_id, dim, embedding_blob, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(content_fp, face_idx, model_id) DO UPDATE SET
+                        dim = excluded.dim,
+                        embedding_blob = excluded.embedding_blob,
+                        created_at = excluded.created_at
+                    """,
+                    (
+                        rec.content_fp,
+                        rec.face_idx,
+                        rec.model_id,
+                        rec.dim,
+                        rec.embedding_blob,
+                        rec.created_at or now,
+                    ),
+                )
+
+    def list_face_embeddings(
+        self,
+        model_id: str,
+        *,
+        content_fps: Sequence[str] | None = None,
+    ) -> list[FaceEmbeddingRecord]:
+        if content_fps is None:
+            rows = self.db.conn.execute(
+                """
+                SELECT * FROM face_embeddings
+                WHERE model_id = ?
+                ORDER BY content_fp ASC, face_idx ASC
+                """,
+                (model_id,),
+            ).fetchall()
+            return [_row_to_face_embedding(row) for row in rows]
+
+        unique_fps = sorted(set(content_fps))
+        if not unique_fps:
+            return []
+        result: list[FaceEmbeddingRecord] = []
+        for start in range(0, len(unique_fps), 500):
+            chunk = unique_fps[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.conn.execute(
+                f"""
+                SELECT * FROM face_embeddings
+                WHERE model_id = ? AND content_fp IN ({placeholders})
+                ORDER BY content_fp ASC, face_idx ASC
+                """,
+                (model_id, *chunk),
+            ).fetchall()
+            result.extend(_row_to_face_embedding(row) for row in rows)
+        return result
+
+    def upsert_face_assignments(self, records: Sequence[FaceAssignmentRecord]) -> None:
+        if not records:
+            return
+        now = time.time()
+        with self.db.transaction() as cur:
+            for rec in records:
+                cur.execute(
+                    """
+                    INSERT INTO face_assignments(
+                        content_fp, face_idx, person_id, status, source,
+                        confidence, cluster_id, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(content_fp, face_idx) DO UPDATE SET
+                        person_id = excluded.person_id,
+                        status = excluded.status,
+                        source = excluded.source,
+                        confidence = excluded.confidence,
+                        cluster_id = excluded.cluster_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        rec.content_fp,
+                        rec.face_idx,
+                        rec.person_id,
+                        rec.status,
+                        rec.source,
+                        rec.confidence,
+                        rec.cluster_id,
+                        rec.updated_at or now,
+                    ),
+                )
+
+    def list_face_assignments(
+        self,
+        *,
+        content_fps: Sequence[str] | None = None,
+    ) -> list[FaceAssignmentRecord]:
+        if content_fps is None:
+            rows = self.db.conn.execute(
+                "SELECT * FROM face_assignments ORDER BY content_fp ASC, face_idx ASC"
+            ).fetchall()
+            return [_row_to_face_assignment(row) for row in rows]
+
+        unique_fps = sorted(set(content_fps))
+        if not unique_fps:
+            return []
+        result: list[FaceAssignmentRecord] = []
+        for start in range(0, len(unique_fps), 500):
+            chunk = unique_fps[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.conn.execute(
+                f"""
+                SELECT * FROM face_assignments
+                WHERE content_fp IN ({placeholders})
+                ORDER BY content_fp ASC, face_idx ASC
+                """,
+                tuple(chunk),
+            ).fetchall()
+            result.extend(_row_to_face_assignment(row) for row in rows)
+        return result
+
+    def reassign_person_faces(self, source_person_id: str, target_person_id: str) -> int:
+        now = time.time()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE face_assignments
+                SET person_id = ?, updated_at = ?
+                WHERE person_id = ?
+                """,
+                (target_person_id, now, source_person_id),
+            )
+            return int(cur.rowcount or 0)
+
+    def reassign_cluster_faces(self, source_cluster_id: str, target_cluster_id: str) -> int:
+        now = time.time()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE face_assignments
+                SET cluster_id = ?, source = 'user', updated_at = ?
+                WHERE cluster_id = ? AND status = 'unassigned'
+                """,
+                (target_cluster_id, now, source_cluster_id),
+            )
+            moved = int(cur.rowcount or 0)
+            if moved > 0:
+                # Also pin existing target cluster members as user-merged so future reclustering
+                # preserves the merged cluster as a user constraint instead of splitting it apart.
+                cur.execute(
+                    """
+                    UPDATE face_assignments
+                    SET source = 'user', updated_at = ?
+                    WHERE cluster_id = ? AND status = 'unassigned'
+                    """,
+                    (now, target_cluster_id),
+                )
+            return moved
+
+    # --- Shooting Digest SQL Aggregations (T17, SPEC §13(2)) ---
+
+    def _build_digest_base_cte(
+        self,
+        *,
+        tech_reason_codes: Sequence[str],
+        burst_reason_codes: Sequence[str],
+        session_id: str | None = None,
+        min_capture_ts: float | None = None,
+        max_capture_ts: float | None = None,
+    ) -> tuple[str, list[Any]]:
+        tech_json = json.dumps(sorted(set(tech_reason_codes)))
+        burst_json = json.dumps(sorted(set(burst_reason_codes)))
+
+        where_clauses: list[str] = []
+        where_params: list[Any] = []
+        if session_id is not None:
+            where_clauses.append("p.session_id = ?")
+            where_params.append(session_id)
+        if min_capture_ts is not None:
+            where_clauses.append("p.capture_time IS NOT NULL AND p.capture_time >= ?")
+            where_params.append(min_capture_ts)
+        if max_capture_ts is not None:
+            where_clauses.append("p.capture_time IS NOT NULL AND p.capture_time <= ?")
+            where_params.append(max_capture_ts)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        cte_sql = f"""
+        WITH digest_raw AS (
+            SELECT
+                p.id AS photo_id,
+                p.session_id AS session_id,
+                COALESCE(NULLIF(TRIM(e.light_bucket), ''), 'unknown') AS light_bucket,
+                CASE
+                    WHEN e.capture_local_hour IS NULL
+                         OR e.capture_local_hour < 0
+                         OR e.capture_local_hour > 23 THEN 'unknown'
+                    WHEN e.capture_local_hour BETWEEN 5 AND 8 THEN '05_08_dawn'
+                    WHEN e.capture_local_hour BETWEEN 9 AND 11 THEN '09_11_morning'
+                    WHEN e.capture_local_hour BETWEEN 12 AND 16 THEN '12_16_afternoon'
+                    WHEN e.capture_local_hour BETWEEN 17 AND 19 THEN '17_19_evening'
+                    WHEN e.capture_local_hour BETWEEN 20 AND 23 THEN '20_23_night'
+                    ELSE '00_04_late_night'
+                END AS capture_local_hour,
+                CASE
+                    WHEN e.flash_fired = 1 THEN 'fired'
+                    WHEN e.flash_fired = 0 THEN 'no_flash'
+                    ELSE 'unknown'
+                END AS flash_fired,
+                COALESCE(NULLIF(TRIM(m.scene_tag), ''), 'unknown') AS scene_tag,
+                COALESCE(NULLIF(TRIM(m.motion_state), ''), 'unknown') AS motion_state,
+                COALESCE(NULLIF(TRIM(p.lens_model), ''), 'unknown') AS lens_model,
+                CASE
+                    WHEN e.focal_eq IS NULL OR e.focal_eq <= 0 THEN 'unknown'
+                    WHEN e.focal_eq < 24.0 THEN 'ultra_wide'
+                    WHEN e.focal_eq <= 35.0 THEN 'wide_24_35'
+                    WHEN e.focal_eq <= 55.0 THEN 'standard_36_55'
+                    WHEN e.focal_eq <= 105.0 THEN 'portrait_56_105'
+                    WHEN e.focal_eq <= 200.0 THEN 'tele_106_200'
+                    ELSE 'super_tele_200p'
+                END AS focal_bucket,
+                CASE
+                    WHEN e.shutter_s IS NULL OR e.shutter_s <= 0 THEN 'unknown'
+                    WHEN e.shutter_s <= 0.00105 THEN 'fast_1000'
+                    WHEN e.shutter_s <= 0.00405 THEN 'fast_250_1000'
+                    WHEN e.shutter_s <= 0.017 THEN 'mid_60_250'
+                    WHEN e.shutter_s < 1.0 THEN 'slow_handheld'
+                    ELSE 'long_1s_plus'
+                END AS shutter_bucket,
+                CASE
+                    WHEN e.shutter_s IS NULL OR e.shutter_s <= 0
+                         OR e.focal_eq IS NULL OR e.focal_eq <= 0 THEN 'unknown'
+                    WHEN (e.shutter_s * e.focal_eq) <= 1.02 THEN 'at_or_faster_safe'
+                    WHEN (e.shutter_s * e.focal_eq) <= 2.04 THEN 'slower_up_to_1_stop'
+                    ELSE 'slower_over_1_stop'
+                END AS shutter_vs_safe,
+                CASE
+                    WHEN e.iso IS NULL OR e.iso <= 0 THEN 'unknown'
+                    WHEN e.iso <= 200 THEN 'iso_le_200'
+                    WHEN e.iso <= 800 THEN 'iso_201_800'
+                    WHEN e.iso <= 3200 THEN 'iso_801_3200'
+                    WHEN e.iso <= 6400 THEN 'iso_3201_6400'
+                    ELSE 'iso_gt_6400'
+                END AS iso_bucket,
+                CASE
+                    WHEN p.is_protected = 1
+                         OR COALESCE(ev.bucket, 'normal') IN ('normal', 'exempt') THEN 'kept'
+                    WHEN ev.bucket = 'yellow' THEN 'uncertain'
+                    WHEN ev.bucket = 'red'
+                         AND EXISTS (
+                             SELECT 1 FROM json_each(COALESCE(ev.reason_codes_json, '[]')) r
+                             WHERE r.value IN (SELECT value FROM json_each(?))
+                         )
+                    THEN 'tech_reject'
+                    WHEN ev.bucket = 'red'
+                         AND EXISTS (
+                             SELECT 1 FROM json_each(COALESCE(ev.reason_codes_json, '[]')) r
+                             WHERE r.value IN (SELECT value FROM json_each(?))
+                         )
+                    THEN 'burst_cull'
+                    ELSE 'subjective_reject'
+                END AS outcome,
+                COALESCE(ev.reason_codes_json, '[]') AS reason_codes_json
+            FROM photos p
+            JOIN sessions s ON s.id = p.session_id
+            LEFT JOIN exif_data e ON e.photo_id = p.id
+            LEFT JOIN metrics m
+                ON m.content_fp = p.primary_content_fp
+                AND m.engine_version = s.engine_version
+            LEFT JOIN effective_verdicts ev ON ev.photo_id = p.id
+            {where_sql}
+        ),
+        digest_base AS (
+            SELECT
+                dr.*,
+                CASE
+                    WHEN dr.outcome = 'tech_reject' THEN (
+                        SELECT r.value
+                        FROM json_each(dr.reason_codes_json) r
+                        WHERE r.value IN (SELECT value FROM json_each(?))
+                        ORDER BY r.key ASC
+                        LIMIT 1
+                    )
+                    ELSE NULL
+                END AS primary_tech_reason
+            FROM digest_raw dr
+        )
+        """
+        params: list[Any] = [tech_json, burst_json, *where_params, tech_json]
+        return cte_sql, params
+
+    def query_digest_overview(
+        self,
+        *,
+        tech_reason_codes: Sequence[str],
+        burst_reason_codes: Sequence[str],
+        session_id: str | None = None,
+        min_capture_ts: float | None = None,
+        max_capture_ts: float | None = None,
+    ) -> DigestOverviewRow:
+        cte_sql, params = self._build_digest_base_cte(
+            tech_reason_codes=tech_reason_codes,
+            burst_reason_codes=burst_reason_codes,
+            session_id=session_id,
+            min_capture_ts=min_capture_ts,
+            max_capture_ts=max_capture_ts,
+        )
+        row = self.db.conn.execute(
+            f"""
+            {cte_sql}
+            SELECT
+                COUNT(*) AS total_shots,
+                COALESCE(SUM(CASE WHEN outcome = 'tech_reject' THEN 1 ELSE 0 END), 0) AS tech_reject,
+                COALESCE(SUM(CASE WHEN outcome = 'burst_cull' THEN 1 ELSE 0 END), 0) AS burst_cull,
+                COALESCE(SUM(CASE WHEN outcome = 'subjective_reject' THEN 1 ELSE 0 END), 0) AS subjective_reject,
+                COALESCE(SUM(CASE WHEN outcome = 'kept' THEN 1 ELSE 0 END), 0) AS kept,
+                COALESCE(SUM(CASE WHEN outcome = 'uncertain' THEN 1 ELSE 0 END), 0) AS uncertain,
+                COUNT(DISTINCT session_id) AS session_count
+            FROM digest_base
+            """,
+            tuple(params),
+        ).fetchone()
+        if row is None:
+            return DigestOverviewRow(0, 0, 0, 0, 0, 0, 0)
+        return DigestOverviewRow(
+            total_shots=int(row["total_shots"]),
+            tech_reject=int(row["tech_reject"]),
+            burst_cull=int(row["burst_cull"]),
+            subjective_reject=int(row["subjective_reject"]),
+            kept=int(row["kept"]),
+            uncertain=int(row["uncertain"]),
+            session_count=int(row["session_count"]),
+        )
+
+    def query_digest_tech_reasons(
+        self,
+        *,
+        tech_reason_codes: Sequence[str],
+        burst_reason_codes: Sequence[str],
+        session_id: str | None = None,
+        min_capture_ts: float | None = None,
+        max_capture_ts: float | None = None,
+    ) -> list[tuple[str, int]]:
+        cte_sql, params = self._build_digest_base_cte(
+            tech_reason_codes=tech_reason_codes,
+            burst_reason_codes=burst_reason_codes,
+            session_id=session_id,
+            min_capture_ts=min_capture_ts,
+            max_capture_ts=max_capture_ts,
+        )
+        rows = self.db.conn.execute(
+            f"""
+            {cte_sql}
+            SELECT primary_tech_reason AS reason_code, COUNT(*) AS cnt
+            FROM digest_base
+            WHERE outcome = 'tech_reject' AND primary_tech_reason IS NOT NULL
+            GROUP BY primary_tech_reason
+            ORDER BY cnt DESC, primary_tech_reason ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        return [(str(r["reason_code"]), int(r["cnt"])) for r in rows]
+
+    def query_digest_dimension(
+        self,
+        dimension: str,
+        *,
+        tech_reason_codes: Sequence[str],
+        burst_reason_codes: Sequence[str],
+        session_id: str | None = None,
+        min_capture_ts: float | None = None,
+        max_capture_ts: float | None = None,
+    ) -> list[DigestBucketRow]:
+        if dimension not in _DIGEST_ALLOWED_DIMENSIONS:
+            raise ValueError(f"Unsupported digest dimension: {dimension!r}")
+        cte_sql, params = self._build_digest_base_cte(
+            tech_reason_codes=tech_reason_codes,
+            burst_reason_codes=burst_reason_codes,
+            session_id=session_id,
+            min_capture_ts=min_capture_ts,
+            max_capture_ts=max_capture_ts,
+        )
+        agg_rows = self.db.conn.execute(
+            f"""
+            {cte_sql}
+            SELECT
+                {dimension} AS bucket_key,
+                COUNT(*) AS total,
+                SUM(CASE WHEN outcome = 'tech_reject' THEN 1 ELSE 0 END) AS tech_reject,
+                SUM(CASE WHEN outcome = 'burst_cull' THEN 1 ELSE 0 END) AS burst_cull,
+                SUM(CASE WHEN outcome = 'subjective_reject' THEN 1 ELSE 0 END) AS subjective_reject,
+                SUM(CASE WHEN outcome = 'kept' THEN 1 ELSE 0 END) AS kept,
+                SUM(CASE WHEN outcome = 'uncertain' THEN 1 ELSE 0 END) AS uncertain
+            FROM digest_base
+            GROUP BY {dimension}
+            ORDER BY total DESC, bucket_key ASC
+            """,
+            tuple(params),
+        ).fetchall()
+
+        reason_rows = self.db.conn.execute(
+            f"""
+            {cte_sql}
+            SELECT
+                {dimension} AS bucket_key,
+                primary_tech_reason AS reason_code,
+                COUNT(*) AS cnt
+            FROM digest_base
+            WHERE outcome = 'tech_reject' AND primary_tech_reason IS NOT NULL
+            GROUP BY {dimension}, primary_tech_reason
+            ORDER BY bucket_key ASC, cnt DESC, primary_tech_reason ASC
+            """,
+            tuple(params),
+        ).fetchall()
+
+        top_reason_by_bucket: dict[str, tuple[str, int]] = {}
+        for rr in reason_rows:
+            bk = str(rr["bucket_key"])
+            if bk not in top_reason_by_bucket:
+                top_reason_by_bucket[bk] = (str(rr["reason_code"]), int(rr["cnt"]))
+
+        result: list[DigestBucketRow] = []
+        for row in agg_rows:
+            bk = str(row["bucket_key"])
+            top_r = top_reason_by_bucket.get(bk)
+            result.append(
+                DigestBucketRow(
+                    bucket_key=bk,
+                    total=int(row["total"]),
+                    tech_reject=int(row["tech_reject"]),
+                    burst_cull=int(row["burst_cull"]),
+                    subjective_reject=int(row["subjective_reject"]),
+                    kept=int(row["kept"]),
+                    uncertain=int(row["uncertain"]),
+                    top_reason_code=top_r[0] if top_r is not None else None,
+                    top_reason_count=top_r[1] if top_r is not None else 0,
+                )
+            )
+        return result
+
+    def query_digest_focal_shutter_matrix(
+        self,
+        *,
+        tech_reason_codes: Sequence[str],
+        burst_reason_codes: Sequence[str],
+        session_id: str | None = None,
+        min_capture_ts: float | None = None,
+        max_capture_ts: float | None = None,
+    ) -> list[DigestMatrixRow]:
+        cte_sql, params = self._build_digest_base_cte(
+            tech_reason_codes=tech_reason_codes,
+            burst_reason_codes=burst_reason_codes,
+            session_id=session_id,
+            min_capture_ts=min_capture_ts,
+            max_capture_ts=max_capture_ts,
+        )
+        rows = self.db.conn.execute(
+            f"""
+            {cte_sql}
+            SELECT
+                focal_bucket,
+                shutter_bucket,
+                COUNT(*) AS total,
+                SUM(CASE WHEN outcome = 'tech_reject' THEN 1 ELSE 0 END) AS tech_reject,
+                SUM(CASE WHEN outcome = 'burst_cull' THEN 1 ELSE 0 END) AS burst_cull,
+                SUM(CASE WHEN outcome = 'subjective_reject' THEN 1 ELSE 0 END) AS subjective_reject,
+                SUM(CASE WHEN outcome = 'kept' THEN 1 ELSE 0 END) AS kept,
+                SUM(CASE WHEN outcome = 'uncertain' THEN 1 ELSE 0 END) AS uncertain
+            FROM digest_base
+            WHERE focal_bucket != 'unknown' AND shutter_bucket != 'unknown'
+            GROUP BY focal_bucket, shutter_bucket
+            ORDER BY total DESC, focal_bucket ASC, shutter_bucket ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        return [
+            DigestMatrixRow(
+                focal_bucket=str(r["focal_bucket"]),
+                shutter_bucket=str(r["shutter_bucket"]),
+                total=int(r["total"]),
+                tech_reject=int(r["tech_reject"]),
+                burst_cull=int(r["burst_cull"]),
+                subjective_reject=int(r["subjective_reject"]),
+                kept=int(r["kept"]),
+                uncertain=int(r["uncertain"]),
+            )
+            for r in rows
+        ]
+
 
 __all__ = [
     "AssetRecord",
     "BurstMemberRecord",
     "BurstRecord",
+    "DigestBucketRow",
+    "DigestMatrixRow",
+    "DigestOverviewRow",
     "ExifRecord",
+    "FaceAssignmentRecord",
+    "FaceEmbeddingRecord",
     "FaceRecord",
     "JobItemRecord",
     "JobRecord",
+    "LLMCallRecord",
     "LightboxRepository",
     "MetricsRecord",
     "OverrideRecord",
+    "PersonRecord",
     "PhotoRecord",
     "PlanItemRecord",
     "PlanRecord",

@@ -46,8 +46,8 @@ consolidate = "claude-sonnet-5-5"
 
 [profiles.local]
 embedder = "siglip2-base"
-triage_vlm = "ollama-vlm"
-agent = "ollama-vlm"
+triage_vlm = "mlx-vlm"
+agent = "mlx-vlm"
 reviewer = "none"
 consolidate = "none"
 
@@ -131,6 +131,34 @@ tools = true
 json_schema = true
 prompt_cache = true
 
+[models.gpt-4o-mini]
+provider = "openai"
+protocol = "openai_compat"
+family = "openai"
+model_id = "gpt-4o-mini"
+input_cost_per_mtok = 0.15
+output_cost_per_mtok = 0.60
+cached_input_cost_per_mtok = 0.075
+vision = true
+tools = true
+json_schema = true
+prompt_cache = true
+
+[models.mlx-vlm]
+provider = "local"
+protocol = "openai_compat"
+family = "local"
+model_id = "mlx-community/Qwen2.5-VL-7B-Instruct-4bit"
+base_url = "http://127.0.0.1:8080/v1"
+max_pixels = 1003520
+input_cost_per_mtok = 0.0
+output_cost_per_mtok = 0.0
+cached_input_cost_per_mtok = 0.0
+vision = true
+tools = true
+json_schema = true
+prompt_cache = false
+
 [models.ollama-vlm]
 provider = "local"
 protocol = "openai_compat"
@@ -203,6 +231,7 @@ class ModelSpec(BaseModel):
     model_id: str
     base_url: str | None = None
     default_effort: Literal["low", "medium", "high"] | None = None
+    max_pixels: int | None = Field(default=None, gt=0)
     input_cost_per_mtok: float = Field(default=0.0, ge=0.0)
     output_cost_per_mtok: float = Field(default=0.0, ge=0.0)
     cached_input_cost_per_mtok: float = Field(default=0.0, ge=0.0)

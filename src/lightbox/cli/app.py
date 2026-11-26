@@ -69,7 +69,7 @@ def scan(
     ] = None,
     embed: Annotated[
         bool,
-        typer.Option("--embed", help="Enable L2 SigLIP 2 embedding (activates in T11)."),
+        typer.Option("--embed", help="Enable local L2 SigLIP 2 semantic indexing and scene tagging."),
     ] = False,
     workers: Annotated[
         int | None,
@@ -86,7 +86,12 @@ def scan(
 ) -> None:
     """Run zero-LLM deterministic scan on a photo folder with resumable caching."""
     with LightboxServices.open() as svcs:
-        res = svcs.scan.scan_folder(folder, sensitivity=sensitivity, max_workers=workers)
+        res = svcs.scan.scan_folder(
+            folder,
+            sensitivity=sensitivity,
+            max_workers=workers,
+            enable_embed=embed,
+        )
         draft_payload = None
         if draft_obvious:
             draft = svcs.plan.draft_obvious_rejects(res.session_id)
@@ -114,6 +119,7 @@ def scan(
         "skipped_retryable": res.skipped_retryable,
         "elapsed_s": res.elapsed_s,
         "embed_requested": embed,
+        "embedded_count": res.embedded_count,
         "obvious_rejects_plan": draft_payload,
     }
     if as_json:
@@ -131,7 +137,7 @@ def scan(
     )
     typer.echo(f"Bursts  : {res.burst_count} | Cache hits: {res.cache_hits}")
     if embed:
-        typer.echo("Note: --embed (SigLIP 2 semantic indexing) will be enabled in T11.")
+        typer.echo(f"Semantic: indexed {res.embedded_count} photos with SigLIP 2 vision tower.")
     if draft_payload is not None:
         if draft_payload["plan_id"]:
             typer.echo(

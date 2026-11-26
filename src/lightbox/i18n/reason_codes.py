@@ -35,6 +35,11 @@ REASON_USER_UNSURE = "user_unsure"
 REASON_USER_RESET = "user_reset"
 REASON_USER_RESTORED = "user_restored"
 
+# --- VLM fallback reason codes ---
+REASON_VLM_KEEP = "vlm_keep"
+REASON_VLM_REJECT = "vlm_reject"
+REASON_VLM_UNSURE = "vlm_unsure"
+
 TECH_REJECT_REASON_CODES: frozenset[str] = frozenset(
     {
         REASON_EXTREME_EXPOSURE,
@@ -150,6 +155,18 @@ REASON_MESSAGES: dict[str, dict[str, str]] = {
         "zh-CN": "已从废片箱放回保留",
         "en-US": "Restored to keep from trash folder",
     },
+    REASON_VLM_KEEP: {
+        "zh-CN": "VLM 视觉复核建议保留",
+        "en-US": "VLM triage recommended keeping",
+    },
+    REASON_VLM_REJECT: {
+        "zh-CN": "VLM 视觉复核建议淘汰",
+        "en-US": "VLM triage recommended rejecting",
+    },
+    REASON_VLM_UNSURE: {
+        "zh-CN": "VLM 视觉复核仍存疑，保留供人工确认",
+        "en-US": "VLM triage uncertain; kept for manual review",
+    },
 }
 
 
@@ -205,7 +222,11 @@ __all__ = [
     "REASON_USER_REJECT",
     "REASON_USER_RESCUE",
     "REASON_USER_RESET",
+    "REASON_USER_RESTORED",
     "REASON_USER_UNSURE",
+    "REASON_VLM_KEEP",
+    "REASON_VLM_REJECT",
+    "REASON_VLM_UNSURE",
     "TECH_REJECT_REASON_CODES",
     "is_burst_cull_reason",
     "is_tech_reject_reason",

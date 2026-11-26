@@ -9,11 +9,15 @@ description = "Local-first photo culling and intelligent selection system"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=2.14.0",
     "exifread>=3.0.0",
     "fastapi>=0.165.0",
+    "huggingface-hub>=2.4.0",
+    "keyring>=25.7.0",
     "mcp>=1.9.0",
     "numpy>=2.0.0",
     "onnxruntime>=1.32.0",
+    "openai>=3.59.0",
     "opencv-python-headless>=5.1.0.95",
     "pillow>=11.0.0",
     "platformdirs>=4.3.0",
@@ -21,6 +25,7 @@ dependencies = [
     "rawpy>=0.23.0",
     "sqlite-vec>=0.1.6",
     "structlog>=24.4.0",
+    "tokenizers>=0.23.3",
     "typer>=0.29.2",
     "uvicorn>=0.54.0",
 ]
@@ -88,6 +93,10 @@ module = [
     "cv2",
     "cv2.*",
     "onnxruntime",
+    "huggingface_hub",
+    "huggingface_hub.*",
+    "tokenizers",
+    "tokenizers.*",
 ]
 ignore_missing_imports = true
 

@@ -22,7 +22,10 @@ from lightbox.i18n import (
 from lightbox.services import (
     ApprovalCodeError,
     BucketName,
+    EmbedderError,
     LightboxServices,
+    MissingAPIKeyError,
+    ModelError,
     PlanError,
     SafeFSError,
 )
@@ -168,7 +171,7 @@ class ScanFolderInput(BaseModel):
     )
     enable_embed: bool = Field(
         default=False,
-        description="Request L2 SigLIP 2 embedding (activates in T11).",
+        description="Enable local L2 SigLIP 2 vision embedding and scene tagging.",
     )
     wait_seconds: int = Field(
         default=15,
@@ -306,6 +309,29 @@ class RestorePlanInput(BaseModel):
     )
 
 
+class ShootingDigestInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str | None = Field(
+        default=None,
+        description="Optional session ID; omitted summarizes across all scanned sessions.",
+    )
+    date_from: str | None = Field(
+        default=None,
+        description="Optional ISO start date filter (YYYY-MM-DD).",
+    )
+    date_to: str | None = Field(
+        default=None,
+        description="Optional ISO end date filter (YYYY-MM-DD).",
+    )
+    min_samples: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description="Minimum sample count required for a condition highlight or stable setup.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool Handlers (all strictly routed through LightboxServices)
 # ---------------------------------------------------------------------------
@@ -365,11 +391,16 @@ def _handle_scan_folder(ctx: ToolContext, args: ScanFolderInput) -> ToolExecutio
 
     def _worker() -> None:
         try:
-            with LightboxServices(app_paths=ctx.services.app_paths, migrate=False) as bg_svcs:
+            with LightboxServices(
+                app_paths=ctx.services.app_paths,
+                embedder=ctx.services.embedder,
+                migrate=False,
+            ) as bg_svcs:
                 scan_res = bg_svcs.scan.scan_folder(
                     folder,
                     sensitivity=args.sensitivity,
                     max_workers=1,
+                    enable_embed=args.enable_embed,
                     on_progress=_on_progress,
                 )
                 result_box["scan"] = scan_res
@@ -401,7 +432,7 @@ def _handle_scan_folder(ctx: ToolContext, args: ScanFolderInput) -> ToolExecutio
             "review_url": ctx.review_url(scan_res.session_id),
         }
         if args.enable_embed:
-            payload["embed_note"] = "SigLIP 2 semantic indexing (--embed) activates in T11."
+            payload["embedded_count"] = scan_res.embedded_count
         return ToolExecutionResult.ok(payload)
 
     # Still running after `wait_seconds`: return job handle for polling via lightbox_job_status
@@ -748,59 +779,94 @@ def _handle_triage_uncertain(
     ctx: ToolContext,
     args: TriageUncertainInput,
 ) -> ToolExecutionResult:
-    try:
-        summary = ctx.services.review.get_session_summary(args.session_id)
-    except ValueError as exc:
-        return ToolExecutionResult.error(str(exc))
-
-    yellow_count = min(args.max_photos, summary.active_counts_by_bucket.get("yellow", 0))
-    burst_count = summary.unconfirmed_burst_count
-    total_units = min(args.max_photos, yellow_count + burst_count)
-    # Conservative local rough estimate (~$0.002 per uncertain crop / burst strip on Haiku-tier VLM)
-    est_usd = round(total_units * 0.002, 4)
-
     if args.dry_run:
+        try:
+            est = ctx.services.triage.estimate_triage(
+                args.session_id,
+                max_photos=args.max_photos,
+            )
+        except (ValueError, ModelError) as exc:
+            return ToolExecutionResult.error(str(exc))
+
         return ToolExecutionResult.ok(
             {
-                "session_id": args.session_id,
+                "session_id": est.session_id,
                 "dry_run": True,
-                "count": total_units,
-                "yellow_count": yellow_count,
-                "unconfirmed_burst_count": burst_count,
-                "est_usd": est_usd,
-                "vlm_backend_ready": False,
-                "note": (
-                    "Dry-run estimate computed locally. Concurrent VLM batch triage backend activates in T10; "
-                    "for small sets (<= 8 photos) you may inspect crops directly via lightbox_get_photo or lightbox_compare_burst."
-                ),
+                "count": est.total_units,
+                "yellow_count": est.yellow_count,
+                "unconfirmed_burst_count": est.burst_count,
+                "total_yellow_available": est.total_yellow_available,
+                "total_bursts_available": est.total_bursts_available,
+                "skipped_bursts_due_to_limit": est.skipped_bursts_due_to_limit,
+                "note": est.note,
+                "est_usd": est.est_usd,
+                "profile": est.profile,
+                "model_alias": est.model_alias,
+                "model_id": est.model_id,
+                "provider": est.provider,
+                "vlm_backend_ready": est.vlm_backend_ready,
+                "session_spent_usd": est.session_spent_usd,
+                "session_budget_usd": est.session_budget_usd,
+                "monthly_spent_usd": est.monthly_spent_usd,
+                "monthly_budget_usd": est.monthly_budget_usd,
+                "review_url": ctx.review_url(args.session_id),
             }
         )
 
-    return ToolExecutionResult.error(
-        "Concurrent VLM batch triage backend is not yet enabled (activates in T10 ModelRouter). "
-        "Call with dry_run=true to estimate scope, inspect <= 8 uncertain photos via lightbox_get_photo / "
-        "lightbox_compare_burst, or review in Web UI.",
-        data={
-            "session_id": args.session_id,
-            "count": total_units,
-            "est_usd": est_usd,
+    try:
+        res = ctx.services.triage.run_triage_sync(
+            args.session_id,
+            max_photos=args.max_photos,
+            on_progress=ctx.progress_callback,
+        )
+    except (ValueError, MissingAPIKeyError, ModelError) as exc:
+        return ToolExecutionResult.error(
+            str(exc),
+            data={
+                "session_id": args.session_id,
+                "review_url": ctx.review_url(args.session_id),
+            },
+        )
+
+    return ToolExecutionResult.ok(
+        {
+            "job_id": res.job_id,
+            "session_id": res.session_id,
+            "dry_run": False,
+            "status": res.status,
+            "paused_reason": res.paused_reason,
+            "yellow_total": res.yellow_total,
+            "burst_total": res.burst_total,
+            "reviewed_yellow": res.reviewed_yellow,
+            "reviewed_bursts": res.reviewed_bursts,
+            "failed_yellow": res.failed_yellow,
+            "failed_bursts": res.failed_bursts,
+            "failed_count": res.failed_count,
+            "cache_hits": res.cache_hits,
+            "paid_calls": res.paid_calls,
+            "fresh_calls": res.fresh_calls,
+            "spent_usd": res.spent_usd,
+            "model_id": res.model_id,
+            "provider": res.provider,
             "review_url": ctx.review_url(args.session_id),
-        },
+        }
     )
 
 
 def _handle_search_photos(ctx: ToolContext, args: SearchPhotosInput) -> ToolExecutionResult:
     try:
-        matches = ctx.services.review.search_photos(
+        res = ctx.services.search.search_photos(
             args.query,
             session_id=args.session_id,
             date_from=args.date_from,
             camera=args.camera,
             limit=args.limit,
+            lang=ctx.lang,
         )
-    except ValueError as exc:
+    except (ValueError, EmbedderError) as exc:
         return ToolExecutionResult.error(str(exc))
 
+    matches = [m.to_dict() for m in res.matches]
     review_session = args.session_id or (matches[0]["session_id"] if matches else None)
     review_url = (
         ctx.review_url(str(review_session))
@@ -809,9 +875,11 @@ def _handle_search_photos(ctx: ToolContext, args: SearchPhotosInput) -> ToolExec
     )
     return ToolExecutionResult.ok(
         {
-            "query": args.query,
-            "mode": "fts_exif",
-            "semantic_ready": False,
+            "query": res.query,
+            "mode": res.mode,
+            "semantic_ready": res.semantic_ready,
+            "indexed_count": res.indexed_count,
+            "total_candidates": res.total_candidates,
             "matches": matches,
             "review_url": review_url,
         }
@@ -820,21 +888,22 @@ def _handle_search_photos(ctx: ToolContext, args: SearchPhotosInput) -> ToolExec
 
 def _handle_find_similar(ctx: ToolContext, args: FindSimilarInput) -> ToolExecutionResult:
     try:
-        anchor, similar = ctx.services.review.find_similar_photos(
+        res = ctx.services.search.find_similar(
             args.photo_id,
             limit=args.limit,
+            lang=ctx.lang,
         )
-    except ValueError as exc:
+    except (ValueError, EmbedderError) as exc:
         return ToolExecutionResult.error(str(exc))
 
     return ToolExecutionResult.ok(
         {
-            "anchor_id": anchor.id,
-            "session_id": anchor.session_id,
-            "mode": "burst_dhash",
-            "semantic_ready": False,
-            "similar": similar,
-            "review_url": ctx.review_url(anchor.session_id),
+            "anchor_id": res.anchor_id,
+            "session_id": res.session_id,
+            "mode": res.mode,
+            "semantic_ready": res.semantic_ready,
+            "similar": [m.to_dict() for m in res.similar],
+            "review_url": ctx.review_url(res.session_id),
         }
     )
 
@@ -988,6 +1057,24 @@ def _handle_restore_plan(ctx: ToolContext, args: RestorePlanInput) -> ToolExecut
     )
 
 
+def _handle_shooting_digest(
+    ctx: ToolContext,
+    args: ShootingDigestInput,
+) -> ToolExecutionResult:
+    try:
+        report = ctx.services.digest.generate_digest(
+            session_id=args.session_id,
+            date_from=args.date_from,
+            date_to=args.date_to,
+            min_samples=args.min_samples,
+            lang=ctx.lang,
+        )
+    except ValueError as exc:
+        return ToolExecutionResult.error(str(exc))
+
+    return ToolExecutionResult.ok(report.to_dict())
+
+
 # ---------------------------------------------------------------------------
 # ToolSpec & ToolRegistry
 # ---------------------------------------------------------------------------
@@ -998,7 +1085,7 @@ class ToolSpec:
     """Unified tool specification shared by MCP Server and built-in Agent."""
 
     name: str
-    mcp_name: str
+    mcp_name: str | None
     description: str
     risk_level: RiskLevel
     agent_allowed: bool
@@ -1030,10 +1117,11 @@ class ToolRegistry:
     def register(self, spec: ToolSpec) -> None:
         if spec.name in self._by_name:
             raise ValueError(f"Duplicate tool name: {spec.name}")
-        if spec.mcp_name in self._by_mcp_name:
-            raise ValueError(f"Duplicate MCP tool name: {spec.mcp_name}")
+        if spec.mcp_name is not None:
+            if spec.mcp_name in self._by_mcp_name:
+                raise ValueError(f"Duplicate MCP tool name: {spec.mcp_name}")
+            self._by_mcp_name[spec.mcp_name] = spec
         self._by_name[spec.name] = spec
-        self._by_mcp_name[spec.mcp_name] = spec
 
     def add_pre_hook(self, hook: PreExecuteHook) -> None:
         self._pre_hooks.append(hook)
@@ -1111,6 +1199,23 @@ class ToolRegistry:
                 f"Tool {spec.name!r} is forbidden on the agent surface (SPEC §7.1/§7.3)."
             )
 
+        # MCP surface hard invariant: never execute agent-only tools over MCP (SPEC §7.3, §8.2)
+        if ctx.surface.startswith("mcp:") and spec.mcp_name is None:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            ctx.services.system.record_audit_log(
+                surface=ctx.surface,
+                tool_name=spec.name,
+                hook_decision="deny",
+                args_redacted=redacted,
+                duration_ms=elapsed_ms,
+                summary="Tool not exposed on MCP surface",
+            )
+            return ToolExecutionResult.error(
+                f"Tool {spec.name!r} is not exposed on the MCP surface (SPEC §7.3/§8.2)."
+            )
+
+        tool_log_name = spec.mcp_name or spec.name
+
         for pre_hook in self._pre_hooks:
             decision, reason = pre_hook(spec, arguments, ctx)
             if decision != "allow":
@@ -1129,10 +1234,10 @@ class ToolRegistry:
             validated = spec.input_model.model_validate(arguments)
         except ValidationError as exc:
             elapsed_ms = int((time.monotonic() - started) * 1000)
-            msg = f"Invalid arguments for {spec.mcp_name}: {exc.errors()}"
+            msg = f"Invalid arguments for {tool_log_name}: {exc.errors()}"
             ctx.services.system.record_audit_log(
                 surface=ctx.surface,
-                tool_name=spec.mcp_name,
+                tool_name=tool_log_name,
                 hook_decision="deny",
                 args_redacted=redacted,
                 duration_ms=elapsed_ms,
@@ -1169,7 +1274,7 @@ class ToolRegistry:
         )
         ctx.services.system.record_audit_log(
             surface=ctx.surface,
-            tool_name=spec.mcp_name,
+            tool_name=tool_log_name,
             hook_decision=decision_str,
             args_redacted=redacted,
             duration_ms=elapsed_ms,
@@ -1314,7 +1419,7 @@ def _build_default_specs() -> list[ToolSpec]:
         ToolSpec(
             name="search_photos",
             mcp_name="lightbox_search_photos",
-            description="Search scanned photos using FTS5, EXIF filters (date_from, camera), and metadata (semantic SigLIP 2 activates in T11).",
+            description="Search scanned photos using EXIF/session/date filters and local SigLIP 2 bilingual semantic vector similarity (with FTS5/EXIF fallback).",
             risk_level="READ",
             agent_allowed=True,
             input_model=SearchPhotosInput,
@@ -1326,7 +1431,7 @@ def _build_default_specs() -> list[ToolSpec]:
         ToolSpec(
             name="find_similar",
             mcp_name="lightbox_find_similar",
-            description="Find similar compositions, burst siblings, or reshoots anchored on a photo_id.",
+            description="Find visually similar photos via local SigLIP 2 vector cosine similarity (with burst/dHash fallback), excluding the anchor photo itself.",
             risk_level="READ",
             agent_allowed=True,
             input_model=FindSimilarInput,
@@ -1377,6 +1482,21 @@ def _build_default_specs() -> list[ToolSpec]:
             destructive_hint=False,
             idempotent_hint=False,
         ),
+        ToolSpec(
+            name="shooting_digest",
+            mcp_name=None,
+            description=(
+                "Generate a deterministic SQL-backed shooting digest (daily report) separating technical "
+                "rejects from burst non-picks, with counts, ratios, single-dimension slices, and focal x shutter setups."
+            ),
+            risk_level="READ",
+            agent_allowed=True,
+            input_model=ShootingDigestInput,
+            handler=_handle_shooting_digest,
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+        ),
     ]
 
 
@@ -1397,6 +1517,7 @@ __all__ = [
     "SearchPhotosInput",
     "SessionSummaryInput",
     "SetVerdictInput",
+    "ShootingDigestInput",
     "ToolContext",
     "ToolExecutionResult",
     "ToolImagePayload",

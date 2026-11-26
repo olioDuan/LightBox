@@ -13,6 +13,8 @@ from numpy.typing import NDArray
 from lightbox.store.db import Database
 
 DEFAULT_EMBEDDING_DIM = 768
+_SQLITE_VEC_MAX_K = 4096
+_SQLITE_IN_CHUNK_SIZE = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +69,10 @@ class VectorIndex(Protocol):
         top_k: int = 10,
         filter_content_fps: set[str] | None = None,
     ) -> list[VectorMatch]: ...
+
+    def get(self, content_fp: str, model_id: str) -> NDArray[np.float32] | None: ...
+
+    def list_content_fps(self, model_id: str) -> set[str]: ...
 
     def count(self, model_id: str | None = None) -> int: ...
 
@@ -145,35 +151,135 @@ class SqliteVecIndex:
         if model_count == 0:
             return []
 
-        q_blob = _pack_float32(_normalize_vector(query_embedding, self.dim))
-        # When all stored vectors belong to the requested model_id and no subset filter is set,
-        # sqlite-vec's native k=top_k is exact; otherwise fetch across stored vectors and filter.
-        needs_post_filter = (model_count < total) or (filter_content_fps is not None)
-        k_limit = total if needs_post_filter else min(top_k, total)
+        q_vec = _normalize_vector(query_embedding, self.dim)
+        if filter_content_fps is not None:
+            if not filter_content_fps:
+                return []
+            return self._query_exact_numpy(
+                q_vec,
+                model_id=model_id,
+                top_k=top_k,
+                filter_content_fps=filter_content_fps,
+            )
 
-        rows = self.db.conn.execute(
+        # sqlite-vec's native `k` parameter is capped at 4096; only use native KNN when all stored
+        # rows belong to `model_id` and `k <= 4096`. Otherwise fall back to exact numpy dot product
+        # over the matching rows so libraries with >4096 photos never hit sqlite-vec's KNN cap.
+        if model_count == total and min(top_k, total) <= _SQLITE_VEC_MAX_K:
+            q_blob = _pack_float32(q_vec)
+            k_limit = min(top_k, total)
+            rows = self.db.conn.execute(
+                """
+                SELECT m.content_fp, v.distance
+                FROM vec_photos v
+                JOIN vec_map m ON m.rowid = v.rowid
+                WHERE v.embedding MATCH ? AND k = ?
+                ORDER BY v.distance ASC, m.content_fp ASC
+                """,
+                (q_blob, k_limit),
+            ).fetchall()
+            return [
+                VectorMatch(
+                    content_fp=str(row["content_fp"]),
+                    distance=float(row["distance"]),
+                    score=1.0 - float(row["distance"]),
+                )
+                for row in rows[:top_k]
+            ]
+
+        return self._query_exact_numpy(
+            q_vec,
+            model_id=model_id,
+            top_k=top_k,
+            filter_content_fps=None,
+        )
+
+    def _query_exact_numpy(
+        self,
+        q_vec: NDArray[np.float32],
+        *,
+        model_id: str,
+        top_k: int,
+        filter_content_fps: set[str] | None,
+    ) -> list[VectorMatch]:
+        """Exact cosine search in numpy over stored SQLite vectors (avoids sqlite-vec k<=4096 cap)."""
+        fps: list[str] = []
+        raw_blobs: list[bytes] = []
+
+        if filter_content_fps is not None:
+            fp_list = sorted(filter_content_fps)
+            for start in range(0, len(fp_list), _SQLITE_IN_CHUNK_SIZE):
+                chunk = fp_list[start : start + _SQLITE_IN_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self.db.conn.execute(
+                    f"""
+                    SELECT m.content_fp, v.embedding
+                    FROM vec_map m
+                    JOIN vec_photos v ON v.rowid = m.rowid
+                    WHERE m.model_id = ? AND m.content_fp IN ({placeholders})
+                    """,
+                    (model_id, *chunk),
+                ).fetchall()
+                for row in rows:
+                    if row["embedding"] is not None:
+                        fps.append(str(row["content_fp"]))
+                        raw_blobs.append(bytes(row["embedding"]))
+        else:
+            rows = self.db.conn.execute(
+                """
+                SELECT m.content_fp, v.embedding
+                FROM vec_map m
+                JOIN vec_photos v ON v.rowid = m.rowid
+                WHERE m.model_id = ?
+                """,
+                (model_id,),
+            ).fetchall()
+            for row in rows:
+                if row["embedding"] is not None:
+                    fps.append(str(row["content_fp"]))
+                    raw_blobs.append(bytes(row["embedding"]))
+
+        if not fps:
+            return []
+
+        joined = b"".join(raw_blobs)
+        matrix = np.frombuffer(joined, dtype="<f4").reshape(len(fps), self.dim)
+        sims = matrix @ q_vec
+        dists = 1.0 - sims
+
+        ranked = sorted(
+            ((float(dists[i]), fps[i], float(sims[i])) for i in range(len(fps))),
+            key=lambda item: (item[0], item[1]),
+        )
+        return [
+            VectorMatch(content_fp=fp, distance=dist, score=sim)
+            for dist, fp, sim in ranked[:top_k]
+        ]
+
+    def get(self, content_fp: str, model_id: str) -> NDArray[np.float32] | None:
+        row = self.db.conn.execute(
             """
-            SELECT m.content_fp, m.model_id, v.distance
+            SELECT v.embedding
             FROM vec_photos v
             JOIN vec_map m ON m.rowid = v.rowid
-            WHERE v.embedding MATCH ? AND k = ?
-            ORDER BY v.distance ASC, m.content_fp ASC
+            WHERE m.content_fp = ? AND m.model_id = ?
             """,
-            (q_blob, k_limit),
-        ).fetchall()
+            (content_fp, model_id),
+        ).fetchone()
+        if row is None or row["embedding"] is None:
+            return None
+        blob = bytes(row["embedding"])
+        arr = np.frombuffer(blob, dtype="<f4").astype(np.float32, copy=True)
+        if arr.shape != (self.dim,):
+            return None
+        return arr
 
-        matches: list[VectorMatch] = []
-        for row in rows:
-            if str(row["model_id"]) != model_id:
-                continue
-            fp = str(row["content_fp"])
-            if filter_content_fps is not None and fp not in filter_content_fps:
-                continue
-            dist = float(row["distance"])
-            matches.append(VectorMatch(content_fp=fp, distance=dist, score=1.0 - dist))
-            if len(matches) >= top_k:
-                break
-        return matches
+    def list_content_fps(self, model_id: str) -> set[str]:
+        rows = self.db.conn.execute(
+            "SELECT content_fp FROM vec_map WHERE model_id = ?",
+            (model_id,),
+        ).fetchall()
+        return {str(row["content_fp"]) for row in rows}
 
     def count(self, model_id: str | None = None) -> int:
         if model_id is None:
@@ -243,6 +349,16 @@ class NumpyVectorIndex:
             VectorMatch(content_fp=fp, distance=dist, score=sim)
             for dist, fp, sim in ranked[:top_k]
         ]
+
+    def get(self, content_fp: str, model_id: str) -> NDArray[np.float32] | None:
+        bucket = self._vectors.get(model_id)
+        if not bucket or content_fp not in bucket:
+            return None
+        return bucket[content_fp].copy()
+
+    def list_content_fps(self, model_id: str) -> set[str]:
+        bucket = self._vectors.get(model_id)
+        return set(bucket.keys()) if bucket else set()
 
     def count(self, model_id: str | None = None) -> int:
         if model_id is None:

@@ -13,6 +13,7 @@ from typing import Any
 
 import anyio
 import mcp.types as types
+import pytest
 from mcp.client.session import ClientSession
 from mcp.shared.memory import create_client_server_memory_streams
 from PIL import Image
@@ -95,8 +96,15 @@ def _assert_no_token_in_urls(payload: Any) -> None:
             _assert_no_token_in_urls(item)
 
 
-def test_mcp_in_memory_full_contract_and_approval_gate(tmp_path: Path) -> None:
+def test_mcp_in_memory_full_contract_and_approval_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify all 14 tools, 4 resources, 3 prompts, tokenless URLs, and approval enforcement."""
+    for env_var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setattr("lightbox.models.secrets._read_from_keyring", lambda _var: None)
+
     home = tmp_path / "lightbox_home"
     shoot_dir = tmp_path / "demo_shoot"
     build_demo_dataset(shoot_dir)

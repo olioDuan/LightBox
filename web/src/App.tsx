@@ -2,38 +2,53 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import { getMessages, I18nContext, type Lang } from "./i18n";
 import { InsightsView } from "./views/InsightsView";
+import { PeopleView } from "./views/PeopleView";
 import { ReviewView } from "./views/ReviewView";
+import { SearchView } from "./views/SearchView";
 import { SessionsView } from "./views/SessionsView";
 
 type Route =
   | { name: "sessions" }
   | { name: "review"; sessionId: string }
-  | { name: "insights" };
+  | { name: "search" }
+  | { name: "people" }
+  | { name: "insights"; tab: "digest" | "trash" };
 
-function parseRoute(pathname: string): Route {
+function parseRoute(pathname: string, search = ""): Route {
   const reviewMatch = pathname.match(/^\/sessions\/([^/]+)\/review\/?$/);
   if (reviewMatch) {
     return { name: "review", sessionId: decodeURIComponent(reviewMatch[1]) };
   }
+  if (pathname === "/search" || pathname === "/search/") {
+    return { name: "search" };
+  }
+  if (pathname === "/people" || pathname === "/people/") {
+    return { name: "people" };
+  }
   if (pathname === "/insights" || pathname === "/insights/") {
-    return { name: "insights" };
+    const params = new URLSearchParams(search);
+    const tab = params.get("tab") === "trash" ? "trash" : "digest";
+    return { name: "insights", tab };
   }
   return { name: "sessions" };
 }
 
 export function App() {
-  const [route, setRoute] = useState<Route>(() => parseRoute(window.location.pathname));
+  const [route, setRoute] = useState<Route>(() =>
+    parseRoute(window.location.pathname, window.location.search),
+  );
   const [lang, setLangState] = useState<Lang>("zh-CN");
   const [authState, setAuthState] = useState<"checking" | "authed" | "needs_confirm">("checking");
   const [authError, setAuthError] = useState<string | null>(null);
 
   const navigate = (path: string) => {
     window.history.pushState({}, "", path);
-    setRoute(parseRoute(path));
+    const url = new URL(path, window.location.origin);
+    setRoute(parseRoute(url.pathname, url.search));
   };
 
   useEffect(() => {
-    const onPop = () => setRoute(parseRoute(window.location.pathname));
+    const onPop = () => setRoute(parseRoute(window.location.pathname, window.location.search));
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
@@ -107,6 +122,28 @@ export function App() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => navigate("/search")}
+                  className={`rounded-md px-3 py-1.5 text-sm ${
+                    route.name === "search"
+                      ? "bg-[#242629] text-[#F3F4F6]"
+                      : "text-[#9CA3AF] hover:text-[#F3F4F6]"
+                  }`}
+                >
+                  {t.navSearch}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigate("/people")}
+                  className={`rounded-md px-3 py-1.5 text-sm ${
+                    route.name === "people"
+                      ? "bg-[#242629] text-[#F3F4F6]"
+                      : "text-[#9CA3AF] hover:text-[#F3F4F6]"
+                  }`}
+                >
+                  {t.navPeople}
+                </button>
+                <button
+                  type="button"
                   onClick={() => navigate("/insights")}
                   className={`rounded-md px-3 py-1.5 text-sm ${
                     route.name === "insights"
@@ -150,10 +187,17 @@ export function App() {
           <ReviewView
             sessionId={route.sessionId}
             onBack={() => navigate("/")}
-            onGoInsights={() => navigate("/insights")}
+            onGoInsights={() => navigate("/insights?tab=trash")}
           />
+        ) : route.name === "search" ? (
+          <SearchView onOpenReview={(id) => navigate(`/sessions/${encodeURIComponent(id)}/review`)} />
+        ) : route.name === "people" ? (
+          <PeopleView onOpenReview={(id) => navigate(`/sessions/${encodeURIComponent(id)}/review`)} />
         ) : route.name === "insights" ? (
-          <InsightsView />
+          <InsightsView
+            activeTab={route.tab}
+            onChangeTab={(tab) => navigate(tab === "trash" ? "/insights?tab=trash" : "/insights")}
+          />
         ) : (
           <SessionsView onOpenReview={(id) => navigate(`/sessions/${encodeURIComponent(id)}/review`)} />
         )}

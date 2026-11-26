@@ -34,7 +34,13 @@ via Python wheels, or installed as optional extras:
    - License: Artistic License / GPL (Perl standard terms)
    - https://exiftool.org/
 
-6. Optional Extra: lightbox-cull[heic] (pillow-heif)
+6. SigLIP 2 Base (google/siglip2-base-patch16-256 / ONNX)
+   - License: Apache License, Version 2.0
+   - Model weights are NOT bundled or redistributed in this repository; they are
+     downloaded on demand by the user into `<APP_DATA_DIR>/models/`.
+   - https://github.com/google-research/big_vision
+
+7. Optional Extra: lightbox-cull[heic] (pillow-heif)
    - pillow-heif Python wrapper: BSD-3-Clause
    - Underlying libheif / libde265 codecs: LGPL-3.0-or-later
    - Certain prebuilt wheels or system builds may include x265 (GPL-2.0)

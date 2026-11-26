@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import io
 import math
 import os
+import secrets
+import shutil
+import tempfile
 import urllib.request
 import zipfile
 from collections.abc import Sequence
@@ -19,10 +21,12 @@ from numpy.typing import NDArray
 
 from lightbox.core.detector import ENGINE_VERSION, DetectedFace, PhotoContext
 from lightbox.core.metrics import compute_region_sharpness
+from lightbox.fs import DestinationExistsError, SafeFS
 from lightbox.paths import AppPaths, get_app_paths
 
 ANTELOPEV2_DIRNAME = "antelopev2"
 DET_MODEL_FILENAME = "det_10g.onnx"
+DET_MODEL_FILENAMES: tuple[str, ...] = ("scrfd_10g_bnkps.onnx", "det_10g.onnx")
 DEFAULT_DET_INPUT_SIZE = (640, 640)
 
 # Decoupled thresholds (SPEC §4.2, PLAN T05):
@@ -62,32 +66,28 @@ class FaceBackend(Protocol):
 
 
 def find_face_model_path(app_paths: AppPaths | None = None) -> Path | None:
-    """Locate `det_10g.onnx` under `<APP_DATA_DIR>/models/antelopev2/` or `<APP_DATA_DIR>/models/`."""
+    """Locate `scrfd_10g_bnkps.onnx` or `det_10g.onnx` under `<APP_DATA_DIR>/models/antelopev2/` or `<APP_DATA_DIR>/models/`."""
     paths = app_paths or get_app_paths()
-    candidates = (
-        paths.models_dir / ANTELOPEV2_DIRNAME / DET_MODEL_FILENAME,
-        paths.models_dir / DET_MODEL_FILENAME,
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+    for base in (paths.models_dir / ANTELOPEV2_DIRNAME, paths.models_dir):
+        for filename in DET_MODEL_FILENAMES:
+            candidate = base / filename
+            if candidate.is_file():
+                return candidate
     return None
 
 
-def ensure_face_model(
+def download_antelopev2_archive(
     app_paths: AppPaths | None = None,
     *,
-    allow_download: bool = False,
     download_url: str | None = None,
-    timeout_s: float = 60.0,
-) -> Path | None:
-    """Return local path to `det_10g.onnx`, optionally downloading `antelopev2.zip` on demand."""
-    existing = find_face_model_path(app_paths)
-    if existing is not None:
-        return existing
-    if not allow_download:
-        return None
+    timeout_s: float = 120.0,
+) -> Path:
+    """Stream-download `antelopev2.zip` and atomically extract `.onnx` models into `<APP_DATA_DIR>/models/antelopev2/`.
 
+    Streams to a disk-backed temporary file (no full-archive RAM buffering) and extracts each ONNX
+    file to a `.part` sibling before committing via `SafeFS.rename_same_volume` so interrupted
+    downloads never leave half-written `.onnx` files behind.
+    """
     paths = app_paths or get_app_paths()
     target_dir = paths.models_dir / ANTELOPEV2_DIRNAME
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -96,21 +96,56 @@ def ensure_face_model(
     if not url.startswith(("https://", "http://")):
         raise ValueError(f"Unsupported model download URL scheme: {url}")
 
+    safe_fs = SafeFS()
     req = urllib.request.Request(url, headers={"User-Agent": "lightbox-cull/0.1"})
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
-        archive_bytes = resp.read()
+    with tempfile.TemporaryFile() as tmp_zip:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+            shutil.copyfileobj(resp, tmp_zip, length=1024 * 1024)
+        tmp_zip.seek(0)
 
-    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            basename = Path(info.filename).name
-            if not basename.endswith(".onnx"):
-                continue
-            dest = target_dir / basename
-            dest.write_bytes(zf.read(info))
+        with zipfile.ZipFile(tmp_zip) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                basename = Path(info.filename).name
+                if not basename.endswith(".onnx"):
+                    continue
+                dest = target_dir / basename
+                if dest.is_file():
+                    continue
+                part_path = target_dir / f".{basename}.{secrets.token_hex(6)}.part"
+                with zf.open(info, "r") as src_stream, part_path.open("wb") as dst_stream:
+                    shutil.copyfileobj(src_stream, dst_stream, length=1024 * 1024)
+                    dst_stream.flush()
+                    os.fsync(dst_stream.fileno())
+                try:
+                    safe_fs.rename_same_volume(part_path, dest, allow_suffix=False)
+                except DestinationExistsError:
+                    # Another worker/thread already committed `dest` cleanly
+                    pass
+    return target_dir
 
-    return find_face_model_path(paths)
+
+def ensure_face_model(
+    app_paths: AppPaths | None = None,
+    *,
+    allow_download: bool = False,
+    download_url: str | None = None,
+    timeout_s: float = 120.0,
+) -> Path | None:
+    """Return local path to InsightFace SCRFD detector (`scrfd_10g_bnkps.onnx` / `det_10g.onnx`), downloading on demand."""
+    existing = find_face_model_path(app_paths)
+    if existing is not None:
+        return existing
+    if not allow_download:
+        return None
+
+    download_antelopev2_archive(
+        app_paths,
+        download_url=download_url,
+        timeout_s=timeout_s,
+    )
+    return find_face_model_path(app_paths)
 
 
 def _nms_xyxy(
@@ -510,6 +545,7 @@ __all__ = [
     "ANTELOPEV2_DIRNAME",
     "DEFAULT_DET_INPUT_SIZE",
     "DET_MODEL_FILENAME",
+    "DET_MODEL_FILENAMES",
     "FACE_DET_SCORE_THRESHOLD",
     "FACE_NMS_IOU_THRESHOLD",
     "FACE_OOF_ABS_THRESHOLD",
@@ -521,6 +557,7 @@ __all__ = [
     "RawFaceDetection",
     "ScrfdOnnxBackend",
     "decode_scrfd_outputs",
+    "download_antelopev2_archive",
     "ensure_face_model",
     "evaluate_subject_faces_oof",
     "find_face_model_path",

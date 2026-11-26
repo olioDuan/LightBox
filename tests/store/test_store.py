@@ -63,10 +63,10 @@ def test_db_pragmas_and_idempotent_migrations(tmp_path: Path) -> None:
 
         first = db.migrate()
         second = db.migrate()
-        assert first == [1, 2]
+        assert first == [1, 2, 3, 4]
         assert second == []
 
-        # Verify migration 002 columns exist
+        # Verify migration 002 & 003 columns exist
         exif_cols = {
             str(r["name"]) for r in db.conn.execute("PRAGMA table_info(exif_data)").fetchall()
         }
@@ -79,6 +79,10 @@ def test_db_pragmas_and_idempotent_migrations(tmp_path: Path) -> None:
             str(r["name"]) for r in db.conn.execute("PRAGMA table_info(faces)").fetchall()
         }
         assert {"landmarks_json", "det_score"} <= faces_cols
+        llm_cols = {
+            str(r["name"]) for r in db.conn.execute("PRAGMA table_info(llm_calls)").fetchall()
+        }
+        assert {"session_id", "cache_hit"} <= llm_cols
 
         tables = {
             str(row[0])
@@ -110,6 +114,9 @@ def test_db_pragmas_and_idempotent_migrations(tmp_path: Path) -> None:
             "plans",
             "plan_items",
             "audit_logs",
+            "people",
+            "face_embeddings",
+            "face_assignments",
             "effective_verdicts",
         }
         assert expected <= tables

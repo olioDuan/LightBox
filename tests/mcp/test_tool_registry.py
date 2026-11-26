@@ -48,6 +48,7 @@ def test_agent_schemas_strictly_exclude_apply_and_restore_plan() -> None:
     assert "apply_plan" not in default_names
     assert "restore_plan" not in default_names
     assert "create_plan" in default_names
+    assert "shooting_digest" in default_names
 
     # Even if caller explicitly requests apply_plan, agent_schemas must refuse to expose it
     forced = {s["name"] for s in reg.agent_schemas(["apply_plan", "restore_plan", "create_plan"])}

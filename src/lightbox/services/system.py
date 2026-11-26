@@ -14,6 +14,11 @@ from typing import Any
 
 from lightbox.config import AppConfig, load_config
 from lightbox.core import find_exiftool, find_face_model_path
+from lightbox.models import (
+    find_face_embedder_model_path,
+    find_siglip2_text_path,
+    find_siglip2_vision_path,
+)
 from lightbox.paths import AppPaths
 from lightbox.store import Database, LightboxRepository
 
@@ -126,12 +131,21 @@ class SystemService:
             )
 
         face_model = find_face_model_path(self.app_paths)
-        if face_model is not None:
+        rec_model = find_face_embedder_model_path(self.app_paths)
+        if face_model is not None and rec_model is not None:
             checks.append(
                 DoctorCheckItem(
                     name="insightface_model",
                     status="ok",
-                    detail=f"det_10g.onnx cached at {face_model}",
+                    detail=f"{face_model.name} + {rec_model.name} cached under {face_model.parent}",
+                )
+            )
+        elif face_model is not None:
+            checks.append(
+                DoctorCheckItem(
+                    name="insightface_model",
+                    status="ok",
+                    detail=f"{face_model.name} cached at {face_model} (glintr100.onnx lazy-downloads on people index)",
                 )
             )
         else:
@@ -139,7 +153,34 @@ class SystemService:
                 DoctorCheckItem(
                     name="insightface_model",
                     status="warn",
-                    detail=f"antelopev2 det_10g.onnx not yet downloaded under {self.app_paths.models_dir}",
+                    detail=f"antelopev2 models not yet downloaded under {self.app_paths.models_dir}",
+                )
+            )
+
+        siglip_vis = find_siglip2_vision_path(self.app_paths)
+        siglip_txt, siglip_tok = find_siglip2_text_path(self.app_paths)
+        if siglip_vis is not None and siglip_txt is not None and siglip_tok is not None:
+            checks.append(
+                DoctorCheckItem(
+                    name="siglip2_model",
+                    status="ok",
+                    detail=f"SigLIP 2 vision + text ONNX cached under {siglip_vis.parent.parent}",
+                )
+            )
+        elif siglip_vis is not None:
+            checks.append(
+                DoctorCheckItem(
+                    name="siglip2_model",
+                    status="ok",
+                    detail=f"SigLIP 2 vision ONNX cached at {siglip_vis} (text tower lazy-loads on search)",
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheckItem(
+                    name="siglip2_model",
+                    status="warn",
+                    detail=f"SigLIP 2 ONNX not yet downloaded under {self.app_paths.models_dir} (lazy downloads on --embed / search)",
                 )
             )
 

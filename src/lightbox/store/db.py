@@ -335,6 +335,54 @@ MIGRATION_002_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("faces", "det_score", "REAL"),
 )
 
+MIGRATION_003_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("llm_calls", "session_id", "TEXT"),
+    ("llm_calls", "cache_hit", "INTEGER DEFAULT 0"),
+)
+
+MIGRATION_003_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_llm_calls_session_created ON llm_calls(session_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_calls_created ON llm_calls(created_at)",
+)
+
+MIGRATION_004_SQL = """\
+-- 7. People auto-classification tables (SPEC §3.2, PLAN T18)
+CREATE TABLE IF NOT EXISTS people (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    is_self INTEGER DEFAULT 0,
+    cover_content_fp TEXT,
+    cover_face_idx INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS face_embeddings (
+    content_fp TEXT NOT NULL,
+    face_idx INTEGER NOT NULL,
+    model_id TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    embedding_blob BLOB NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (content_fp, face_idx, model_id)
+);
+
+CREATE TABLE IF NOT EXISTS face_assignments (
+    content_fp TEXT NOT NULL,
+    face_idx INTEGER NOT NULL,
+    person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    confidence REAL,
+    cluster_id TEXT,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (content_fp, face_idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_face_assignments_person ON face_assignments(person_id);
+CREATE INDEX IF NOT EXISTS idx_face_assignments_cluster ON face_assignments(cluster_id);
+CREATE INDEX IF NOT EXISTS idx_face_assignments_status ON face_assignments(status);
+"""
+
 VEC_PHOTOS_DDL = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS vec_photos "
     "USING vec0(embedding float[768] distance_metric=cosine)"
@@ -343,6 +391,8 @@ VEC_PHOTOS_DDL = (
 MIGRATIONS: tuple[tuple[int, str, str | None], ...] = (
     (1, "001_initial_schema", MIGRATION_001_SQL),
     (2, "002_t045_digest_and_face_fields", None),
+    (3, "003_t10_llm_calls_budget_and_cache", None),
+    (4, "004_t18_people_classification", MIGRATION_004_SQL),
 )
 
 
@@ -412,6 +462,8 @@ class Database:
                         cur.execute(statement)
                 elif version == 2:
                     _apply_migration_002(cur)
+                elif version == 3:
+                    _apply_migration_003(cur)
                 cur.execute(
                     "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, name, time.time()),
@@ -459,8 +511,22 @@ class Database:
 
 def _apply_migration_002(cur: sqlite3.Cursor) -> None:
     """Idempotently add T04.5 columns to `exif_data`, `metrics`, and `faces`."""
+    _apply_column_additions(cur, MIGRATION_002_COLUMNS)
+
+
+def _apply_migration_003(cur: sqlite3.Cursor) -> None:
+    """Idempotently add T10 columns and indexes on `llm_calls`."""
+    _apply_column_additions(cur, MIGRATION_003_COLUMNS)
+    for idx_sql in MIGRATION_003_INDEXES:
+        cur.execute(idx_sql)
+
+
+def _apply_column_additions(
+    cur: sqlite3.Cursor,
+    columns: tuple[tuple[str, str, str], ...],
+) -> None:
     existing_by_table: dict[str, set[str]] = {}
-    for table, col_name, col_type in MIGRATION_002_COLUMNS:
+    for table, col_name, col_type in columns:
         if table not in existing_by_table:
             rows = cur.execute(f"PRAGMA table_info({table})").fetchall()
             existing_by_table[table] = {str(r["name"]) for r in rows}

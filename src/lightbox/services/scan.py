@@ -39,7 +39,9 @@ from lightbox.core import (
 )
 from lightbox.fs import is_camera_card_path, is_readonly_path
 from lightbox.jobs import JobRunner, ProgressCallback, StageWorkItem, make_cache_key
+from lightbox.models import Embedder
 from lightbox.paths import AppPaths
+from lightbox.services.search import SearchService
 from lightbox.store import (
     AssetRecord,
     ExifRecord,
@@ -49,6 +51,7 @@ from lightbox.store import (
     PhotoRecord,
     RootRecord,
     SessionRecord,
+    VectorIndex,
 )
 
 
@@ -91,6 +94,7 @@ class ScanResult:
     skipped_retryable: int
     elapsed_s: float
     status: str
+    embedded_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,11 +212,15 @@ class ScanService:
         config: AppConfig,
         *,
         job_runner: JobRunner | None = None,
+        vector_index: VectorIndex | None = None,
+        embedder: Embedder | None = None,
     ) -> None:
         self.repo = repo
         self.app_paths = app_paths
         self.config = config
         self.job_runner = job_runner or JobRunner(repo)
+        self.vector_index = vector_index
+        self.embedder = embedder
 
     def scan_folder(
         self,
@@ -225,6 +233,8 @@ class ScanService:
         exif_extractor: ExifExtractor | None = None,
         on_progress: ProgressCallback | None = None,
         worker_override: Any = None,
+        enable_embed: bool = False,
+        embedder: Embedder | None = None,
     ) -> ScanResult:
         """Scan `folder_path` end-to-end with resumable caching, burst detection, and verdicts."""
         started = time.monotonic()
@@ -600,7 +610,9 @@ class ScanService:
             counts[vo.bucket] = counts.get(vo.bucket, 0) + 1
             out = stage_res.results[vo.photo_id]
 
-            # Persist calibrated sharp_z and final motion_state back to metrics
+            # Persist calibrated sharp_z and final motion_state back to metrics (preserving scene_tag)
+            existing_metrics = self.repo.get_metrics(out.content_fp, ENGINE_VERSION)
+            preserved_scene_tag = existing_metrics.scene_tag if existing_metrics is not None else None
             exp_payload = dict(out.metrics.exposure)
             exp_payload["cell_sharpness_p50"] = out.metrics.cell_sharpness_p50
             exp_payload["face_model_tag"] = out.face_model_tag
@@ -617,6 +629,7 @@ class ScanService:
                     texture=out.metrics.texture,
                     face_count=vo.face_count,
                     face_sharp_min=vo.face_sharp_min,
+                    scene_tag=preserved_scene_tag,
                 )
             )
 
@@ -649,7 +662,7 @@ class ScanService:
                     session_name=root.name or "session",
                     rel_dir=photo.rel_dir,
                     stem=photo.stem,
-                    scene_tag="",
+                    scene_tag=preserved_scene_tag or "",
                 )
 
             self.repo.add_verdict(
@@ -664,6 +677,19 @@ class ScanService:
 
         if on_progress is not None:
             on_progress("calibrate", len(verdict_outputs), len(verdict_outputs))
+
+        # 5. Optional Stage 4: L2 SigLIP 2 embedding + zero-text-tower scene tagging (PLAN T11)
+        embedded_count = 0
+        active_embedder = embedder or self.embedder
+        if enable_embed and self.vector_index is not None and active_embedder is not None:
+            search_svc = SearchService(
+                self.repo,
+                self.vector_index,
+                active_embedder,
+                app_paths=self.app_paths,
+            )
+            embed_res = search_svc.index_session(session_id, on_progress=on_progress)
+            embedded_count = embed_res.indexed_count
 
         finished_ts = time.time()
         self.repo.upsert_session(
@@ -692,6 +718,7 @@ class ScanService:
             skipped_retryable=stage_res.skipped_retryable,
             elapsed_s=round(time.monotonic() - started, 3),
             status="completed",
+            embedded_count=embedded_count,
         )
 
     def get_job_status(self, job_id: str) -> JobStatusSummary:
