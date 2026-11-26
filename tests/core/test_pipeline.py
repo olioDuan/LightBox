@@ -32,6 +32,7 @@ from lightbox.i18n import (
     REASON_BURST_NON_PICK,
     REASON_EXTREME_EV_COMP_PROTECTED,
     REASON_EXTREME_EXPOSURE,
+    REASON_EYES_CLOSED,
     REASON_FACE_OUT_OF_FOCUS,
     REASON_IN_CAMERA_PROTECTED,
     REASON_IN_CAMERA_RATED,
@@ -726,6 +727,147 @@ def test_i18n_bilingual_rendering_and_tech_vs_burst_separation() -> None:
     assert "motion blur" in en.lower()
 
     assert is_tech_reject_reason([REASON_OUT_OF_FOCUS]) is True
+    assert is_tech_reject_reason([REASON_EYES_CLOSED]) is True
     assert is_tech_reject_reason([REASON_BURST_NON_PICK]) is False
     assert is_burst_cull_reason([REASON_BURST_NON_PICK]) is True
     assert is_burst_cull_reason([REASON_BURST_NON_PICK, REASON_MOTION_BLUR]) is False
+
+
+class _StubLandmark106Backend:
+    """Deterministic 106-point landmark stub with configurable eye aspect ratio."""
+
+    def __init__(self, ear: float) -> None:
+        self.ear = ear
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    def predict_landmarks_106(
+        self,
+        _image_rgb: NDArray[np.uint8],
+        bbox_px: tuple[float, float, float, float],
+    ) -> NDArray[np.float32]:
+        pts = np.zeros((106, 2), dtype=np.float32)
+        x1, y1, x2, y2 = bbox_px
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        eye_w = max(10.0, 0.25 * (x2 - x1))
+        half_h = 0.5 * eye_w * self.ear
+
+        def _fill_eye(corners: tuple[int, int], pairs: tuple[tuple[int, int], ...], ecx: float) -> None:
+            pts[corners[0]] = (ecx - 0.5 * eye_w, cy)
+            pts[corners[1]] = (ecx + 0.5 * eye_w, cy)
+            for idx_i, (u, lo) in enumerate(pairs):
+                px = ecx + (idx_i - 1) * (0.25 * eye_w)
+                pts[u] = (px, cy - half_h)
+                pts[lo] = (px, cy + half_h)
+
+        _fill_eye((35, 39), ((41, 36), (40, 33), (42, 37)), cx - 0.2 * (x2 - x1))
+        _fill_eye((89, 93), ((95, 90), (94, 87), (96, 91)), cx + 0.2 * (x2 - x1))
+        return pts
+
+
+def test_offline_closed_eye_detection_flags_yellow_never_red() -> None:
+    """Frontal face with closed eyes flags `yellow` + `eyes_closed`; open eyes & extreme profiles stay `normal`."""
+    img = _make_sharp_scene(512, 512, seed=42)
+    m = compute_image_metrics(img)
+    frontal_face = RawFaceDetection(
+        bbox_px=(180.0, 140.0, 300.0, 280.0),
+        landmarks_px=(
+            (215.0, 195.0),
+            (265.0, 195.0),
+            (240.0, 220.0),
+            (220.0, 250.0),
+            (260.0, 250.0),
+        ),
+        det_score=0.92,
+    )
+
+    # 1. Closed eyes (EAR = 0.11) -> detected as eyes_closed, verdict capped at yellow
+    fd_closed = FaceDetector(
+        backend=_StubFaceBackend([frontal_face]),
+        landmark_backend=_StubLandmark106Backend(ear=0.11),
+    )
+    ctx_closed = PhotoContext(
+        photo_id="blink_1",
+        content_fp="fp_blink_1",
+        analysis_img=img,
+        metrics={"sharp_p95": m.sharp_p95, "noise_sigma": m.noise_sigma},
+    )
+    out_closed = fd_closed.run(ctx_closed)
+    assert out_closed["eyes_closed"] is True
+    assert out_closed["eye_ear_min"] is not None and out_closed["eye_ear_min"] <= 0.12
+
+    verdict_closed = _eval_with_sharp_peers(
+        PhotoEvaluationInput(
+            photo_id="blink_1",
+            content_fp="fp_blink_1",
+            metrics=m,
+            dhash=compute_dhash(img),
+            faces=ctx_closed.faces,
+            eyes_closed=True,
+            eye_ear_min=out_closed["eye_ear_min"],
+        )
+    )["target"]
+    assert verdict_closed.bucket == "yellow"  # type: ignore[attr-defined]
+    assert REASON_EYES_CLOSED in verdict_closed.reason_codes  # type: ignore[attr-defined]
+
+    # 2. Open eyes (EAR = 0.28) -> stays normal
+    fd_open = FaceDetector(
+        backend=_StubFaceBackend([frontal_face]),
+        landmark_backend=_StubLandmark106Backend(ear=0.28),
+    )
+    ctx_open = PhotoContext(
+        photo_id="open_1",
+        content_fp="fp_open_1",
+        analysis_img=img,
+        metrics={"sharp_p95": m.sharp_p95, "noise_sigma": m.noise_sigma},
+    )
+    out_open = fd_open.run(ctx_open)
+    assert out_open["eyes_closed"] is False
+
+    # 3. Strong side profile (nose right on top of left eye, yaw_ratio ~ 0.05) -> skipped cleanly
+    profile_face = RawFaceDetection(
+        bbox_px=(180.0, 140.0, 300.0, 280.0),
+        landmarks_px=(
+            (200.0, 195.0),
+            (265.0, 195.0),
+            (203.0, 220.0),
+            (210.0, 250.0),
+            (250.0, 250.0),
+        ),
+        det_score=0.90,
+    )
+    fd_profile = FaceDetector(
+        backend=_StubFaceBackend([profile_face]),
+        landmark_backend=_StubLandmark106Backend(ear=0.10),
+    )
+    ctx_profile = PhotoContext(
+        photo_id="prof_1",
+        content_fp="fp_prof_1",
+        analysis_img=img,
+        metrics={"sharp_p95": m.sharp_p95, "noise_sigma": m.noise_sigma},
+    )
+    assert fd_profile.run(ctx_profile)["eyes_closed"] is False
+
+
+def test_wide_group_photo_faces_below_003_are_retained_while_tiny_noise_filtered() -> None:
+    """Full-body/wide group photo faces (~0.09%–0.25% area, high score) are retained for People grouping."""
+    img = _make_sharp_scene(1000, 1000, seed=77)
+    # 2 group friends: 30x30px each -> area_ratio = 900 / 1_000_000 = 0.0009, high det_score = 0.85
+    # 1 low-confidence small false positive (0.0009, score=0.55) -> filtered out
+    # 1 microscopic distant dot (15x15 -> 0.000225, score=0.90) -> filtered out
+    dets = [
+        RawFaceDetection(bbox_px=(100.0, 100.0, 130.0, 130.0), landmarks_px=None, det_score=0.86),
+        RawFaceDetection(bbox_px=(200.0, 100.0, 230.0, 130.0), landmarks_px=None, det_score=0.84),
+        RawFaceDetection(bbox_px=(300.0, 100.0, 330.0, 130.0), landmarks_px=None, det_score=0.55),
+        RawFaceDetection(bbox_px=(400.0, 100.0, 415.0, 115.0), landmarks_px=None, det_score=0.90),
+    ]
+    fd = FaceDetector(backend=_StubFaceBackend(dets))
+    ctx = PhotoContext(photo_id="wide_grp", content_fp="fp_wide_grp", analysis_img=img)
+    out = fd.run(ctx)
+    assert out["face_count"] == 2
+    assert len(ctx.faces) == 2
+    assert out["face_out_of_focus"] is False
+

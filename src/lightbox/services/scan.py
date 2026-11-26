@@ -5,15 +5,17 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image
 
 from lightbox.config import AppConfig
 from lightbox.core import (
     ENGINE_VERSION,
+    FACE_DETECTOR_PIPELINE_VERSION,
     BurstCandidate,
     DetectedFace,
     ExifExtractor,
@@ -30,6 +32,7 @@ from lightbox.core import (
     detect_bursts,
     evaluate_session_verdicts,
     find_face_model_path,
+    find_landmark106_model_path,
     generate_previews,
     get_cached_face_detector,
     load_analysis_gray,
@@ -65,6 +68,7 @@ class _AnalyzeTask:
     max_cache_bytes: int | None
     exif: NormalizedExif
     face_model_path: str | None
+    landmark_model_path: str | None
     face_model_tag: str
 
 
@@ -114,21 +118,27 @@ class JobStatusSummary:
 def _resolve_face_model_info(
     app_paths: AppPaths,
     face_backend: FaceBackend | None,
-) -> tuple[str | None, str]:
-    """Return `(face_model_path_str, face_model_tag)` for cache invalidation & session reuse."""
+) -> tuple[str | None, str | None, str]:
+    """Return `(face_model_path_str, landmark_model_path_str, face_model_tag)` for cache invalidation."""
     if face_backend is not None:
         if face_backend.available:
-            return None, f"custom:{type(face_backend).__qualname__}"
-        return None, "none"
+            return None, None, f"custom:{type(face_backend).__qualname__}:{FACE_DETECTOR_PIPELINE_VERSION}"
+        return None, None, "none"
     model_path = find_face_model_path(app_paths)
     if model_path is None:
-        return None, "none"
+        return None, None, "none"
     model_fp = compute_content_fp(model_path)[:12]
-    return str(model_path.resolve()), f"antelopev2:{model_path.name}:{model_fp}"
+    lm_path = find_landmark106_model_path(app_paths)
+    lm_path_str = str(lm_path.resolve()) if lm_path is not None else None
+    lm_fp = compute_content_fp(lm_path)[:12] if lm_path is not None else "none"
+    tag = (
+        f"antelopev2:{model_path.name}:{model_fp}:{FACE_DETECTOR_PIPELINE_VERSION}:lm:{lm_fp}"
+    )
+    return str(model_path.resolve()), lm_path_str, tag
 
 
 def _analyze_photo_worker(task: _AnalyzeTask) -> _AnalyzeOutput:
-    """Top-level picklable worker executing preview + metrics + cached ONNX face detection."""
+    """Top-level picklable worker executing preview + metrics + cached ONNX face/blink detection."""
     source_path = Path(task.source_path)
     cache_dir = Path(task.cache_dir)
     preview = generate_previews(
@@ -144,19 +154,31 @@ def _analyze_photo_worker(task: _AnalyzeTask) -> _AnalyzeOutput:
 
     faces: tuple[DetectedFace, ...] = ()
     if task.face_model_path is not None:
-        face_detector = get_cached_face_detector(task.face_model_path)
+        face_detector = get_cached_face_detector(task.face_model_path, task.landmark_model_path)
         if face_detector.model_available:
+            loupe_rgb = None
+            if preview.loupe_path.is_file():
+                try:
+                    with Image.open(preview.loupe_path) as loupe_im:
+                        loupe_rgb = np.asarray(loupe_im.convert("RGB"), dtype=np.uint8)
+                except Exception:
+                    loupe_rgb = None
             ctx = PhotoContext(
                 photo_id=task.photo_id,
                 content_fp=task.content_fp,
                 analysis_img=gray,
+                loupe_rgb=loupe_rgb,
                 analysis_path=preview.analysis_path,
                 loupe_path=preview.loupe_path,
                 exif=task.exif,
                 metrics={"sharp_p95": metrics.sharp_p95, "noise_sigma": metrics.noise_sigma},
             )
-            face_detector.run(ctx)
+            face_out = face_detector.run(ctx)
             faces = ctx.faces
+            exp_updated = dict(metrics.exposure)
+            exp_updated["eyes_closed"] = bool(face_out.get("eyes_closed", False))
+            exp_updated["eye_ear_min"] = face_out.get("eye_ear_min")
+            metrics = replace(metrics, exposure=exp_updated)
 
     return _AnalyzeOutput(
         photo_id=task.photo_id,
@@ -292,7 +314,9 @@ class ScanService:
         photo_file_map: dict[str, Path] = {}
         work_items: list[StageWorkItem[_AnalyzeTask]] = []
         max_cache_bytes = int(self.config.cache.preview_max_gb * (1024**3))
-        face_model_path, face_model_tag = _resolve_face_model_info(self.app_paths, face_backend)
+        face_model_path, landmark_model_path, face_model_tag = _resolve_face_model_info(
+            self.app_paths, face_backend
+        )
 
         for group in ingest.groups:
             photo_id = _stable_id("ph", f"{session_id}:{group.rel_dir}:{group.stem}:{group.primary_content_fp}")
@@ -373,6 +397,7 @@ class ScanService:
                 max_cache_bytes=max_cache_bytes,
                 exif=ex,
                 face_model_path=face_model_path,
+                landmark_model_path=landmark_model_path,
                 face_model_tag=face_model_tag,
             )
             work_items.append(

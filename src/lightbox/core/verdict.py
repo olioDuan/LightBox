@@ -24,6 +24,7 @@ from lightbox.core.metrics import ImageMetrics, infer_motion_state
 from lightbox.i18n import (
     REASON_BORDERLINE_BLUR,
     REASON_EXTREME_EXPOSURE,
+    REASON_EYES_CLOSED,
     REASON_FACE_OUT_OF_FOCUS,
     REASON_LOW_RELATIVE_SHARPNESS,
     REASON_MOTION_BLUR,
@@ -88,6 +89,8 @@ class PhotoEvaluationInput:
     file_path: Path | None = None
     burst_frame_motion: float | None = None
     scene_tag: str | None = None
+    eyes_closed: bool = False
+    eye_ear_min: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +235,16 @@ def evaluate_session_verdicts(
         face_oof, face_sharp_min = evaluate_subject_faces_oof(
             it.faces, sharp_p95=it.metrics.sharp_p95
         )
+        eyes_closed = bool(it.eyes_closed or it.metrics.exposure.get("eyes_closed", False))
+        eye_ear_min = (
+            it.eye_ear_min
+            if it.eye_ear_min is not None
+            else (
+                float(it.metrics.exposure["eye_ear_min"])
+                if it.metrics.exposure.get("eye_ear_min") is not None
+                else None
+            )
+        )
         motion_state = infer_motion_state(
             panning_detected=it.metrics.panning_detected,
             motion_aniso=it.metrics.motion_aniso,
@@ -252,6 +265,8 @@ def evaluate_session_verdicts(
             "cohort": key[2],
             "sensitivity": sensitivity,
             "slower_than_handheld_rule": slow_shutter,
+            "eyes_closed": eyes_closed,
+            "eye_ear_min": eye_ear_min,
         }
 
         # Hard rule 1: Exempt photos never participate in culling
@@ -304,11 +319,16 @@ def evaluate_session_verdicts(
             )
             continue
 
-        # Hard rule 3: Panning shot protection -> normal (unless face_oof -> yellow)
+        # Hard rule 3: Panning shot protection -> normal (unless face_oof or eyes_closed -> yellow)
         if it.metrics.panning_detected:
-            if face_oof:
+            if face_oof or eyes_closed:
                 bucket = "yellow"
-                reasons = [REASON_FACE_OUT_OF_FOCUS, REASON_PANNING_PROTECTED]
+                reasons = []
+                if eyes_closed:
+                    reasons.append(REASON_EYES_CLOSED)
+                if face_oof:
+                    reasons.append(REASON_FACE_OUT_OF_FOCUS)
+                reasons.append(REASON_PANNING_PROTECTED)
                 confidence = 0.65
             else:
                 bucket = "normal"
@@ -373,8 +393,10 @@ def evaluate_session_verdicts(
                 # Confidence increases the further below threshold
                 margin = max(0.0, (preset.abs_red_sharp - sharp) / max(preset.abs_red_sharp, 1.0))
                 confidence = round(min(0.97, 0.80 + 0.17 * margin), 4)
-        elif abs_fail_yellow or rel_low_yellow or face_oof:
+        elif abs_fail_yellow or rel_low_yellow or face_oof or eyes_closed:
             bucket = "yellow"
+            if eyes_closed:
+                reasons.append(REASON_EYES_CLOSED)
             if face_oof:
                 reasons.append(REASON_FACE_OUT_OF_FOCUS)
             if abs_fail_yellow:

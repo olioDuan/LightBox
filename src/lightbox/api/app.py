@@ -155,15 +155,17 @@ class FaceRefInput(BaseModel):
 class PeopleLabelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["name", "merge", "ignore"]
+    action: Literal["name", "merge", "ignore", "split", "reassign"]
     name: str | None = None
     is_self: bool = False
     cluster_id: str | None = None
     person_id: str | None = None
     faces: list[FaceRefInput] | None = None
     source_cluster_id: str | None = None
+    source_cluster_ids: list[str] | None = None
     target_cluster_id: str | None = None
     source_person_id: str | None = None
+    source_person_ids: list[str] | None = None
     target_person_id: str | None = None
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
@@ -623,7 +625,7 @@ def create_app(
         bucket: Annotated[str | None, Query()] = None,
         reason: Annotated[str | None, Query()] = None,
         sort: Annotated[str, Query()] = "uncertainty",
-        limit: Annotated[int, Query(ge=1, le=200)] = 30,
+        limit: Annotated[int, Query(ge=1, le=2000)] = 30,
         offset: Annotated[int, Query(ge=0)] = 0,
         lang: Annotated[str, Query()] = "zh-CN",
         include_quarantined: Annotated[bool, Query()] = False,
@@ -717,6 +719,10 @@ def create_app(
         light_bucket: Annotated[str | None, Query()] = None,
         focal_min: Annotated[float | None, Query()] = None,
         focal_max: Annotated[float | None, Query()] = None,
+        location: Annotated[str | None, Query()] = None,
+        ignore_location: Annotated[bool, Query()] = False,
+        strictness: Annotated[Literal["strict", "balanced", "relaxed", "all"], Query()] = "balanced",
+        min_score: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 24,
         lang: Annotated[str, Query()] = "zh-CN",
     ) -> dict[str, Any]:
@@ -732,6 +738,10 @@ def create_app(
                     light_bucket=light_bucket,
                     focal_min=focal_min,
                     focal_max=focal_max,
+                    location=location,
+                    ignore_location=ignore_location,
+                    strictness=strictness,
+                    min_score=min_score,
                     limit=limit,
                     lang=lang,
                 )
@@ -747,7 +757,14 @@ def create_app(
             "indexed_count": res.indexed_count,
             "total_candidates": res.total_candidates,
             "cameras": list(res.cameras),
+            "locations": list(res.locations),
+            "detected_location_key": res.detected_location_key,
+            "detected_location_label": res.detected_location_label,
+            "effective_visual_query": res.effective_visual_query,
+            "strictness": res.strictness,
+            "score_threshold": res.score_threshold,
             "matches": [m.to_dict() for m in res.matches],
+            "weak_matches": [m.to_dict() for m in res.weak_matches],
         }
 
     @app.get("/api/photos/{photo_id}/similar")
@@ -756,6 +773,8 @@ def create_app(
         svcs: SvcsDep,
         limit: Annotated[int, Query(ge=1, le=30)] = 12,
         session_id: Annotated[str | None, Query()] = None,
+        strictness: Annotated[Literal["strict", "balanced", "relaxed", "all"], Query()] = "balanced",
+        min_score: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
         lang: Annotated[str, Query()] = "zh-CN",
     ) -> dict[str, Any]:
         try:
@@ -764,6 +783,8 @@ def create_app(
                     photo_id,
                     limit=limit,
                     session_id=session_id,
+                    strictness=strictness,
+                    min_score=min_score,
                     lang=lang,
                 )
             )
@@ -777,7 +798,10 @@ def create_app(
             "session_id": res.session_id,
             "mode": res.mode,
             "semantic_ready": res.semantic_ready,
+            "strictness": res.strictness,
+            "score_threshold": res.score_threshold,
             "similar": [m.to_dict() for m in res.similar],
+            "weak_similar": [m.to_dict() for m in res.weak_similar],
         }
 
     @app.post("/api/sessions/{session_id}/embed")
@@ -894,12 +918,28 @@ def create_app(
             if body.action == "merge":
                 merged = svcs.people.label_merge(
                     source_cluster_id=body.source_cluster_id,
+                    source_cluster_ids=body.source_cluster_ids,
                     target_cluster_id=body.target_cluster_id,
                     source_person_id=body.source_person_id,
+                    source_person_ids=body.source_person_ids,
                     target_person_id=body.target_person_id,
                     threshold=body.threshold,
                 )
                 return {"action": "merge", **merged}
+            if body.action == "split":
+                split_res = svcs.people.label_split(
+                    faces=face_tuples or [],
+                    threshold=body.threshold,
+                )
+                return {"action": "split", **split_res}
+            if body.action == "reassign":
+                reassign_res = svcs.people.label_reassign(
+                    faces=face_tuples or [],
+                    target_person_id=body.target_person_id,
+                    target_cluster_id=body.target_cluster_id,
+                    threshold=body.threshold,
+                )
+                return {"action": "reassign", **reassign_res}
             ignored_count = svcs.people.label_ignore(
                 faces=face_tuples,
                 cluster_id=body.cluster_id,

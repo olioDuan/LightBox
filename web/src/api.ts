@@ -150,6 +150,18 @@ export interface SearchMatchItem {
   score: number;
   similarity: number;
   relation: string;
+  gps_lat: number | null;
+  gps_lon: number | null;
+  location_key: string | null;
+  location_label: string | null;
+  location_source: "gps" | "folder" | null;
+}
+
+export type SearchStrictness = "strict" | "balanced" | "relaxed" | "all";
+
+export interface SearchLocationOption {
+  key: string;
+  label: string;
 }
 
 export interface SearchPhotosResponse {
@@ -159,7 +171,14 @@ export interface SearchPhotosResponse {
   indexed_count: number;
   total_candidates: number;
   cameras: string[];
+  locations: SearchLocationOption[];
+  detected_location_key: string | null;
+  detected_location_label: string | null;
+  effective_visual_query: string;
+  strictness: SearchStrictness;
+  score_threshold: number | null;
   matches: SearchMatchItem[];
+  weak_matches: SearchMatchItem[];
 }
 
 export interface SimilarPhotosResponse {
@@ -168,7 +187,10 @@ export interface SimilarPhotosResponse {
   session_id: string;
   mode: "semantic" | "burst_dhash";
   semantic_ready: boolean;
+  strictness: SearchStrictness;
+  score_threshold: number | null;
   similar: SearchMatchItem[];
+  weak_similar: SearchMatchItem[];
 }
 
 export interface EmbedSessionResponse {
@@ -207,6 +229,16 @@ export interface PeoplePhotoItem {
   faces: FaceSlot[];
 }
 
+export interface SimilarFaceCandidate {
+  kind: "person" | "cluster";
+  target_id: string;
+  name: string | null;
+  cover_photo_id: string | null;
+  cover_face_idx: number | null;
+  photo_count: number;
+  similarity: number;
+}
+
 export interface PersonGroupInfo {
   person_id: string;
   group_key: string;
@@ -217,6 +249,7 @@ export interface PersonGroupInfo {
   photo_count: number;
   group_photo_count: number;
   photos: PeoplePhotoItem[];
+  similar_candidates: SimilarFaceCandidate[];
 }
 
 export interface UnnamedClusterInfo {
@@ -228,6 +261,7 @@ export interface UnnamedClusterInfo {
   solo_photo_count: number;
   faces: Array<{ content_fp: string; face_idx: number }>;
   photos: PeoplePhotoItem[];
+  similar_candidates: SimilarFaceCandidate[];
 }
 
 export interface PeopleGroupsResponse {
@@ -656,6 +690,9 @@ export const api = {
     dateTo?: string;
     camera?: string;
     lightBucket?: string;
+    location?: string;
+    ignoreLocation?: boolean;
+    strictness?: SearchStrictness;
     limit?: number;
     lang: Lang;
   }) => {
@@ -669,15 +706,22 @@ export const api = {
     if (opts.dateTo) params.set("date_to", opts.dateTo);
     if (opts.camera) params.set("camera", opts.camera);
     if (opts.lightBucket) params.set("light_bucket", opts.lightBucket);
+    if (opts.location) params.set("location", opts.location);
+    if (opts.ignoreLocation) params.set("ignore_location", "true");
+    if (opts.strictness) params.set("strictness", opts.strictness);
     return apiFetch<SearchPhotosResponse>(`/api/search?${params.toString()}`);
   },
 
-  findSimilarPhotos: (photoId: string, opts: { limit?: number; sessionId?: string; lang: Lang }) => {
+  findSimilarPhotos: (
+    photoId: string,
+    opts: { limit?: number; sessionId?: string; strictness?: SearchStrictness; lang: Lang },
+  ) => {
     const params = new URLSearchParams({
       limit: String(opts.limit ?? 18),
       lang: opts.lang,
     });
     if (opts.sessionId) params.set("session_id", opts.sessionId);
+    if (opts.strictness) params.set("strictness", opts.strictness);
     return apiFetch<SimilarPhotosResponse>(
       `/api/photos/${encodeURIComponent(photoId)}/similar?${params.toString()}`,
     );
@@ -707,15 +751,17 @@ export const api = {
   },
 
   labelPeople: (payload: {
-    action: "name" | "merge" | "ignore";
+    action: "name" | "merge" | "ignore" | "split" | "reassign";
     name?: string;
     is_self?: boolean;
     cluster_id?: string;
     person_id?: string;
     faces?: Array<{ content_fp: string; face_idx: number }>;
     source_cluster_id?: string;
+    source_cluster_ids?: string[];
     target_cluster_id?: string;
     source_person_id?: string;
+    source_person_ids?: string[];
     target_person_id?: string;
     threshold?: number;
   }) =>

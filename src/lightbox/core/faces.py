@@ -27,19 +27,38 @@ from lightbox.paths import AppPaths, get_app_paths
 ANTELOPEV2_DIRNAME = "antelopev2"
 DET_MODEL_FILENAME = "det_10g.onnx"
 DET_MODEL_FILENAMES: tuple[str, ...] = ("scrfd_10g_bnkps.onnx", "det_10g.onnx")
+LANDMARK106_MODEL_FILENAME = "2d106det.onnx"
+FACE_DETECTOR_PIPELINE_VERSION = "v2"
 DEFAULT_DET_INPUT_SIZE = (640, 640)
 
-# Decoupled thresholds (SPEC §4.2, PLAN T05):
-# - Persist every valid face with area_ratio >= 0.003 (0.3%) + 5-point landmarks for T18 group photos
+# Decoupled thresholds (SPEC §4.2, PLAN T05 / T18):
+# - Persist valid faces down to area_ratio >= 0.0006 (0.06% — covers full-body & wide group photos
+#   where faces are ~120px on 24MP) while requiring higher confidence (>= 0.65) below 0.003 so
+#   distant background clutter is ignored.
 # - Only evaluate face out-of-focus on subject faces with area_ratio >= 0.015 (1.5%)
-FACE_STORE_MIN_AREA_RATIO = 0.003
+FACE_STORE_MIN_AREA_RATIO = 0.0006
+FACE_SMALL_AREA_CUTOFF = 0.003
 FACE_SUBJECT_MIN_AREA_RATIO = 0.015
 FACE_DET_SCORE_THRESHOLD = 0.50
+FACE_SMALL_DET_SCORE_THRESHOLD = 0.65
 FACE_NMS_IOU_THRESHOLD = 0.40
 
 # Subject face out-of-focus comparison thresholds (NEVER escalates to `red`, max `yellow`)
 FACE_OOF_ABS_THRESHOLD = 7.0
 FACE_OOF_RELATIVE_RATIO = 0.45
+
+# Local offline closed-eye detection thresholds using InsightFace `2d106det.onnx` (NEVER auto-`red`, max `yellow`)
+FACE_BLINK_MIN_AREA_RATIO = 0.002
+FACE_BLINK_MIN_YAW_RATIO = 0.35
+FACE_BLINK_AVG_EAR_THRESHOLD = 0.165
+FACE_BLINK_MAX_EAR_THRESHOLD = 0.178
+
+# Verified InsightFace 2d106det eye contour indices:
+# Left eye corners (35, 39) + 3 upper/lower eyelid pairs; Right eye corners (89, 93) + 3 pairs
+_LEFT_EYE_CORNERS = (35, 39)
+_LEFT_EYE_LID_PAIRS: tuple[tuple[int, int], ...] = ((41, 36), (40, 33), (42, 37))
+_RIGHT_EYE_CORNERS = (89, 93)
+_RIGHT_EYE_LID_PAIRS: tuple[tuple[int, int], ...] = ((95, 90), (94, 87), (96, 91))
 
 # Official InsightFace antelopev2 release archive URL (on-demand user download; never bundled)
 ANTELOPEV2_DEFAULT_URL = (
@@ -65,6 +84,19 @@ class FaceBackend(Protocol):
     def detect_raw(self, image_rgb: NDArray[np.uint8]) -> list[RawFaceDetection]: ...
 
 
+class EyeLandmarkBackend(Protocol):
+    """Injectable 106-point 2D facial landmark backend for offline closed-eye detection."""
+
+    @property
+    def available(self) -> bool: ...
+
+    def predict_landmarks_106(
+        self,
+        image_rgb: NDArray[np.uint8],
+        bbox_px: tuple[float, float, float, float],
+    ) -> NDArray[np.float32] | None: ...
+
+
 def find_face_model_path(app_paths: AppPaths | None = None) -> Path | None:
     """Locate `scrfd_10g_bnkps.onnx` or `det_10g.onnx` under `<APP_DATA_DIR>/models/antelopev2/` or `<APP_DATA_DIR>/models/`."""
     paths = app_paths or get_app_paths()
@@ -73,6 +105,16 @@ def find_face_model_path(app_paths: AppPaths | None = None) -> Path | None:
             candidate = base / filename
             if candidate.is_file():
                 return candidate
+    return None
+
+
+def find_landmark106_model_path(app_paths: AppPaths | None = None) -> Path | None:
+    """Locate `2d106det.onnx` under `<APP_DATA_DIR>/models/antelopev2/` or `<APP_DATA_DIR>/models/`."""
+    paths = app_paths or get_app_paths()
+    for base in (paths.models_dir / ANTELOPEV2_DIRNAME, paths.models_dir):
+        candidate = base / LANDMARK106_MODEL_FILENAME
+        if candidate.is_file():
+            return candidate
     return None
 
 
@@ -355,6 +397,147 @@ class ScrfdOnnxBackend:
         )
 
 
+class Landmark106OnnxBackend:
+    """ONNX Runtime backend for InsightFace `antelopev2/2d106det.onnx` (106-pt 2D landmarks)."""
+
+    def __init__(
+        self,
+        model_path: Path | None = None,
+        *,
+        app_paths: AppPaths | None = None,
+        providers: Sequence[str] = ("CPUExecutionProvider",),
+    ) -> None:
+        self.model_path = model_path or find_landmark106_model_path(app_paths)
+        self.providers = list(providers)
+        self._session: Any = None
+
+    @property
+    def available(self) -> bool:
+        return self.model_path is not None and self.model_path.is_file()
+
+    def _ensure_session(self) -> Any:
+        if self._session is not None:
+            return self._session
+        if not self.available:
+            return None
+        import onnxruntime as ort
+
+        assert self.model_path is not None
+        self._session = ort.InferenceSession(str(self.model_path), providers=self.providers)
+        return self._session
+
+    def predict_landmarks_106(
+        self,
+        image_rgb: NDArray[np.uint8],
+        bbox_px: tuple[float, float, float, float],
+    ) -> NDArray[np.float32] | None:
+        session = self._ensure_session()
+        if session is None:
+            return None
+        x1, y1, x2, y2 = bbox_px
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw <= 2.0 or bh <= 2.0:
+            return None
+
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        scale = 192.0 / (max(bw, bh) * 1.5)
+        mat = cv2.getRotationMatrix2D((0.0, 0.0), 0.0, scale)
+        mat[0, 2] = 96.0 - cx * scale
+        mat[1, 2] = 96.0 - cy * scale
+        crop_rgb = cv2.warpAffine(image_rgb, mat, (192, 192), borderValue=(0, 0, 0))
+
+        # 2d106det expects RGB float32 NCHW in [0, 255] (InsightFace blobFromImage swapRB=True on BGR)
+        blob = np.transpose(crop_rgb.astype(np.float32), (2, 0, 1))[np.newaxis, ...]
+        input_name = str(session.get_inputs()[0].name)
+        raw = np.asarray(session.run(None, {input_name: blob})[0][0], dtype=np.float32)
+        if raw.size < 212:
+            return None
+        pred = raw[:212].reshape(106, 2)
+        pred = (pred + 1.0) * 96.0
+        inv_mat = cv2.invertAffineTransform(mat)
+        ones = np.ones((106, 1), dtype=np.float32)
+        pts = (inv_mat @ np.hstack([pred, ones]).T).T
+        return np.asarray(pts, dtype=np.float32)
+
+
+def compute_eye_aspect_ratios(landmarks_106: NDArray[np.float32]) -> tuple[float, float]:
+    """Compute rotation-invariant 3-pair Eye Aspect Ratio `(left_ear, right_ear)` from 106-pt landmarks."""
+    pts = np.asarray(landmarks_106, dtype=np.float32)
+    if pts.shape[0] < 97 or pts.shape[1] < 2:
+        return 1.0, 1.0
+
+    def _single_ear(corners: tuple[int, int], pairs: tuple[tuple[int, int], ...]) -> float:
+        width = float(np.linalg.norm(pts[corners[0]] - pts[corners[1]]))
+        if width <= 1e-6:
+            return 1.0
+        vert = sum(float(np.linalg.norm(pts[u] - pts[lo])) for u, lo in pairs) / float(len(pairs))
+        return vert / width
+
+    return (
+        _single_ear(_LEFT_EYE_CORNERS, _LEFT_EYE_LID_PAIRS),
+        _single_ear(_RIGHT_EYE_CORNERS, _RIGHT_EYE_LID_PAIRS),
+    )
+
+
+def estimate_face_yaw_ratio(landmarks_5: tuple[tuple[float, float], ...] | None) -> float:
+    """Estimate frontal symmetry in `[0, 1]` from 5-pt landmarks (`1.0` = frontal, `<0.35` = strong profile)."""
+    if landmarks_5 is None or len(landmarks_5) < 3:
+        return 1.0
+    le_x = landmarks_5[0][0]
+    re_x = landmarks_5[1][0]
+    nose_x = landmarks_5[2][0]
+    dl = abs(nose_x - le_x)
+    dr = abs(re_x - nose_x)
+    denom = max(dl, dr, 1e-6)
+    return min(dl, dr) / denom
+
+
+def is_face_eyes_closed(left_ear: float, right_ear: float) -> bool:
+    """Return True when both eyes are clearly closed based on rotation-invariant EAR."""
+    avg_ear = 0.5 * (left_ear + right_ear)
+    return avg_ear <= FACE_BLINK_AVG_EAR_THRESHOLD and max(left_ear, right_ear) <= FACE_BLINK_MAX_EAR_THRESHOLD
+
+
+def evaluate_faces_eyes_closed(
+    faces: Sequence[DetectedFace],
+    image_rgb: NDArray[np.uint8],
+    landmark_backend: EyeLandmarkBackend | None,
+    *,
+    min_area_ratio: float = FACE_BLINK_MIN_AREA_RATIO,
+    min_yaw_ratio: float = FACE_BLINK_MIN_YAW_RATIO,
+) -> tuple[bool, float | None]:
+    """Evaluate frontal subject/group faces for closed eyes using `2d106det.onnx` (never auto-`red`)."""
+    if landmark_backend is None or not landmark_backend.available or not faces:
+        return False, None
+
+    h, w = image_rgb.shape[:2]
+    if h <= 0 or w <= 0:
+        return False, None
+
+    any_closed = False
+    min_avg_ear: float | None = None
+    for face in faces:
+        if face.area_ratio < min_area_ratio:
+            continue
+        if estimate_face_yaw_ratio(face.landmarks) < min_yaw_ratio:
+            continue
+        x1, y1, x2, y2 = face.bbox
+        bbox_px = (x1 * w, y1 * h, x2 * w, y2 * h)
+        pts = landmark_backend.predict_landmarks_106(image_rgb, bbox_px)
+        if pts is None:
+            continue
+        le, re = compute_eye_aspect_ratios(pts)
+        avg_ear = 0.5 * (le + re)
+        if min_avg_ear is None or avg_ear < min_avg_ear:
+            min_avg_ear = avg_ear
+        if is_face_eyes_closed(le, re):
+            any_closed = True
+
+    return any_closed, (round(min_avg_ear, 4) if min_avg_ear is not None else None)
+
+
 def score_and_filter_faces(
     raw_detections: Sequence[RawFaceDetection],
     analysis_gray: NDArray[np.uint8],
@@ -362,6 +545,8 @@ def score_and_filter_faces(
     noise_sigma: float = 0.0,
     min_area_ratio: float = FACE_STORE_MIN_AREA_RATIO,
     min_det_score: float = FACE_DET_SCORE_THRESHOLD,
+    small_area_cutoff: float = FACE_SMALL_AREA_CUTOFF,
+    small_min_det_score: float = FACE_SMALL_DET_SCORE_THRESHOLD,
 ) -> tuple[DetectedFace, ...]:
     """Normalize detected faces, compute per-face ROI sharpness, and filter by storage threshold."""
     h, w = analysis_gray.shape[:2]
@@ -384,6 +569,9 @@ def score_and_filter_faces(
 
         area_ratio = (bw * bh) / frame_area
         if area_ratio < min_area_ratio:
+            continue
+        # Require stronger detector confidence for small distant/group faces to avoid false positives
+        if area_ratio < small_area_cutoff and det.det_score < max(min_det_score, small_min_det_score):
             continue
 
         ix1, iy1 = int(math.floor(x1_px)), int(math.floor(y1_px))
@@ -456,7 +644,7 @@ def evaluate_subject_faces_oof(
 
 
 class FaceDetector:
-    """`Detector` implementation wrapping InsightFace `antelopev2/det_10g.onnx`."""
+    """`Detector` implementation wrapping InsightFace `antelopev2` SCRFD + optional `2d106det` blink check."""
 
     name: str = "faces"
     version: str = ENGINE_VERSION
@@ -466,13 +654,26 @@ class FaceDetector:
         self,
         *,
         backend: FaceBackend | None = None,
+        landmark_backend: EyeLandmarkBackend | None = None,
         app_paths: AppPaths | None = None,
     ) -> None:
         self._backend: FaceBackend = backend or ScrfdOnnxBackend(app_paths=app_paths)
+        if landmark_backend is not None:
+            self._landmark_backend: EyeLandmarkBackend | None = landmark_backend
+        elif backend is None:
+            # Automatically enable offline closed-eye check when `2d106det.onnx` is present
+            self._landmark_backend = Landmark106OnnxBackend(app_paths=app_paths)
+        else:
+            # Custom injected FaceBackend (e.g. unit test stubs) does not touch disk models unless passed
+            self._landmark_backend = None
 
     @property
     def model_available(self) -> bool:
         return self._backend.available
+
+    @property
+    def blink_model_available(self) -> bool:
+        return self._landmark_backend is not None and self._landmark_backend.available
 
     def run(self, ctx: PhotoContext) -> dict[str, Any]:
         if ctx.analysis_img is None:
@@ -484,6 +685,8 @@ class FaceDetector:
                 "face_count": 0,
                 "face_sharp_min": None,
                 "face_out_of_focus": False,
+                "eyes_closed": False,
+                "eye_ear_min": None,
                 "model_available": False,
             }
 
@@ -523,21 +726,38 @@ class FaceDetector:
         sharp_p95 = float(ctx.metrics.get("sharp_p95", 0.0))
         faces = score_and_filter_faces(raw_dets, ctx.analysis_img, noise_sigma=noise_sigma)
         face_oof, face_sharp_min = evaluate_subject_faces_oof(faces, sharp_p95=sharp_p95)
+        eyes_closed, eye_ear_min = evaluate_faces_eyes_closed(
+            faces,
+            image_rgb,
+            self._landmark_backend,
+        )
         ctx.faces = faces
+        ctx.metrics["eyes_closed"] = eyes_closed
+        ctx.metrics["eye_ear_min"] = eye_ear_min
         return {
             "faces": faces,
             "face_count": len(faces),
             "face_sharp_min": face_sharp_min,
             "face_out_of_focus": face_oof,
+            "eyes_closed": eyes_closed,
+            "eye_ear_min": eye_ear_min,
             "model_available": True,
         }
 
 
 @lru_cache(maxsize=4)
-def get_cached_face_detector(model_path_str: str) -> FaceDetector:
-    """Return a process-local cached `FaceDetector` so `det_10g.onnx` loads once per worker."""
+def get_cached_face_detector(
+    model_path_str: str,
+    landmark_model_path_str: str | None = None,
+) -> FaceDetector:
+    """Return a process-local cached `FaceDetector` so ONNX models load once per worker."""
     backend = ScrfdOnnxBackend(model_path=Path(model_path_str))
-    return FaceDetector(backend=backend)
+    lm_backend = (
+        Landmark106OnnxBackend(model_path=Path(landmark_model_path_str))
+        if landmark_model_path_str
+        else None
+    )
+    return FaceDetector(backend=backend, landmark_backend=lm_backend)
 
 
 __all__ = [
@@ -546,21 +766,36 @@ __all__ = [
     "DEFAULT_DET_INPUT_SIZE",
     "DET_MODEL_FILENAME",
     "DET_MODEL_FILENAMES",
+    "FACE_BLINK_AVG_EAR_THRESHOLD",
+    "FACE_BLINK_MAX_EAR_THRESHOLD",
+    "FACE_BLINK_MIN_AREA_RATIO",
+    "FACE_BLINK_MIN_YAW_RATIO",
+    "FACE_DETECTOR_PIPELINE_VERSION",
     "FACE_DET_SCORE_THRESHOLD",
     "FACE_NMS_IOU_THRESHOLD",
     "FACE_OOF_ABS_THRESHOLD",
     "FACE_OOF_RELATIVE_RATIO",
+    "FACE_SMALL_AREA_CUTOFF",
+    "FACE_SMALL_DET_SCORE_THRESHOLD",
     "FACE_STORE_MIN_AREA_RATIO",
     "FACE_SUBJECT_MIN_AREA_RATIO",
+    "LANDMARK106_MODEL_FILENAME",
+    "EyeLandmarkBackend",
     "FaceBackend",
     "FaceDetector",
+    "Landmark106OnnxBackend",
     "RawFaceDetection",
     "ScrfdOnnxBackend",
+    "compute_eye_aspect_ratios",
     "decode_scrfd_outputs",
     "download_antelopev2_archive",
     "ensure_face_model",
+    "estimate_face_yaw_ratio",
+    "evaluate_faces_eyes_closed",
     "evaluate_subject_faces_oof",
     "find_face_model_path",
+    "find_landmark106_model_path",
     "get_cached_face_detector",
+    "is_face_eyes_closed",
     "score_and_filter_faces",
 ]

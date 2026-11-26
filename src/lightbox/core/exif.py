@@ -601,8 +601,66 @@ def _extract_mov_fallback(path: Path) -> NormalizedExif:
     )
 
 
+def _ratio_to_float(val: Any) -> float | None:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if hasattr(val, "numerator") and hasattr(val, "denominator"):
+        den = float(val.denominator)
+        return float(val.numerator) / den if den != 0.0 else None
+    if hasattr(val, "num") and hasattr(val, "den"):
+        den = float(val.den)
+        return float(val.num) / den if den != 0.0 else None
+    if isinstance(val, tuple) and len(val) == 2:
+        den = float(val[1])
+        return float(val[0]) / den if den != 0.0 else None
+    return _parse_float(val)
+
+
+def _dms_to_decimal(dms: Any, ref: Any) -> float | None:
+    """Convert EXIF GPS DMS sequence `[deg, min, sec]` + hemisphere ref (`N`/`S`/`E`/`W`) to decimal degrees."""
+    if dms is None:
+        return None
+    if isinstance(dms, (int, float)):
+        deg = float(dms)
+    elif isinstance(dms, (list, tuple)) and len(dms) >= 3:
+        d = _ratio_to_float(dms[0])
+        m = _ratio_to_float(dms[1])
+        s = _ratio_to_float(dms[2])
+        if d is None or m is None or s is None:
+            return None
+        deg = abs(d) + abs(m) / 60.0 + abs(s) / 3600.0
+        if d < 0:
+            deg = -deg
+    else:
+        return None
+
+    ref_str = str(ref or "").strip().upper()
+    if ref_str.startswith(("S", "W")):
+        deg = -abs(deg)
+    elif ref_str.startswith(("N", "E")):
+        deg = abs(deg)
+    if math.isnan(deg) or math.isinf(deg):
+        return None
+    return round(deg, 6)
+
+
+def _parse_gps_coords(parsed: dict[str, Any]) -> tuple[float | None, float | None]:
+    lat = _dms_to_decimal(parsed.get("GPSLatitude"), parsed.get("GPSLatitudeRef"))
+    lon = _dms_to_decimal(parsed.get("GPSLongitude"), parsed.get("GPSLongitudeRef"))
+    if lat is None or lon is None:
+        return None, None
+    if abs(lat) > 90.0 or abs(lon) > 180.0:
+        return None, None
+    # Treat exact (0.0, 0.0) null-island placeholder tags as missing GPS
+    if abs(lat) < 1e-5 and abs(lon) < 1e-5:
+        return None, None
+    return lat, lon
+
+
 def _extract_image_bytes_exif(raw_bytes: bytes) -> dict[str, Any]:
-    """Read standard EXIF tags from image bytes using Pillow + exifread."""
+    """Read standard EXIF tags (including GPSInfo) from image bytes using Pillow + exifread."""
     parsed: dict[str, Any] = {}
 
     try:
@@ -615,6 +673,11 @@ def _extract_image_bytes_exif(raw_bytes: bytes) -> dict[str, Any]:
             for tag_id, value in ifd.items():
                 tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
                 parsed[tag_name] = value
+            gps_ifd = exif_obj.get_ifd(ExifTags.IFD.GPSInfo)
+            if isinstance(gps_ifd, dict):
+                for tag_id, value in gps_ifd.items():
+                    tag_name = ExifTags.GPSTAGS.get(tag_id, str(tag_id))
+                    parsed[tag_name] = value
     except Exception:
         pass
 
@@ -640,10 +703,31 @@ def _extract_image_bytes_exif(raw_bytes: bytes) -> dict[str, Any]:
             if out_key not in parsed and er_key in tags:
                 val = tags[er_key].values
                 parsed[out_key] = val[0] if isinstance(val, list) and val else str(tags[er_key])
+
+        gps_mapping = {
+            "GPS GPSLatitude": "GPSLatitude",
+            "GPS GPSLatitudeRef": "GPSLatitudeRef",
+            "GPS GPSLongitude": "GPSLongitude",
+            "GPS GPSLongitudeRef": "GPSLongitudeRef",
+        }
+        for er_key, out_key in gps_mapping.items():
+            if out_key not in parsed and er_key in tags:
+                parsed[out_key] = tags[er_key].values
     except Exception:
         pass
 
     return parsed
+
+
+def extract_gps_fast(path: Path) -> tuple[float | None, float | None]:
+    """Fast header-only GPS reader for lazy backfill without decoding pixels or calling ExifTool."""
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(512 * 1024)
+    except OSError:
+        return None, None
+    parsed = _extract_image_bytes_exif(header)
+    return _parse_gps_coords(parsed)
 
 
 def _extract_fallback(path: Path) -> NormalizedExif:
@@ -717,6 +801,8 @@ def _extract_fallback(path: Path) -> NormalizedExif:
             content_id = str(parsed[key]).strip()
             break
 
+    gps_lat, gps_lon = _parse_gps_coords(parsed)
+
     # Vendor-private fields cannot be reliably read without ExifTool -> mark confidence="low"
     confidence = {f: "low" for f in _VENDOR_PRIVATE_FIELDS}
     return NormalizedExif(
@@ -741,8 +827,8 @@ def _extract_fallback(path: Path) -> NormalizedExif:
         bracket_group=None,
         rating=None,
         protected=None,
-        gps_lat=None,
-        gps_lon=None,
+        gps_lat=gps_lat,
+        gps_lon=gps_lon,
         content_identifier=content_id,
         duration_s=None,
         cohort=infer_cohort(make, model, lens),

@@ -17,11 +17,13 @@ from PIL import Image, ImageOps
 
 from lightbox.core import (
     ENGINE_VERSION,
+    FACE_DETECTOR_PIPELINE_VERSION,
     FACE_STORE_MIN_AREA_RATIO,
     FaceDetector,
     PhotoContext,
     compute_content_fp,
     find_face_model_path,
+    find_landmark106_model_path,
     load_analysis_gray,
     preview_cache_paths,
 )
@@ -38,12 +40,15 @@ from lightbox.store import (
     FaceEmbeddingRecord,
     FaceRecord,
     LightboxRepository,
+    MetricsRecord,
     PersonRecord,
     PhotoRecord,
     SessionRecord,
 )
 
 DEFAULT_FACE_COSINE_THRESHOLD = 0.42
+SIMILAR_CANDIDATE_MIN_COSINE = 0.22
+SIMILAR_CANDIDATE_LIMIT = 4
 GROUP_KEY_GROUP_PHOTO = "group_photo"
 GROUP_KEY_UNNAMED = "unnamed"
 GROUP_KEY_NO_FACE = "no_face"
@@ -114,6 +119,30 @@ class PeoplePhotoItem:
 
 
 @dataclass(frozen=True, slots=True)
+class SimilarFaceCandidate:
+    """Potential same-person match surfaced for 1-click visual merge."""
+
+    kind: str  # 'person' | 'cluster'
+    target_id: str
+    name: str | None
+    cover_photo_id: str | None
+    cover_face_idx: int | None
+    photo_count: int
+    similarity: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "target_id": self.target_id,
+            "name": self.name,
+            "cover_photo_id": self.cover_photo_id,
+            "cover_face_idx": self.cover_face_idx,
+            "photo_count": self.photo_count,
+            "similarity": round(self.similarity, 4),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PersonGroupInfo:
     """Named single-person group containing 100% of that person's solo kept photos."""
 
@@ -126,6 +155,7 @@ class PersonGroupInfo:
     photo_count: int
     group_photo_count: int
     photos: tuple[PeoplePhotoItem, ...]
+    similar_candidates: tuple[SimilarFaceCandidate, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -138,6 +168,7 @@ class PersonGroupInfo:
             "photo_count": self.photo_count,
             "group_photo_count": self.group_photo_count,
             "photos": [p.to_dict() for p in self.photos],
+            "similar_candidates": [c.to_dict() for c in self.similar_candidates],
         }
 
 
@@ -153,6 +184,7 @@ class UnnamedClusterInfo:
     solo_photo_count: int
     faces: tuple[tuple[str, int], ...]
     photos: tuple[PeoplePhotoItem, ...]
+    similar_candidates: tuple[SimilarFaceCandidate, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +196,7 @@ class UnnamedClusterInfo:
             "solo_photo_count": self.solo_photo_count,
             "faces": [{"content_fp": fp, "face_idx": fi} for fp, fi in self.faces],
             "photos": [p.to_dict() for p in self.photos],
+            "similar_candidates": [c.to_dict() for c in self.similar_candidates],
         }
 
 
@@ -280,6 +313,30 @@ def _normalize_vec(vec: NDArray[np.float32]) -> NDArray[np.float32]:
     return (arr / norm).astype(np.float32, copy=False) if norm > 0.0 else arr
 
 
+def _build_prototype_bank(
+    vecs: Sequence[NDArray[np.float32]],
+    *,
+    max_samples: int = 24,
+) -> list[NDArray[np.float32]]:
+    """Build a multi-angle prototype bank (confirmed samples + normalized mean vector).
+
+    Keeping individual user-confirmed samples alongside their mean lets the recognizer
+    remember multiple angles/lighting conditions (e.g. front + side profile) after a merge,
+    rather than collapsing them into a single averaged vector that misses both extremes.
+    """
+    if not vecs:
+        return []
+    if len(vecs) == 1:
+        return [vecs[0]]
+    if len(vecs) <= max_samples:
+        selected = list(vecs)
+    else:
+        idxs = np.linspace(0, len(vecs) - 1, num=max_samples, dtype=int)
+        selected = [vecs[int(i)] for i in idxs]
+    mean_arr = np.asarray(np.mean(np.stack(vecs, axis=0), axis=0), dtype=np.float32)
+    return [*selected, _normalize_vec(mean_arr)]
+
+
 def _stable_id(prefix: str, key: str) -> str:
     return f"{prefix}_{hashlib.sha256(key.encode('utf-8')).hexdigest()[:12]}"
 
@@ -301,6 +358,33 @@ def _special_folder_name(group_key: str, *, lang: str = "zh-CN") -> str:
     if group_key == GROUP_KEY_NO_FACE:
         return "无人脸" if is_zh else "No Face"
     return _sanitize_folder_name(group_key)
+
+
+def _bbox_iou(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    xx1 = max(a[0], b[0])
+    yy1 = max(a[1], b[1])
+    xx2 = min(a[2], b[2])
+    yy2 = min(a[3], b[3])
+    inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0.0 else 0.0
+
+
+def _current_face_detector_tag(app_paths: AppPaths) -> str | None:
+    det_path = find_face_model_path(app_paths)
+    if det_path is None:
+        return None
+    det_fp = compute_content_fp(det_path)[:12]
+    lm_path = find_landmark106_model_path(app_paths)
+    lm_fp = compute_content_fp(lm_path)[:12] if lm_path is not None else "none"
+    return f"antelopev2:{det_path.name}:{det_fp}:{FACE_DETECTOR_PIPELINE_VERSION}:lm:{lm_fp}"
 
 
 def _load_rgb_image_for_photo(
@@ -382,11 +466,16 @@ class PeopleService:
         self,
         kept_photos: Sequence[tuple[PhotoRecord, SessionRecord]],
     ) -> None:
-        """If `det_10g.onnx` was absent during initial scan but is now cached, populate missing faces."""
+        """Populate or upgrade face detections when model availability or detector version changed.
+
+        When a photo previously had faces (e.g. a group photo where smaller faces were missed under
+        older thresholds), existing `face_idx` slots are preserved via bbox IoU so user labels stay
+        intact while newly discovered faces are appended cleanly.
+        """
         if not isinstance(self.face_embedder, InsightFaceEmbedder):
             return
-        det_path = find_face_model_path(self.app_paths)
-        if det_path is None:
+        current_tag = _current_face_detector_tag(self.app_paths)
+        if current_tag is None:
             return
         detector = FaceDetector(app_paths=self.app_paths)
         if not detector.model_available:
@@ -398,20 +487,21 @@ class PeopleService:
             if fp in seen_fps:
                 continue
             seen_fps.add(fp)
-            if self.repo.list_faces(fp):
-                continue
             metrics = self.repo.get_metrics(fp, ENGINE_VERSION)
             face_tag = (metrics.exposure or {}).get("face_model_tag") if metrics else None
-            if face_tag not in (None, "none"):
+            if face_tag == current_tag:
                 continue
+
             _g, loupe_p, analysis_p = preview_cache_paths(self.app_paths.cache_dir, fp)
             if not analysis_p.is_file():
                 continue
             gray = load_analysis_gray(analysis_p)
+            loupe_rgb = _load_rgb_image_for_photo(self.repo, self.app_paths, photo)
             ctx = PhotoContext(
                 photo_id=photo.id,
                 content_fp=fp,
                 analysis_img=gray,
+                loupe_rgb=loupe_rgb,
                 analysis_path=analysis_p,
                 loupe_path=loupe_p if loupe_p.is_file() else None,
                 metrics={
@@ -419,22 +509,69 @@ class PeopleService:
                     "noise_sigma": float(metrics.noise_sigma or 0.0) if metrics else 0.0,
                 },
             )
-            detector.run(ctx)
-            if ctx.faces:
-                self.repo.replace_faces(
-                    fp,
-                    [
+            face_out = detector.run(ctx)
+            existing_faces = self.repo.list_faces(fp)
+
+            final_records: list[FaceRecord]
+            if not existing_faces:
+                final_records = [
+                    FaceRecord(
+                        content_fp=fp,
+                        idx=f.idx,
+                        bbox=f.bbox,
+                        landmarks=f.landmarks,
+                        det_score=f.det_score,
+                        sharpness=f.sharpness,
+                        area_ratio=f.area_ratio,
+                    )
+                    for f in ctx.faces
+                ]
+                if final_records:
+                    self.repo.replace_faces(fp, final_records)
+            else:
+                # Preserve existing face indices and append any newly discovered faces (e.g. group photos)
+                final_records = list(existing_faces)
+                next_idx = max(f.idx for f in existing_faces) + 1
+                added = False
+                for new_f in ctx.faces:
+                    if any(_bbox_iou(new_f.bbox, old_f.bbox) >= 0.35 for old_f in existing_faces):
+                        continue
+                    final_records.append(
                         FaceRecord(
                             content_fp=fp,
-                            idx=f.idx,
-                            bbox=f.bbox,
-                            landmarks=f.landmarks,
-                            det_score=f.det_score,
-                            sharpness=f.sharpness,
-                            area_ratio=f.area_ratio,
+                            idx=next_idx,
+                            bbox=new_f.bbox,
+                            landmarks=new_f.landmarks,
+                            det_score=new_f.det_score,
+                            sharpness=new_f.sharpness,
+                            area_ratio=new_f.area_ratio,
                         )
-                        for f in ctx.faces
-                    ],
+                    )
+                    next_idx += 1
+                    added = True
+                if added:
+                    self.repo.replace_faces(fp, final_records)
+
+            if metrics is not None:
+                exp = dict(metrics.exposure or {})
+                exp["face_model_tag"] = current_tag
+                exp["eyes_closed"] = bool(face_out.get("eyes_closed", False))
+                exp["eye_ear_min"] = face_out.get("eye_ear_min")
+                self.repo.upsert_metrics(
+                    MetricsRecord(
+                        content_fp=metrics.content_fp,
+                        engine_version=metrics.engine_version,
+                        sharp_p95=metrics.sharp_p95,
+                        sharp_z=metrics.sharp_z,
+                        noise_sigma=metrics.noise_sigma,
+                        motion_aniso=metrics.motion_aniso,
+                        motion_state=metrics.motion_state,
+                        exposure=exp,
+                        texture=metrics.texture,
+                        face_count=len(final_records),
+                        face_sharp_min=metrics.face_sharp_min,
+                        scene_tag=metrics.scene_tag,
+                    )
                 )
 
     def index_session(
@@ -549,9 +686,10 @@ class PeopleService:
             (a.content_fp, a.face_idx): a for a in self.repo.list_face_assignments()
         }
 
-        # 1. Build prototype mean vector per named person (authoritatively from `source='user'` samples)
+        # 1. Build multi-angle prototype bank per named person (authoritatively from `source='user'` samples)
         people = self.repo.list_people()
-        prototypes: list[tuple[str, NDArray[np.float32]]] = []
+        proto_ids: list[str] = []
+        proto_vecs: list[NDArray[np.float32]] = []
         for person in people:
             user_vecs: list[NDArray[np.float32]] = []
             fallback_vecs: list[NDArray[np.float32]] = []
@@ -566,19 +704,17 @@ class PeopleService:
                 else:
                     fallback_vecs.append(vec)
             chosen = user_vecs or fallback_vecs
-            if chosen:
-                mean_arr = np.asarray(np.mean(np.stack(chosen, axis=0), axis=0), dtype=np.float32)
-                mean_vec = _normalize_vec(mean_arr)
-                prototypes.append((person.id, mean_vec))
+            for pvec in _build_prototype_bank(chosen):
+                proto_ids.append(person.id)
+                proto_vecs.append(pvec)
 
-        proto_ids = [pid for pid, _ in prototypes]
         proto_mat = (
-            np.stack([vec for _, vec in prototypes], axis=0)
-            if prototypes
+            np.stack(proto_vecs, axis=0)
+            if proto_vecs
             else np.zeros((0, self.face_embedder.dim), dtype=np.float32)
         )
 
-        # 2. Match every non-user, non-ignored valid face of kept photos against prototypes
+        # 2. Match every non-user, non-ignored valid face of kept photos against multi-angle prototypes
         now = time.time()
         updates: list[FaceAssignmentRecord] = []
         unmatched: list[tuple[str, int, NDArray[np.float32]]] = []
@@ -626,7 +762,8 @@ class PeopleService:
 
         # 3. Greedy cosine threshold clustering in pure numpy over unmatched faces.
         # Pre-seed with any user-merged unnamed clusters (`source='user', status='unassigned'`)
-        # so manually merged clusters are preserved as user constraints and never split back apart.
+        # using multi-angle sample banks so manually merged clusters stay intact and immediately
+        # recall other unmatched faces from any of the merged angles.
         pinned_cluster_vecs: dict[str, list[NDArray[np.float32]]] = {}
         kept_fp_set = set(kept_fps)
         for key, asgn in all_assignments.items():
@@ -642,10 +779,13 @@ class PeopleService:
 
         clusters_sum: list[NDArray[np.float32]] = []
         clusters_id: list[str] = []
+        clusters_pinned_mat: list[NDArray[np.float32] | None] = []
         for pinned_cid in sorted(pinned_cluster_vecs):
             vecs = pinned_cluster_vecs[pinned_cid]
             clusters_id.append(pinned_cid)
             clusters_sum.append(np.sum(np.stack(vecs, axis=0), axis=0).astype(np.float32))
+            bank = _build_prototype_bank(vecs)
+            clusters_pinned_mat.append(np.stack(bank, axis=0) if bank else None)
 
         for fp, face_idx, vec in unmatched:
             assigned_cluster: str | None = None
@@ -653,9 +793,17 @@ class PeopleService:
             if clusters_sum:
                 centroids = np.stack([_normalize_vec(s) for s in clusters_sum], axis=0)
                 sims = centroids @ vec
-                best_i = int(np.argmax(sims))
-                best_sim = float(sims[best_i])
-                if best_sim >= eff_threshold:
+                best_i = -1
+                best_sim = -1.0
+                for idx in range(len(clusters_sum)):
+                    cand_sim = float(sims[idx])
+                    pmat = clusters_pinned_mat[idx]
+                    if pmat is not None:
+                        cand_sim = max(cand_sim, float(np.max(pmat @ vec)))
+                    if cand_sim > best_sim:
+                        best_sim = cand_sim
+                        best_i = idx
+                if best_i >= 0 and best_sim >= eff_threshold:
                     clusters_sum[best_i] = clusters_sum[best_i] + vec
                     assigned_cluster = clusters_id[best_i]
                     assigned_sim = best_sim
@@ -663,6 +811,7 @@ class PeopleService:
                 assigned_cluster = _stable_id("clu", f"{fp}:{face_idx}")
                 clusters_id.append(assigned_cluster)
                 clusters_sum.append(vec.copy())
+                clusters_pinned_mat.append(None)
                 assigned_sim = 1.0
 
             updates.append(
@@ -794,35 +943,157 @@ class PeopleService:
         target_cluster_id: str | None = None,
         source_person_id: str | None = None,
         target_person_id: str | None = None,
+        source_cluster_ids: Sequence[str] | None = None,
+        source_person_ids: Sequence[str] | None = None,
         threshold: float | None = None,
     ) -> dict[str, Any]:
-        """Merge two clusters, merge a cluster into a named person, or merge two named people."""
+        """Merge clusters and/or named people into a single target and re-match across angles."""
         now = time.time()
-        # 1. Person -> Person
-        if source_person_id and target_person_id:
-            if source_person_id == target_person_id:
-                raise PeopleError("Cannot merge a person into themselves.")
-            src = self.repo.get_person(source_person_id)
-            dst = self.repo.get_person(target_person_id)
-            if src is None or dst is None:
-                raise PeopleError("Unknown source_person_id or target_person_id.")
-            moved = self.repo.reassign_person_faces(source_person_id, target_person_id)
-            self.repo.delete_person(source_person_id)
-            self.recluster_and_match(threshold=threshold)
-            return {
-                "merged_kind": "person_into_person",
-                "target_person_id": target_person_id,
-                "moved_faces": moved,
-            }
+        src_cids = list(
+            dict.fromkeys(
+                [
+                    *(source_cluster_ids or ()),
+                    *([source_cluster_id] if source_cluster_id else []),
+                ]
+            )
+        )
+        src_pids = list(
+            dict.fromkeys(
+                [
+                    *(source_person_ids or ()),
+                    *([source_person_id] if source_person_id else []),
+                ]
+            )
+        )
 
-        # 2. Cluster -> Person
-        if source_cluster_id and target_person_id:
+        # 1. Target is a named person (accepts source person(s) and/or source cluster(s))
+        if target_person_id and (src_pids or src_cids):
             dst = self.repo.get_person(target_person_id)
             if dst is None:
                 raise PeopleError(f"Unknown target_person_id: {target_person_id}")
-            targets = self._resolve_target_faces(cluster_id=source_cluster_id)
-            if not targets:
-                raise PeopleError(f"No unassigned faces in cluster {source_cluster_id!r}.")
+
+            moved_total = 0
+            for spid in src_pids:
+                if spid == target_person_id:
+                    raise PeopleError("Cannot merge a person into themselves.")
+                if self.repo.get_person(spid) is None:
+                    raise PeopleError(f"Unknown source_person_id: {spid}")
+                moved_total += self.repo.reassign_person_faces(spid, target_person_id)
+                self.repo.delete_person(spid)
+
+            cluster_faces_to_move: list[tuple[str, int]] = []
+            for scid in src_cids:
+                targets = self._resolve_target_faces(cluster_id=scid)
+                if not targets:
+                    raise PeopleError(f"No unassigned faces in cluster {scid!r}.")
+                cluster_faces_to_move.extend(targets)
+
+            if cluster_faces_to_move:
+                dedup_targets = list(dict.fromkeys(cluster_faces_to_move))
+                self.repo.upsert_face_assignments(
+                    [
+                        FaceAssignmentRecord(
+                            content_fp=fp,
+                            face_idx=fi,
+                            person_id=dst.id,
+                            status="assigned",
+                            source="user",
+                            confidence=1.0,
+                            cluster_id=None,
+                            updated_at=now,
+                        )
+                        for fp, fi in dedup_targets
+                    ]
+                )
+                moved_total += len(dedup_targets)
+
+            self.recluster_and_match(threshold=threshold)
+            merged_kind = (
+                "person_into_person"
+                if src_pids and not src_cids
+                else "cluster_into_person"
+                if src_cids and not src_pids
+                else "batch_into_person"
+            )
+            return {
+                "merged_kind": merged_kind,
+                "target_person_id": target_person_id,
+                "moved_faces": moved_total,
+            }
+
+        # 2. Cluster(s) -> Cluster (pin merged angles as user samples and immediately recall similar faces)
+        if target_cluster_id and src_cids:
+            moved_total = 0
+            for scid in src_cids:
+                if scid == target_cluster_id:
+                    raise PeopleError("Cannot merge a cluster into itself.")
+                moved = self.repo.reassign_cluster_faces(scid, target_cluster_id)
+                if moved == 0:
+                    raise PeopleError(f"No unassigned faces in source cluster {scid!r}.")
+                moved_total += moved
+            self.recluster_and_match(threshold=threshold)
+            return {
+                "merged_kind": "cluster_into_cluster",
+                "target_cluster_id": target_cluster_id,
+                "moved_faces": moved_total,
+            }
+
+        raise PeopleError(
+            "Merge requires (source_person_id + target_person_id), "
+            "(source_cluster_id + target_person_id), or (source_cluster_id + target_cluster_id)."
+        )
+
+    def label_split(
+        self,
+        *,
+        faces: Sequence[tuple[str, int]],
+        threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Detach mis-grouped face(s) from their current person/cluster into a fresh user-pinned face group."""
+        targets = list(dict.fromkeys((str(fp), int(fi)) for fp, fi in faces))
+        if not targets:
+            raise PeopleError("At least one face is required for split.")
+        now = time.time()
+        new_cid = _stable_id("clu", f"split:{targets[0][0]}:{targets[0][1]}:{now:.6f}")
+        self.repo.upsert_face_assignments(
+            [
+                FaceAssignmentRecord(
+                    content_fp=fp,
+                    face_idx=fi,
+                    person_id=None,
+                    status="unassigned",
+                    source="user",
+                    confidence=1.0,
+                    cluster_id=new_cid,
+                    updated_at=now,
+                )
+                for fp, fi in targets
+            ]
+        )
+        self.recluster_and_match(threshold=threshold)
+        return {"cluster_id": new_cid, "moved_faces": len(targets)}
+
+    def label_reassign(
+        self,
+        *,
+        faces: Sequence[tuple[str, int]],
+        target_person_id: str | None = None,
+        target_cluster_id: str | None = None,
+        threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Reassign specific face(s) to another named person or unnamed face group and update prototypes."""
+        targets = list(dict.fromkeys((str(fp), int(fi)) for fp, fi in faces))
+        if not targets:
+            raise PeopleError("At least one face is required for reassign.")
+        if bool(target_person_id) == bool(target_cluster_id):
+            raise PeopleError(
+                "Reassign requires exactly one of target_person_id or target_cluster_id."
+            )
+        now = time.time()
+        if target_person_id:
+            dst = self.repo.get_person(target_person_id)
+            if dst is None:
+                raise PeopleError(f"Unknown target_person_id: {target_person_id}")
             self.repo.upsert_face_assignments(
                 [
                     FaceAssignmentRecord(
@@ -840,28 +1111,36 @@ class PeopleService:
             )
             self.recluster_and_match(threshold=threshold)
             return {
-                "merged_kind": "cluster_into_person",
-                "target_person_id": target_person_id,
+                "target_person_id": dst.id,
+                "target_cluster_id": None,
                 "moved_faces": len(targets),
             }
 
-        # 3. Cluster -> Cluster (keep merged cluster intact without re-splitting)
-        if source_cluster_id and target_cluster_id:
-            if source_cluster_id == target_cluster_id:
-                raise PeopleError("Cannot merge a cluster into itself.")
-            moved = self.repo.reassign_cluster_faces(source_cluster_id, target_cluster_id)
-            if moved == 0:
-                raise PeopleError(f"No unassigned faces in source cluster {source_cluster_id!r}.")
-            return {
-                "merged_kind": "cluster_into_cluster",
-                "target_cluster_id": target_cluster_id,
-                "moved_faces": moved,
-            }
-
-        raise PeopleError(
-            "Merge requires (source_person_id + target_person_id), "
-            "(source_cluster_id + target_person_id), or (source_cluster_id + target_cluster_id)."
+        assert target_cluster_id is not None
+        # Also pin existing target cluster members as `source='user'` so reclustering preserves them together
+        existing_members = self._resolve_target_faces(cluster_id=target_cluster_id)
+        combined = list(dict.fromkeys([*existing_members, *targets]))
+        self.repo.upsert_face_assignments(
+            [
+                FaceAssignmentRecord(
+                    content_fp=fp,
+                    face_idx=fi,
+                    person_id=None,
+                    status="unassigned",
+                    source="user",
+                    confidence=1.0,
+                    cluster_id=target_cluster_id,
+                    updated_at=now,
+                )
+                for fp, fi in combined
+            ]
         )
+        self.recluster_and_match(threshold=threshold)
+        return {
+            "target_person_id": None,
+            "target_cluster_id": target_cluster_id,
+            "moved_faces": len(targets),
+        }
 
     def label_ignore(
         self,
@@ -1064,6 +1343,117 @@ class PeopleService:
                 )
             )
         unnamed_cluster_infos.sort(key=lambda c: (-c.face_count, c.cluster_id))
+
+        # Compute "possibly same person" suggestions across named people & unnamed clusters
+        emb_by_key: dict[tuple[str, int], NDArray[np.float32]] = {}
+        for rec in embs:
+            try:
+                emb_by_key[(rec.content_fp, rec.face_idx)] = _unpack_embedding(
+                    rec.embedding_blob, self.face_embedder.dim
+                )
+            except ValueError:
+                continue
+
+        # Entity metadata + multi-sample prototype matrix for pairwise similarity
+        entity_entries: list[
+            tuple[str, str, str | None, str | None, int | None, int, NDArray[np.float32]]
+        ] = []
+
+        for p_grp in people_groups:
+            user_vecs: list[NDArray[np.float32]] = []
+            fallback_vecs: list[NDArray[np.float32]] = []
+            for key, asgn in assignments.items():
+                if asgn.status != "assigned" or asgn.person_id != p_grp.person_id:
+                    continue
+                vec = emb_by_key.get(key)
+                if vec is None:
+                    continue
+                if asgn.source == "user":
+                    user_vecs.append(vec)
+                else:
+                    fallback_vecs.append(vec)
+            bank = _build_prototype_bank(user_vecs or fallback_vecs, max_samples=12)
+            if bank:
+                entity_entries.append(
+                    (
+                        "person",
+                        p_grp.person_id,
+                        p_grp.name,
+                        p_grp.cover_photo_id,
+                        p_grp.cover_face_idx,
+                        p_grp.photo_count,
+                        np.stack(bank, axis=0),
+                    )
+                )
+
+        for clu in unnamed_cluster_infos:
+            c_vecs = [emb_by_key[key] for key in clu.faces if key in emb_by_key]
+            bank = _build_prototype_bank(c_vecs, max_samples=12)
+            if bank:
+                entity_entries.append(
+                    (
+                        "cluster",
+                        clu.cluster_id,
+                        None,
+                        clu.cover_photo_id,
+                        clu.cover_face_idx,
+                        len(clu.photos),
+                        np.stack(bank, axis=0),
+                    )
+                )
+
+        sim_map: dict[tuple[str, str], list[SimilarFaceCandidate]] = {}
+        for i, (kind_a, id_a, _na, _cpa, _cfa, _cnta, mat_a) in enumerate(entity_entries):
+            cands: list[SimilarFaceCandidate] = []
+            for j, (kind_b, id_b, name_b, cpb, cfb, cnt_b, mat_b) in enumerate(entity_entries):
+                if i == j:
+                    continue
+                best_sim = float(np.max(mat_a @ mat_b.T))
+                if best_sim >= SIMILAR_CANDIDATE_MIN_COSINE:
+                    cands.append(
+                        SimilarFaceCandidate(
+                            kind=kind_b,
+                            target_id=id_b,
+                            name=name_b,
+                            cover_photo_id=cpb,
+                            cover_face_idx=cfb,
+                            photo_count=cnt_b,
+                            similarity=best_sim,
+                        )
+                    )
+            cands.sort(key=lambda c: (-c.similarity, c.target_id))
+            sim_map[(kind_a, id_a)] = cands[:SIMILAR_CANDIDATE_LIMIT]
+
+        people_groups = [
+            PersonGroupInfo(
+                person_id=p.person_id,
+                group_key=p.group_key,
+                name=p.name,
+                is_self=p.is_self,
+                cover_photo_id=p.cover_photo_id,
+                cover_face_idx=p.cover_face_idx,
+                photo_count=p.photo_count,
+                group_photo_count=p.group_photo_count,
+                photos=p.photos,
+                similar_candidates=tuple(sim_map.get(("person", p.person_id), ())),
+            )
+            for p in people_groups
+        ]
+
+        unnamed_cluster_infos = [
+            UnnamedClusterInfo(
+                cluster_id=c.cluster_id,
+                cover_photo_id=c.cover_photo_id,
+                cover_content_fp=c.cover_content_fp,
+                cover_face_idx=c.cover_face_idx,
+                face_count=c.face_count,
+                solo_photo_count=c.solo_photo_count,
+                faces=c.faces,
+                photos=c.photos,
+                similar_candidates=tuple(sim_map.get(("cluster", c.cluster_id), ())),
+            )
+            for c in unnamed_cluster_infos
+        ]
 
         return PeopleGroupsResponse(
             session_id=session_id,
@@ -1298,6 +1688,7 @@ __all__ = [
     "GROUP_KEY_GROUP_PHOTO",
     "GROUP_KEY_NO_FACE",
     "GROUP_KEY_UNNAMED",
+    "SIMILAR_CANDIDATE_MIN_COSINE",
     "ExportGroupReport",
     "FaceSlotInfo",
     "PeopleError",
@@ -1307,5 +1698,6 @@ __all__ = [
     "PeoplePhotoItem",
     "PeopleService",
     "PersonGroupInfo",
+    "SimilarFaceCandidate",
     "UnnamedClusterInfo",
 ]

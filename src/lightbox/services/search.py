@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -15,6 +15,7 @@ from numpy.typing import NDArray
 from lightbox.core import (
     ENGINE_VERSION,
     compute_dhash,
+    extract_gps_fast,
     load_analysis_gray,
     preview_cache_paths,
 )
@@ -26,6 +27,15 @@ from lightbox.models import (
     load_scene_vocab,
 )
 from lightbox.paths import AppPaths, get_app_paths
+from lightbox.services.geo import (
+    PLACE_BY_KEY,
+    PlaceEntry,
+    format_place_label,
+    match_place_in_text,
+    parse_query_location,
+    photo_matches_place,
+    resolve_photo_location,
+)
 from lightbox.store import (
     ExifRecord,
     LightboxRepository,
@@ -36,6 +46,21 @@ from lightbox.store import (
 )
 
 ProgressCallback = Callable[[str, int, int], None]
+SearchStrictness = Literal["strict", "balanced", "relaxed", "all"]
+
+# Calibrated adaptive similarity cutoffs for SigLIP 2 text-image and image-image cosine spaces.
+_TEXT_CUTOFF_PRESETS: dict[str, tuple[float, float]] = {
+    "strict": (0.095, 0.65),
+    "balanced": (0.075, 0.52),
+    "relaxed": (0.055, 0.38),
+}
+_SIMILAR_CUTOFF_PRESETS: dict[str, tuple[float, float]] = {
+    "strict": (0.72, 0.82),
+    "balanced": (0.55, 0.68),
+    "relaxed": (0.40, 0.50),
+}
+# Process-level set of photo_ids whose on-disk assets have already been checked for missing GPS backfill
+_GPS_BACKFILL_CHECKED: set[str] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +99,11 @@ class SearchMatch:
     exif_brief: str
     score: float
     relation: str = "semantic"
+    gps_lat: float | None = None
+    gps_lon: float | None = None
+    location_key: str | None = None
+    location_label: str | None = None
+    location_source: str | None = None  # 'gps' | 'folder' | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +127,11 @@ class SearchMatch:
             "score": self.score,
             "similarity": self.score,
             "relation": self.relation,
+            "gps_lat": self.gps_lat,
+            "gps_lon": self.gps_lon,
+            "location_key": self.location_key,
+            "location_label": self.location_label,
+            "location_source": self.location_source,
         }
 
 
@@ -111,6 +146,13 @@ class SearchResult:
     total_candidates: int
     cameras: tuple[str, ...]
     matches: tuple[SearchMatch, ...]
+    weak_matches: tuple[SearchMatch, ...] = ()
+    score_threshold: float | None = None
+    strictness: str = "balanced"
+    detected_location_key: str | None = None
+    detected_location_label: str | None = None
+    effective_visual_query: str = ""
+    locations: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +165,24 @@ class SimilarResult:
     mode: str  # 'semantic' | 'burst_dhash'
     semantic_ready: bool
     similar: tuple[SearchMatch, ...]
+    weak_similar: tuple[SearchMatch, ...] = ()
+    score_threshold: float | None = None
+    strictness: str = "balanced"
+
+
+def _compute_cutoff(
+    top_score: float,
+    *,
+    strictness: str,
+    presets: dict[str, tuple[float, float]],
+    min_score: float | None = None,
+) -> float | None:
+    if min_score is not None:
+        return float(min_score)
+    if strictness == "all":
+        return None
+    floor, rel_ratio = presets.get(strictness, presets["balanced"])
+    return round(max(floor, top_score * rel_ratio), 4)
 
 
 def _parse_iso_date_bounds(date_str: str, *, end_of_day: bool = False) -> float:
@@ -345,6 +405,49 @@ class SearchService:
             scene_tag=scene_tag,
         )
 
+    def _maybe_backfill_gps(self, photo: PhotoRecord, exif: ExifRecord | None) -> ExifRecord | None:
+        """Lazily read missing GPS coordinates from on-disk assets once per photo (for pre-fix scans)."""
+        if exif is not None and exif.gps_lat is not None and exif.gps_lon is not None:
+            return exif
+        if photo.id in _GPS_BACKFILL_CHECKED:
+            return exif
+        _GPS_BACKFILL_CHECKED.add(photo.id)
+
+        assets = self.repo.list_assets_for_photo(photo.id)
+        for kind in ("jpg", "heic", "raw"):
+            for asset in assets:
+                if asset.kind != kind:
+                    continue
+                p = Path(asset.abs_path)
+                if not p.is_file():
+                    continue
+                lat, lon = extract_gps_fast(p)
+                if lat is not None and lon is not None:
+                    updated = ExifRecord(
+                        photo_id=photo.id,
+                        aperture=exif.aperture if exif else None,
+                        shutter_s=exif.shutter_s if exif else None,
+                        iso=exif.iso if exif else None,
+                        focal_eq=exif.focal_eq if exif else None,
+                        ev_comp=exif.ev_comp if exif else None,
+                        ev100=exif.ev100 if exif else None,
+                        light_bucket=exif.light_bucket if exif else None,
+                        exposure_program=exif.exposure_program if exif else None,
+                        af_mode=exif.af_mode if exif else None,
+                        flash_fired=exif.flash_fired if exif else None,
+                        capture_local_hour=exif.capture_local_hour if exif else None,
+                        drive_mode=exif.drive_mode if exif else None,
+                        bracket_group=exif.bracket_group if exif else None,
+                        rating=exif.rating if exif else None,
+                        protected=exif.protected if exif else None,
+                        gps_lat=lat,
+                        gps_lon=lon,
+                        field_confidence=dict(exif.field_confidence) if exif else {},
+                    )
+                    self.repo.upsert_exif(updated)
+                    return updated
+        return exif
+
     def _build_match(
         self,
         photo: PhotoRecord,
@@ -361,6 +464,9 @@ class SearchService:
         conf = float(verdict.confidence) if verdict is not None else 1.0
         reason_codes = tuple(verdict.reason_codes) if verdict is not None else ()
         scene_tag = metrics.scene_tag if metrics is not None else None
+        gps_lat = exif.gps_lat if exif is not None else None
+        gps_lon = exif.gps_lon if exif is not None else None
+        place, loc_source = resolve_photo_location(gps_lat, gps_lon, session_name, photo.rel_dir)
         return SearchMatch(
             photo_id=photo.id,
             session_id=photo.session_id,
@@ -381,6 +487,11 @@ class SearchService:
             exif_brief=_format_exif_brief(photo, exif),
             score=round(float(score), 4),
             relation=relation,
+            gps_lat=gps_lat,
+            gps_lon=gps_lon,
+            location_key=place.key if place is not None else None,
+            location_label=format_place_label(place, lang=lang),
+            location_source=loc_source,
         )
 
     def search_photos(
@@ -394,16 +505,41 @@ class SearchService:
         light_bucket: str | None = None,
         focal_min: float | None = None,
         focal_max: float | None = None,
+        location: str | None = None,
+        ignore_location: bool = False,
+        strictness: SearchStrictness = "balanced",
+        min_score: float | None = None,
         limit: int = 20,
         lang: str = "zh-CN",
     ) -> SearchResult:
-        """Filter photos by EXIF/session/date first, then rank candidates by SigLIP 2 cosine similarity."""
+        """Filter photos by EXIF/session/date/location first, then rank by SigLIP 2 cosine with adaptive cutoff."""
         clamped_limit = max(1, min(limit, 100))
         q_clean = query.strip()
         cam_needle = camera.strip().lower() if camera else None
         light_needle = light_bucket.strip().lower() if light_bucket else None
         min_ts = _parse_iso_date_bounds(date_from, end_of_day=False) if date_from else None
         max_ts = _parse_iso_date_bounds(date_to, end_of_day=True) if date_to else None
+
+        # Parse natural-language location from query (e.g. "迈阿密的日落" -> place=Miami, visual="日落")
+        parsed_q = parse_query_location(q_clean)
+        explicit_place: PlaceEntry | None = None
+        if location and location.strip():
+            loc_clean = location.strip()
+            explicit_place = PLACE_BY_KEY.get(loc_clean.lower()) or match_place_in_text(loc_clean)
+
+        active_place: PlaceEntry | None = (
+            explicit_place
+            if explicit_place is not None
+            else (None if ignore_location else parsed_q.place)
+        )
+        # Strip recognized place name from visual query so SigLIP 2 focuses purely on visual semantics
+        visual_query = (
+            parsed_q.visual_query
+            if parsed_q.place is not None
+            else q_clean
+        )
+        detected_loc_key = active_place.key if active_place is not None else None
+        detected_loc_label = format_place_label(active_place, lang=lang)
 
         if session_id:
             sess = self.repo.get_session(session_id)
@@ -414,6 +550,7 @@ class SearchService:
             sessions = self.repo.list_sessions()
 
         all_cameras: set[str] = set()
+        all_places: dict[str, PlaceEntry] = {}
         candidates: list[
             tuple[PhotoRecord, SessionRecord, Any, ExifRecord | None, MetricsRecord | None]
         ] = []
@@ -426,23 +563,47 @@ class SearchService:
                     continue
                 if p.camera_model:
                     all_cameras.add(p.camera_model)
+                exif = self._maybe_backfill_gps(p, self.repo.get_exif(p.id))
+                photo_place, _loc_src = resolve_photo_location(
+                    exif.gps_lat if exif else None,
+                    exif.gps_lon if exif else None,
+                    sess.name,
+                    p.rel_dir,
+                )
+                if photo_place is not None:
+                    all_places[photo_place.key] = photo_place
+
                 if min_ts is not None and (p.capture_time is None or p.capture_time < min_ts):
                     continue
                 if max_ts is not None and (p.capture_time is None or p.capture_time > max_ts):
                     continue
                 if cam_needle and cam_needle not in (p.camera_model or "").lower():
                     continue
-                exif = self.repo.get_exif(p.id)
                 if light_needle and (exif is None or (exif.light_bucket or "").lower() != light_needle):
                     continue
                 if focal_min is not None and (exif is None or exif.focal_eq is None or exif.focal_eq < focal_min):
                     continue
                 if focal_max is not None and (exif is None or exif.focal_eq is None or exif.focal_eq > focal_max):
                     continue
+                if active_place is not None and not photo_matches_place(
+                    active_place,
+                    gps_lat=exif.gps_lat if exif else None,
+                    gps_lon=exif.gps_lon if exif else None,
+                    session_name=sess.name,
+                    rel_dir=p.rel_dir,
+                ):
+                    continue
                 metrics = self.repo.get_metrics(p.primary_content_fp, ENGINE_VERSION)
                 candidates.append((p, sess, verdicts.get(p.id), exif, metrics))
 
         sorted_cameras = tuple(sorted(all_cameras))
+        sorted_locations = tuple(
+            {"key": pl.key, "label": format_place_label(pl, lang=lang) or pl.name_en}
+            for pl in sorted(
+                all_places.values(),
+                key=lambda item: (format_place_label(item, lang=lang) or item.name_en).lower(),
+            )
+        )
         indexed_fps = self.vector_index.list_content_fps(self.embedder.model_id)
         candidate_fps = {p.primary_content_fp for p, *_ in candidates}
         indexed_candidate_fps = candidate_fps & indexed_fps
@@ -451,16 +612,23 @@ class SearchService:
         if not candidates:
             return SearchResult(
                 query=q_clean,
-                mode="semantic" if (q_clean and indexed_fps) else ("filter" if not q_clean else "fts_exif"),
+                mode="semantic" if (visual_query and indexed_fps) else ("filter" if not visual_query else "fts_exif"),
                 semantic_ready=bool(indexed_fps),
                 indexed_count=0,
                 total_candidates=0,
                 cameras=sorted_cameras,
                 matches=(),
+                weak_matches=(),
+                score_threshold=None,
+                strictness=strictness,
+                detected_location_key=detected_loc_key,
+                detected_location_label=detected_loc_label,
+                effective_visual_query=visual_query,
+                locations=sorted_locations,
             )
 
-        # Case 1: Empty query -> browse filtered candidates by capture time descending
-        if not q_clean:
+        # Case 1: Empty visual query (either blank search or pure location query like "迈阿密") -> browse by capture time desc
+        if not visual_query:
             ordered = sorted(
                 candidates,
                 key=lambda row: (-(row[0].capture_time or 0.0), row[0].rel_dir, row[0].stem, row[0].id),
@@ -486,11 +654,18 @@ class SearchService:
                 total_candidates=len(candidates),
                 cameras=sorted_cameras,
                 matches=matches,
+                weak_matches=(),
+                score_threshold=None,
+                strictness=strictness,
+                detected_location_key=detected_loc_key,
+                detected_location_label=detected_loc_label,
+                effective_visual_query="",
+                locations=sorted_locations,
             )
 
-        # Case 2: Semantic query over indexed candidates (filter first -> cosine rank)
+        # Case 2: Semantic query over indexed candidates (location/EXIF filter first -> cosine rank -> adaptive cutoff)
         if indexed_candidate_fps:
-            q_vec = self.embedder.embed_texts([q_clean])[0]
+            q_vec = self.embedder.embed_texts([visual_query])[0]
             vec_matches = self.vector_index.query(
                 q_vec,
                 model_id=self.embedder.model_id,
@@ -520,6 +695,26 @@ class SearchService:
                     )
                 )
             ranked.sort(key=lambda pair: (-pair[0], pair[1].rel_dir, pair[1].stem, pair[1].photo_id))
+
+            cutoff = (
+                _compute_cutoff(
+                    ranked[0][0],
+                    strictness=strictness,
+                    presets=_TEXT_CUTOFF_PRESETS,
+                    min_score=min_score,
+                )
+                if ranked
+                else None
+            )
+            strong: list[SearchMatch] = []
+            weak: list[SearchMatch] = []
+            for sim, match in ranked:
+                if cutoff is None or sim >= cutoff:
+                    if len(strong) < clamped_limit:
+                        strong.append(match)
+                elif len(weak) < 24:
+                    weak.append(match)
+
             return SearchResult(
                 query=q_clean,
                 mode="semantic",
@@ -527,7 +722,14 @@ class SearchService:
                 indexed_count=indexed_count,
                 total_candidates=len(candidates),
                 cameras=sorted_cameras,
-                matches=tuple(match for _, match in ranked[:clamped_limit]),
+                matches=tuple(strong),
+                weak_matches=tuple(weak),
+                score_threshold=cutoff,
+                strictness=strictness,
+                detected_location_key=detected_loc_key,
+                detected_location_label=detected_loc_label,
+                effective_visual_query=visual_query,
+                locations=sorted_locations,
             )
 
         # Case 3: Graceful FTS5 / EXIF metadata fallback when no vectors have been indexed yet
@@ -599,6 +801,13 @@ class SearchService:
             total_candidates=len(candidates),
             cameras=sorted_cameras,
             matches=tuple(match for _, match in scored_fallback[:clamped_limit]),
+            weak_matches=(),
+            score_threshold=None,
+            strictness=strictness,
+            detected_location_key=detected_loc_key,
+            detected_location_label=detected_loc_label,
+            effective_visual_query=visual_query,
+            locations=sorted_locations,
         )
 
     def find_similar(
@@ -607,19 +816,22 @@ class SearchService:
         *,
         limit: int = 12,
         session_id: str | None = None,
+        strictness: SearchStrictness = "balanced",
+        min_score: float | None = None,
         lang: str = "zh-CN",
     ) -> SimilarResult:
-        """Find visually similar photos by SigLIP 2 cosine similarity (always excluding anchor itself)."""
+        """Find visually similar photos by SigLIP 2 cosine similarity with adaptive low-score cutoff."""
         anchor = self.repo.get_photo(photo_id)
         if anchor is None:
             raise ValueError(f"Unknown photo_id: {photo_id}")
         anchor_sess = self.repo.get_session(anchor.session_id)
         anchor_sess_name = anchor_sess.name if anchor_sess is not None else anchor.session_id
+        anchor_exif = self._maybe_backfill_gps(anchor, self.repo.get_exif(anchor.id))
         anchor_match = self._build_match(
             anchor,
             anchor_sess_name,
             verdict=self.repo.get_effective_verdict(anchor.id),
-            exif=self.repo.get_exif(anchor.id),
+            exif=anchor_exif,
             metrics=self.repo.get_metrics(anchor.primary_content_fp, ENGINE_VERSION),
             score=1.0,
             lang=lang,
@@ -650,7 +862,7 @@ class SearchService:
                         p,
                         sess,
                         verdicts.get(p.id),
-                        self.repo.get_exif(p.id),
+                        self._maybe_backfill_gps(p, self.repo.get_exif(p.id)),
                         self.repo.get_metrics(p.primary_content_fp, ENGINE_VERSION),
                     )
                 )
@@ -694,13 +906,36 @@ class SearchService:
                     )
                 )
             ranked.sort(key=lambda pair: (-pair[0], pair[1].rel_dir, pair[1].stem, pair[1].photo_id))
+
+            cutoff = (
+                _compute_cutoff(
+                    ranked[0][0],
+                    strictness=strictness,
+                    presets=_SIMILAR_CUTOFF_PRESETS,
+                    min_score=min_score,
+                )
+                if ranked
+                else None
+            )
+            strong: list[SearchMatch] = []
+            weak: list[SearchMatch] = []
+            for sim, match in ranked:
+                if cutoff is None or sim >= cutoff:
+                    if len(strong) < clamped_limit:
+                        strong.append(match)
+                elif len(weak) < 12:
+                    weak.append(match)
+
             return SimilarResult(
                 anchor=anchor_match,
                 anchor_id=anchor.id,
                 session_id=anchor.session_id,
                 mode="semantic",
                 semantic_ready=True,
-                similar=tuple(match for _, match in ranked[:clamped_limit]),
+                similar=tuple(strong),
+                weak_similar=tuple(weak),
+                score_threshold=cutoff,
+                strictness=strictness,
             )
 
         # Fallback when vectors are not indexed yet: burst siblings + dHash + nearby capture time

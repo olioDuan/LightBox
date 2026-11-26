@@ -339,7 +339,7 @@ class ReviewService:
                 offset = max(0, int(cursor.strip()))
             except ValueError as exc:
                 raise ValueError(f"Invalid pagination cursor: {cursor!r}") from exc
-        clamped_limit = max(1, min(limit, 200))
+        clamped_limit = max(1, min(limit, 2000))
         batch = self.list_photos(
             session_id,
             bucket=bucket,

@@ -37,6 +37,7 @@ from lightbox.services.people import (
     PeoplePhotoItem,
     PeopleService,
     PersonGroupInfo,
+    SimilarFaceCandidate,
     UnnamedClusterInfo,
 )
 from lightbox.services.plan import (
@@ -172,6 +173,7 @@ __all__ = [
     "SearchService",
     "SessionSummary",
     "ShootingDigestReport",
+    "SimilarFaceCandidate",
     "SimilarResult",
     "StalePlanError",
     "SynthSampleSpec",

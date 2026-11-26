@@ -12,6 +12,7 @@ REASON_SEVERE_BLUR = "severe_blur"
 REASON_BORDERLINE_BLUR = "borderline_blur"
 REASON_LOW_RELATIVE_SHARPNESS = "low_relative_sharpness"
 REASON_FACE_OUT_OF_FOCUS = "face_out_of_focus"
+REASON_EYES_CLOSED = "eyes_closed"
 
 # --- Burst selection reason codes (strictly separated from technical failures!) ---
 REASON_BURST_NON_PICK = "burst_non_pick"
@@ -49,6 +50,7 @@ TECH_REJECT_REASON_CODES: frozenset[str] = frozenset(
         REASON_BORDERLINE_BLUR,
         REASON_LOW_RELATIVE_SHARPNESS,
         REASON_FACE_OUT_OF_FOCUS,
+        REASON_EYES_CLOSED,
     }
 )
 
@@ -90,6 +92,10 @@ REASON_MESSAGES: dict[str, dict[str, str]] = {
     REASON_FACE_OUT_OF_FOCUS: {
         "zh-CN": "主体人脸疑似失焦（仅标黄保留，不自动判废）",
         "en-US": "Subject face appears soft (marked yellow for review, never auto-red)",
+    },
+    REASON_EYES_CLOSED: {
+        "zh-CN": "检测到人物闭眼（仅标黄保留，建议人工复核）",
+        "en-US": "Subject appears to have eyes closed (marked yellow for review, never auto-red)",
     },
     REASON_BURST_NON_PICK: {
         "zh-CN": "已确认连拍组中未选中的合格次选帧",
@@ -206,6 +212,7 @@ __all__ = [
     "REASON_BURST_PICK",
     "REASON_EXTREME_EV_COMP_PROTECTED",
     "REASON_EXTREME_EXPOSURE",
+    "REASON_EYES_CLOSED",
     "REASON_FACE_OUT_OF_FOCUS",
     "REASON_IN_CAMERA_PROTECTED",
     "REASON_IN_CAMERA_RATED",

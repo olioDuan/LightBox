@@ -846,3 +846,117 @@ def test_load_rgb_fallback_applies_exif_orientation(tmp_path: Path) -> None:
         rgb = _load_rgb_image_for_photo(svcs.repo, paths, photo)
         assert rgb is not None
         assert rgb.shape == (300, 200, 3)  # H=300, W=200 after EXIF transpose!
+
+
+def test_people_multi_angle_learning_similar_candidates_and_split_reassign(tmp_path: Path) -> None:
+    """Verify multi-angle prototype learning, similar-face suggestions, batch merge, split, and reassign."""
+    # Construct two angles of Bob whose cosine similarity is ~0.30 (below 0.42 auto-merge, above 0.22 suggestion)
+    # and a third future side-profile shot of Bob very close to angle 2 (~0.97) but still far from angle 1 (~0.30).
+    bob_front_vec = _face_vec(10)
+    bob_side_vec = _normalize_vec_test(0.30 * _face_vec(10) + 0.9539 * _face_vec(11))
+    bob_side_new_vec = _normalize_vec_test(0.28 * _face_vec(10) + 0.955 * _face_vec(11) + 0.05 * _face_vec(12))
+    alice_vec = _face_vec(30)
+
+    c_front = (230, 40, 40)
+    c_side = (230, 140, 40)
+    c_side_new = (200, 160, 40)
+    c_alice = (40, 210, 80)
+
+    embedder = FakeFaceEmbedder(
+        {
+            c_front: bob_front_vec,
+            c_side: bob_side_vec,
+            c_side_new: bob_side_new_vec,
+            c_alice: alice_vec,
+        }
+    )
+    solo_box = (0.25, 0.20, 0.75, 0.80)
+    shoot1 = tmp_path / "s1"
+    shoot2 = tmp_path / "s2"
+    paths = get_app_paths(tmp_path / "home_multi")
+
+    with LightboxServices(app_paths=paths, face_embedder=embedder) as svcs:
+        p1 = _write_color_blocks_jpg(shoot1 / "BOB_FRONT.jpg", [(solo_box, c_front)])
+        p2 = _write_color_blocks_jpg(shoot1 / "BOB_SIDE.jpg", [(solo_box, c_side)])
+        p3 = _write_color_blocks_jpg(shoot1 / "ALICE.jpg", [(solo_box, c_alice)])
+        fp_front = _seed_kept_photo(
+            svcs,
+            session_id="s1",
+            session_name="Shoot 1",
+            photo_id="p_front",
+            stem="BOB_FRONT",
+            img_path=p1,
+            faces=[(solo_box, 0.12)],
+        )
+        fp_side = _seed_kept_photo(
+            svcs,
+            session_id="s1",
+            session_name="Shoot 1",
+            photo_id="p_side",
+            stem="BOB_SIDE",
+            img_path=p2,
+            faces=[(solo_box, 0.12)],
+        )
+        fp_alice = _seed_kept_photo(
+            svcs,
+            session_id="s1",
+            session_name="Shoot 1",
+            photo_id="p_alice",
+            stem="ALICE",
+            img_path=p3,
+            faces=[(solo_box, 0.12)],
+        )
+
+        svcs.people.index_session("s1")
+        groups_initial = svcs.people.get_people_groups()
+        # Front, Side, Alice start as 3 separate unnamed clusters
+        assert len(groups_initial.unnamed_clusters) == 3
+
+        front_clu = next(c for c in groups_initial.unnamed_clusters if (fp_front, 0) in c.faces)
+        side_clu = next(c for c in groups_initial.unnamed_clusters if (fp_side, 0) in c.faces)
+        alice_clu = next(c for c in groups_initial.unnamed_clusters if (fp_alice, 0) in c.faces)
+
+        # Front cluster MUST suggest Side cluster as `similar_candidates` (sim ~0.30 >= 0.22), NOT Alice (sim 0.0)
+        assert [cand.target_id for cand in front_clu.similar_candidates] == [side_clu.cluster_id]
+        assert front_clu.similar_candidates[0].similarity >= 0.25
+
+        # Name Front cluster as "Bob", then merge Side cluster into Bob
+        bob = svcs.people.label_name("Bob", cluster_id=front_clu.cluster_id)
+        svcs.people.label_merge(source_cluster_ids=[side_clu.cluster_id], target_person_id=bob.id)
+
+        # Now add a brand-new Session 2 with a new side-profile photo of Bob (`c_side_new`)
+        # Even though `c_side_new` has cosine ~0.28 to Bob's front photo, multi-prototype learning remembers Bob's side angle!
+        p4 = _write_color_blocks_jpg(shoot2 / "BOB_SIDE_2.jpg", [(solo_box, c_side_new)])
+        _seed_kept_photo(
+            svcs,
+            session_id="s2",
+            session_name="Shoot 2",
+            photo_id="p_side_2",
+            stem="BOB_SIDE_2",
+            img_path=p4,
+            faces=[(solo_box, 0.12)],
+        )
+        svcs.people.index_session("s2")
+        groups_after_s2 = svcs.people.get_people_groups()
+        bob_grp = next(p for p in groups_after_s2.people if p.person_id == bob.id)
+        assert sorted(p.photo_id for p in bob_grp.photos) == ["p_front", "p_side", "p_side_2"]
+
+        # Test `split`: detach `p_side` from Bob -> both `p_side` and auto-matched `p_side_2` leave Bob
+        split_res = svcs.people.label_split(faces=[(fp_side, 0)])
+        assert split_res["moved_faces"] == 1
+        groups_after_split = svcs.people.get_people_groups()
+        bob_after_split = next(p for p in groups_after_split.people if p.person_id == bob.id)
+        assert sorted(p.photo_id for p in bob_after_split.photos) == ["p_front"]
+
+        # Test `reassign`: move `p_side` to Alice -> multi-prototype learning also pulls `p_side_2` to Alice!
+        alice = svcs.people.label_name("Alice", cluster_id=alice_clu.cluster_id)
+        reassign_res = svcs.people.label_reassign(faces=[(fp_side, 0)], target_person_id=alice.id)
+        assert reassign_res["moved_faces"] == 1
+        groups_after_reassign = svcs.people.get_people_groups()
+        alice_grp = next(p for p in groups_after_reassign.people if p.person_id == alice.id)
+        assert sorted(p.photo_id for p in alice_grp.photos) == ["p_alice", "p_side", "p_side_2"]
+
+
+def _normalize_vec_test(v: NDArray[np.float32]) -> NDArray[np.float32]:
+    norm = float(np.linalg.norm(v))
+    return (v / norm).astype(np.float32) if norm > 0.0 else v

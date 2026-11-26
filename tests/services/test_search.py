@@ -316,20 +316,27 @@ def test_filtered_search_cosine_ranking(tmp_path: Path) -> None:
             scene_tag="sunset_golden_hour",
         )
 
-        # 1. Unfiltered Chinese query ranks all 4 strictly by cosine descending
-        res_all = svcs.search.search_photos("日落")
-        assert res_all.mode == "semantic"
-        assert res_all.semantic_ready is True
+        # 1. Unfiltered Chinese query: default `balanced` filters out low-similarity `p_low` into `weak_matches`,
+        # while `strictness="all"` ranks all 4 strictly by cosine descending.
+        res_balanced = svcs.search.search_photos("日落")
+        assert res_balanced.mode == "semantic"
+        assert res_balanced.semantic_ready is True
+        assert [m.photo_id for m in res_balanced.matches] == ["p_fuji", "p_high", "p_mid"]
+        assert [m.photo_id for m in res_balanced.weak_matches] == ["p_low"]
+        assert res_balanced.matches[0].score > res_balanced.matches[1].score > res_balanced.matches[2].score
+
+        res_all = svcs.search.search_photos("日落", strictness="all")
         assert [m.photo_id for m in res_all.matches] == ["p_fuji", "p_high", "p_mid", "p_low"]
-        assert res_all.matches[0].score > res_all.matches[1].score > res_all.matches[2].score
 
         # 2. Camera filter excludes p_fuji BEFORE ranking
-        res_sony = svcs.search.search_photos("sunset", camera="Sony")
+        res_sony = svcs.search.search_photos("sunset", camera="Sony", strictness="all")
         assert [m.photo_id for m in res_sony.matches] == ["p_high", "p_mid", "p_low"]
         assert "Fujifilm X-T5" in res_sony.cameras and "Sony A7IV" in res_sony.cameras
 
         # 3. Date range filter (`2026-05-11`..`2026-05-31`) keeps only p_mid and p_low
-        res_date = svcs.search.search_photos("sunset", date_from="2026-05-11", date_to="2026-05-31")
+        res_date = svcs.search.search_photos(
+            "sunset", date_from="2026-05-11", date_to="2026-05-31", strictness="all"
+        )
         assert [m.photo_id for m in res_date.matches] == ["p_mid", "p_low"]
 
         # 4. Session + light_bucket filter keeps only daylight Sony shots in sess_a
@@ -408,18 +415,22 @@ def test_find_similar_excludes_anchor_and_ranks_by_cosine(tmp_path: Path) -> Non
             img_path=_create_jpg(tmp_path / "s1" / "FAR.jpg", (10, 10, 30)),
         )
 
-        # Cross-session find_similar: anchor excluded, sorted near -> mid -> far
-        sim_all = svcs.search.find_similar("p_anchor", limit=10)
-        assert sim_all.mode == "semantic"
-        assert sim_all.semantic_ready is True
-        assert sim_all.anchor_id == "p_anchor"
-        returned_ids = [m.photo_id for m in sim_all.similar]
-        assert "p_anchor" not in returned_ids
-        assert returned_ids == ["p_near", "p_mid", "p_far"]
+        # Cross-session find_similar: default `balanced` drops orthogonal `p_far` (0.0) into `weak_similar`
+        sim_balanced = svcs.search.find_similar("p_anchor", limit=10)
+        assert sim_balanced.mode == "semantic"
+        assert sim_balanced.semantic_ready is True
+        assert sim_balanced.anchor_id == "p_anchor"
+        assert "p_anchor" not in [m.photo_id for m in sim_balanced.similar]
+        assert [m.photo_id for m in sim_balanced.similar] == ["p_near"]
+        assert [m.photo_id for m in sim_balanced.weak_similar] == ["p_mid", "p_far"]
         assert fake.embed_texts_calls == 0  # find_similar never touches text tower
 
+        # `strictness="all"` returns all neighbors ranked descending
+        sim_all = svcs.search.find_similar("p_anchor", limit=10, strictness="all")
+        assert [m.photo_id for m in sim_all.similar] == ["p_near", "p_mid", "p_far"]
+
         # Session-scoped find_similar excludes other session and still excludes anchor
-        sim_s1 = svcs.search.find_similar("p_anchor", limit=10, session_id="sess_1")
+        sim_s1 = svcs.search.find_similar("p_anchor", limit=10, session_id="sess_1", strictness="all")
         assert [m.photo_id for m in sim_s1.similar] == ["p_near", "p_far"]
 
 
@@ -779,3 +790,152 @@ def test_download_failure_wrapped_as_embedder_error_and_api_503(
         assert "HF_ENDPOINT" in r_embed.json()["detail"]
     finally:
         clear_shared_siglip2_embedder_cache()
+
+
+def test_location_parsing_gps_folder_filtering_and_adaptive_cutoff(tmp_path: Path) -> None:
+    """Verify query location extraction, GPS+folder dual filtering, ignore_location, and adaptive cutoff."""
+    from lightbox.services.geo import parse_query_location, reverse_geocode
+
+    parsed_zh = parse_query_location("迈阿密的日落")
+    assert parsed_zh.place is not None and parsed_zh.place.key == "miami"
+    assert parsed_zh.visual_query == "日落"
+
+    parsed_en = parse_query_location("golden sunset in Sydney")
+    assert parsed_en.place is not None and parsed_en.place.key == "sydney"
+    assert parsed_en.visual_query == "golden sunset"
+
+    parsed_only_loc = parse_query_location("迈阿密")
+    assert parsed_only_loc.place is not None and parsed_only_loc.place.key == "miami"
+    assert parsed_only_loc.visual_query == ""
+
+    miami_geo = reverse_geocode(25.78, -80.18)
+    assert miami_geo is not None and miami_geo.key == "miami"
+    sydney_geo = reverse_geocode(-33.87, 151.21)
+    assert sydney_geo is not None and sydney_geo.key == "sydney"
+    shanghai_geo = reverse_geocode(31.23, 121.47)
+    assert shanghai_geo is not None and shanghai_geo.key == "shanghai"
+
+    q_sunset = _unit_vec({0: 1.0})
+    fake = FakeEmbedder(text_vectors={"日落": q_sunset, "sunset": q_sunset})
+    paths = get_app_paths(tmp_path / "home_geo")
+
+    with LightboxServices(app_paths=paths, embedder=fake) as svcs:
+        # 1. Miami DJI sunset with Miami GPS (high sunset score 0.16)
+        _seed_photo_with_vector(
+            svcs,
+            session_id="sess_miami",
+            session_name="Miami Selected",
+            photo_id="p_miami_gps",
+            stem="DJI_MIAMI_SUNSET",
+            content_fp="fp_miami_gps",
+            camera_model="DJI Mavic 3",
+            capture_iso="2025-11-11",
+            light_bucket="daylight",
+            focal_eq=24.0,
+            vec=_unit_vec({0: 0.16, 1: 0.9871}),
+            img_path=_create_jpg(tmp_path / "miami" / "DJI_MIAMI_SUNSET.jpg", (240, 140, 60)),
+            scene_tag="sunset_golden_hour",
+        )
+        svcs.repo.upsert_exif(
+            ExifRecord(photo_id="p_miami_gps", light_bucket="daylight", gps_lat=25.78, gps_lon=-80.18)
+        )
+
+        # 2. Miami Canon sunset WITHOUT GPS, inside "Miami Selected" folder (score 0.12)
+        _seed_photo_with_vector(
+            svcs,
+            session_id="sess_miami",
+            session_name="Miami Selected",
+            photo_id="p_miami_canon",
+            stem="5A3A_MIAMI_SUNSET",
+            content_fp="fp_miami_canon",
+            camera_model="Canon R5",
+            capture_iso="2025-11-11",
+            light_bucket="daylight",
+            focal_eq=50.0,
+            vec=_unit_vec({0: 0.12, 2: 0.9928}),
+            img_path=_create_jpg(tmp_path / "miami" / "5A3A_MIAMI_SUNSET.jpg", (230, 130, 50)),
+            scene_tag="sunset_golden_hour",
+        )
+
+        # 3. Miami daytime unrelated boat with Miami GPS (low sunset score 0.05 -> goes to weak_matches!)
+        _seed_photo_with_vector(
+            svcs,
+            session_id="sess_miami",
+            session_name="Miami Selected",
+            photo_id="p_miami_low",
+            stem="DJI_MIAMI_BOAT",
+            content_fp="fp_miami_low",
+            camera_model="DJI Mavic 3",
+            capture_iso="2025-11-10",
+            light_bucket="daylight",
+            focal_eq=24.0,
+            vec=_unit_vec({0: 0.05, 3: 0.9987}),
+            img_path=_create_jpg(tmp_path / "miami" / "DJI_MIAMI_BOAT.jpg", (50, 120, 200)),
+            scene_tag="vehicle_transport",
+        )
+        svcs.repo.upsert_exif(
+            ExifRecord(photo_id="p_miami_low", light_bucket="daylight", gps_lat=25.77, gps_lon=-80.19)
+        )
+
+        # 4. Australia sunset with Sydney GPS (VERY high sunset score 0.19 -> MUST be excluded for Miami!)
+        _seed_photo_with_vector(
+            svcs,
+            session_id="sess_aus",
+            session_name="Testphotos",
+            photo_id="p_aus_sunset",
+            stem="SYDNEY_SUNSET",
+            content_fp="fp_aus_sunset",
+            camera_model="Canon R5",
+            capture_iso="2025-10-01",
+            light_bucket="daylight",
+            focal_eq=35.0,
+            vec=_unit_vec({0: 0.19, 4: 0.9818}),
+            img_path=_create_jpg(tmp_path / "aus" / "SYDNEY_SUNSET.jpg", (255, 130, 40)),
+            scene_tag="sunset_golden_hour",
+        )
+        svcs.repo.upsert_exif(
+            ExifRecord(photo_id="p_aus_sunset", light_bucket="daylight", gps_lat=-33.87, gps_lon=151.21)
+        )
+
+        # 5. Unrelated no-GPS portrait in "Testphotos" -> MUST be excluded for Miami!
+        _seed_photo_with_vector(
+            svcs,
+            session_id="sess_aus",
+            session_name="Testphotos",
+            photo_id="p_portrait_nogps",
+            stem="PORTRAIT_NOGPS",
+            content_fp="fp_portrait_nogps",
+            camera_model="Canon R5",
+            capture_iso="2025-10-02",
+            light_bucket="daylight",
+            focal_eq=85.0,
+            vec=_unit_vec({0: 0.14, 5: 0.9901}),
+            img_path=_create_jpg(tmp_path / "aus" / "PORTRAIT_NOGPS.jpg", (200, 180, 170)),
+            scene_tag="portrait",
+        )
+
+        # Search "迈阿密的日落": ONLY Miami GPS + Miami folder sunsets pass; Australia & Testphotos excluded;
+        # low-score Miami boat (0.05) moves cleanly into weak_matches!
+        res = svcs.search.search_photos("迈阿密的日落")
+        assert res.detected_location_key == "miami"
+        assert res.detected_location_label == "迈阿密"
+        assert res.effective_visual_query == "日落"
+        assert [m.photo_id for m in res.matches] == ["p_miami_gps", "p_miami_canon"]
+        assert [m.photo_id for m in res.weak_matches] == ["p_miami_low"]
+        assert res.matches[0].location_source == "gps"
+        assert res.matches[1].location_source == "folder"
+        assert {loc["key"] for loc in res.locations} >= {"miami", "sydney"}
+
+        # With ignore_location=True: Australia sunset + no-GPS high-score photo appear too
+        res_any = svcs.search.search_photos("迈阿密的日落", ignore_location=True)
+        assert res_any.detected_location_key is None
+        assert "p_aus_sunset" in [m.photo_id for m in res_any.matches]
+
+        # Pure location query "迈阿密" browses all 3 Miami photos (and excludes Australia/Testphotos)
+        res_loc_only = svcs.search.search_photos("迈阿密")
+        assert res_loc_only.mode == "filter"
+        assert set(m.photo_id for m in res_loc_only.matches) == {
+            "p_miami_gps",
+            "p_miami_canon",
+            "p_miami_low",
+        }
