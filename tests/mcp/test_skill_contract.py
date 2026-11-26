@@ -341,5 +341,6 @@ def test_cli_mcp_command_help_is_registered() -> None:
     runner = CliRunner()
     res = runner.invoke(cli_app, ["mcp", "--help"])
     assert res.exit_code == 0
-    assert "--transport" in res.output
-    assert "--port" in res.output
+    plain_output = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", res.output)
+    assert "--transport" in plain_output
+    assert "--port" in plain_output
