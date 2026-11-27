@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
@@ -90,6 +90,17 @@ def _truncate_untrusted(value: str | None, max_len: int = 160) -> str | None:
     return cleaned[: max_len - 3] + "..."
 
 
+def _format_meta(ctx: ToolContext, value: str | None, *, max_len: int = 160) -> str | None:
+    """Truncate untrusted metadata and wrap with `<untrusted_metadata>` on the Agent surface."""
+    truncated = _truncate_untrusted(value, max_len=max_len)
+    if truncated is None:
+        return None
+    if ctx.surface.startswith("agent"):
+        safe = truncated.replace("<", "&lt;").replace(">", "&gt;")
+        return f"<untrusted_metadata>{safe}</untrusted_metadata>"
+    return truncated
+
+
 @dataclass(frozen=True, slots=True)
 class ToolImagePayload:
     """Binary EXIF-stripped image payload attached to a tool result."""
@@ -107,6 +118,7 @@ class ToolExecutionResult:
     images: tuple[ToolImagePayload, ...] = ()
     is_error: bool = False
     error_message: str | None = None
+    hook_decision: Literal["ALLOW", "DENY", "ASK"] | None = None
 
     @classmethod
     def ok(
@@ -115,7 +127,13 @@ class ToolExecutionResult:
         *,
         images: tuple[ToolImagePayload, ...] = (),
     ) -> ToolExecutionResult:
-        return cls(data=data, images=images, is_error=False, error_message=None)
+        return cls(
+            data=data,
+            images=images,
+            is_error=False,
+            error_message=None,
+            hook_decision="ALLOW",
+        )
 
     @classmethod
     def error(
@@ -123,10 +141,19 @@ class ToolExecutionResult:
         message: str,
         *,
         data: dict[str, Any] | None = None,
+        hook_decision: Literal["ALLOW", "DENY", "ASK"] | None = None,
     ) -> ToolExecutionResult:
         payload = dict(data or {})
         payload.setdefault("error", message)
-        return cls(data=payload, images=(), is_error=True, error_message=message)
+        if hook_decision is not None:
+            payload.setdefault("hook_decision", hook_decision)
+        return cls(
+            data=payload,
+            images=(),
+            is_error=True,
+            error_message=message,
+            hook_decision=hook_decision,
+        )
 
 
 @dataclass(slots=True)
@@ -139,6 +166,15 @@ class ToolContext:
     progress_callback: Callable[[str, int, int], None] | None = None
     elicitation_approver: Callable[[str, int, str | None], bool] | None = None
     lang: str = "zh-CN"
+    session_id: str | None = None
+    agent_session_id: str | None = None
+    viewed_photo_count: int = 0
+    max_viewed_photos: int = 40
+    saved_sets: dict[str, list[str]] = field(default_factory=dict)
+    on_update_plan: Callable[[list[dict[str, Any]]], None] | None = None
+    budget_ask_approved: bool = False
+    session_budget_override_usd: float | None = None
+    bypass_monthly_budget: bool = False
 
     def review_url(self, session_id: str) -> str:
         base = self._resolve_base_url()
@@ -208,6 +244,10 @@ class ListPhotosInput(BaseModel):
     )
     limit: int = Field(default=30, ge=1, le=30, description="Page size (max 30 for compact handles).")
     cursor: str | None = Field(default=None, description="Opaque pagination cursor from previous response.")
+    save_as_set: bool = Field(
+        default=False,
+        description="When true on agent surface, save returned photo_ids under a compact server-side set_id.",
+    )
 
 
 class GetPhotoInput(BaseModel):
@@ -332,6 +372,62 @@ class ShootingDigestInput(BaseModel):
     )
 
 
+class ViewPhotosInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    photo_ids: list[str] = Field(
+        min_length=1,
+        max_length=6,
+        description="Up to 6 photo IDs to inspect visually (cumulative cap 40 per agent session).",
+    )
+    mode: Literal["face_crop", "sharpest_crop", "thumb"] = Field(
+        default="sharpest_crop",
+        description="EXIF-stripped crop or thumbnail mode to attach for visual inspection.",
+    )
+
+
+class TodoItemInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=40)
+    title: str = Field(min_length=1, max_length=160)
+    status: Literal["pending", "in_progress", "done", "skipped"] = "pending"
+
+
+class UpdatePlanInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    todos: list[TodoItemInput] = Field(
+        min_length=1,
+        max_length=20,
+        description="Ordered checklist of agent execution steps persisted to SQLite.",
+    )
+
+
+class GetMemoryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ProposeRuleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rule_text: str = Field(
+        min_length=4,
+        max_length=240,
+        description="Concise text preference rule proposed for human approval (never auto-activated).",
+    )
+    rationale: str | None = Field(
+        default=None,
+        max_length=280,
+        description="Short evidence summary explaining why this rule is proposed.",
+    )
+    evidence_ids: list[int] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Optional override IDs supporting this proposal.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool Handlers (all strictly routed through LightboxServices)
 # ---------------------------------------------------------------------------
@@ -344,10 +440,9 @@ def _serialize_summary(ctx: ToolContext, session_id: str) -> dict[str, Any]:
         if summary.low_res_preview_count > 0
         else "All scanned previews are full resolution (>= 2000px) or standard JPG/HEIC."
     )
-    return {
+    summary_dict: dict[str, Any] = {
         "session_id": summary.session.id,
-        "name": _truncate_untrusted(summary.session.name),
-        "root_path": summary.session.root_path,
+        "name": _format_meta(ctx, summary.session.name),
         "sensitivity": summary.session.sensitivity,
         "total_photos": summary.total_photos,
         "active_total_photos": summary.active_total_photos,
@@ -370,6 +465,10 @@ def _serialize_summary(ctx: ToolContext, session_id: str) -> dict[str, Any]:
         "quarantined_count": summary.quarantined_count,
         "review_url": ctx.review_url(summary.session.id),
     }
+    # Never expose raw absolute host paths into the built-in Agent LLM context (OutboundPrivacyHook)
+    if not ctx.surface.startswith("agent"):
+        summary_dict["root_path"] = summary.session.root_path
+    return summary_dict
 
 
 def _handle_scan_folder(ctx: ToolContext, args: ScanFolderInput) -> ToolExecutionResult:
@@ -508,8 +607,8 @@ def _handle_list_photos(ctx: ToolContext, args: ListPhotosInput) -> ToolExecutio
         items.append(
             {
                 "photo_id": it.photo_id,
-                "stem": _truncate_untrusted(it.stem),
-                "rel_dir": _truncate_untrusted(it.rel_dir),
+                "stem": _format_meta(ctx, it.stem),
+                "rel_dir": _format_meta(ctx, it.rel_dir),
                 "bucket": it.bucket,
                 "source": it.source,
                 "confidence": round(it.confidence, 4),
@@ -521,14 +620,18 @@ def _handle_list_photos(ctx: ToolContext, args: ListPhotosInput) -> ToolExecutio
                 "is_protected": it.is_protected,
             }
         )
-    return ToolExecutionResult.ok(
-        {
-            "session_id": args.session_id,
-            "items": items,
-            "next_cursor": next_cursor,
-            "review_url": ctx.review_url(args.session_id),
-        }
-    )
+    resp_data: dict[str, Any] = {
+        "session_id": args.session_id,
+        "items": items,
+        "next_cursor": next_cursor,
+        "review_url": ctx.review_url(args.session_id),
+    }
+    if args.save_as_set:
+        set_id = f"set_{len(ctx.saved_sets) + 1:02d}"
+        ctx.saved_sets[set_id] = [it["photo_id"] for it in items]
+        resp_data["set_id"] = set_id
+        resp_data["set_size"] = len(items)
+    return ToolExecutionResult.ok(resp_data)
 
 
 def _handle_get_photo(ctx: ToolContext, args: GetPhotoInput) -> ToolExecutionResult:
@@ -545,11 +648,11 @@ def _handle_get_photo(ctx: ToolContext, args: GetPhotoInput) -> ToolExecutionRes
     payload: dict[str, Any] = {
         "photo_id": detail.photo.id,
         "session_id": detail.photo.session_id,
-        "stem": _truncate_untrusted(detail.photo.stem),
-        "rel_dir": _truncate_untrusted(detail.photo.rel_dir),
+        "stem": _format_meta(ctx, detail.photo.stem),
+        "rel_dir": _format_meta(ctx, detail.photo.rel_dir),
         "cohort": detail.photo.cohort,
-        "camera_model": _truncate_untrusted(detail.photo.camera_model),
-        "lens_model": _truncate_untrusted(detail.photo.lens_model),
+        "camera_model": _format_meta(ctx, detail.photo.camera_model),
+        "lens_model": _format_meta(ctx, detail.photo.lens_model),
         "preview_w": detail.photo.preview_w,
         "preview_h": detail.photo.preview_h,
         "is_protected": detail.photo.is_protected,
@@ -557,7 +660,7 @@ def _handle_get_photo(ctx: ToolContext, args: GetPhotoInput) -> ToolExecutionRes
         "decision_version": detail.photo.decision_version,
         "burst_id": burst_id,
         "assets": [
-            {"rel_path": _truncate_untrusted(a.rel_path), "kind": a.kind, "size_bytes": a.size_bytes}
+            {"rel_path": _format_meta(ctx, a.rel_path), "kind": a.kind, "size_bytes": a.size_bytes}
             for a in detail.assets
         ],
         "exif_brief": ctx.services.review.format_exif_brief(detail.photo.id),
@@ -649,7 +752,7 @@ def _handle_compare_burst(ctx: ToolContext, args: CompareBurstInput) -> ToolExec
             {
                 "frame_no": idx,
                 "photo_id": m.photo_id,
-                "stem": _truncate_untrusted(pd.photo.stem),
+                "stem": _format_meta(ctx, pd.photo.stem),
                 "rank": m.rank,
                 "is_pick": m.is_pick,
                 "ai_note": m.ai_note,
@@ -817,6 +920,8 @@ def _handle_triage_uncertain(
         res = ctx.services.triage.run_triage_sync(
             args.session_id,
             max_photos=args.max_photos,
+            session_budget_usd=ctx.session_budget_override_usd,
+            bypass_monthly_budget=ctx.bypass_monthly_budget,
             on_progress=ctx.progress_callback,
         )
     except (ValueError, MissingAPIKeyError, ModelError) as exc:
@@ -925,6 +1030,14 @@ def _handle_create_plan(ctx: ToolContext, args: CreatePlanInput) -> ToolExecutio
     except (PlanError, SafeFSError, ValueError) as exc:
         return ToolExecutionResult.error(str(exc))
 
+    # Run two-layer Independent Verifier before returning plan (SPEC §7.5, PLAN T12)
+    from lightbox.agent.verifier import IndependentVerifier
+
+    draft = IndependentVerifier(ctx.services).verify_and_finalize_draft_sync(
+        args.session_id,
+        draft,
+    )
+
     if draft.plan is None:
         return ToolExecutionResult.ok(
             {
@@ -938,22 +1051,26 @@ def _handle_create_plan(ctx: ToolContext, args: CreatePlanInput) -> ToolExecutio
             }
         )
 
-    return ToolExecutionResult.ok(
-        {
-            "plan_id": draft.plan.id,
-            "plan_hash": draft.plan.plan_hash,
-            "status": draft.plan.status,
-            "count": draft.selected_count,
-            "tech_reject_count": draft.tech_reject_count,
-            "burst_non_pick_count": draft.burst_non_pick_count,
-            "manual_reject_count": draft.manual_reject_count,
-            "quarantine_dir": draft.plan.quarantine_dir,
-            "high_ratio_warning": draft.high_ratio_warning,
-            "verifier_report": draft.verifier_report,
-            "approve_url": ctx.approve_url(args.session_id, draft.plan.id),
-            "cli_approve_command": f"lightbox approve {draft.plan.id}",
-        }
-    )
+    plan_payload: dict[str, Any] = {
+        "plan_id": draft.plan.id,
+        "plan_hash": draft.plan.plan_hash,
+        "status": draft.plan.status,
+        "count": draft.selected_count,
+        "tech_reject_count": draft.tech_reject_count,
+        "burst_non_pick_count": draft.burst_non_pick_count,
+        "manual_reject_count": draft.manual_reject_count,
+        "high_ratio_warning": draft.high_ratio_warning,
+        "verifier_report": draft.verifier_report,
+        "approve_url": ctx.approve_url(args.session_id, draft.plan.id),
+        "cli_approve_command": f"lightbox approve {draft.plan.id}",
+    }
+    if ctx.surface.startswith("agent"):
+        plan_payload["quarantine_folder_name"] = (
+            Path(draft.plan.quarantine_dir).name if draft.plan.quarantine_dir else None
+        )
+    else:
+        plan_payload["quarantine_dir"] = draft.plan.quarantine_dir
+    return ToolExecutionResult.ok(plan_payload)
 
 
 def _handle_apply_plan(ctx: ToolContext, args: ApplyPlanInput) -> ToolExecutionResult:
@@ -1075,6 +1192,113 @@ def _handle_shooting_digest(
     return ToolExecutionResult.ok(report.to_dict())
 
 
+def _handle_view_photos(
+    ctx: ToolContext,
+    args: ViewPhotosInput,
+) -> ToolExecutionResult:
+    """Attach up to 6 EXIF-stripped crops/thumbnails (cumulative <= 40 per agent session)."""
+    requested = len(args.photo_ids)
+    if ctx.viewed_photo_count + requested > ctx.max_viewed_photos:
+        remaining = max(0, ctx.max_viewed_photos - ctx.viewed_photo_count)
+        return ToolExecutionResult.error(
+            f"Agent visual budget exceeded: requested {requested} photo(s), but only {remaining} "
+            f"of {ctx.max_viewed_photos} remaining in this session. Direct the user to Web UI review_url."
+        )
+
+    from lightbox.models import strip_metadata_and_encode
+
+    items: list[dict[str, Any]] = []
+    images: list[ToolImagePayload] = []
+    for pid in args.photo_ids:
+        try:
+            detail = ctx.services.review.get_photo_detail(pid)
+            raw_bytes = ctx.services.review.get_photo_mcp_image_bytes(pid, mode=args.mode)
+        except (ValueError, FileNotFoundError) as exc:
+            return ToolExecutionResult.error(f"Failed to load photo {pid}: {exc}")
+        clean_bytes, mime = strip_metadata_and_encode(raw_bytes, max_edge=512, fmt="JPEG", quality=84)
+        eff = detail.effective_verdict
+        items.append(
+            {
+                "photo_id": pid,
+                "stem": _format_meta(ctx, detail.photo.stem),
+                "bucket": eff.bucket if eff else "normal",
+                "confidence": round(eff.confidence, 4) if eff else 0.5,
+                "reason_codes": list(eff.reason_codes) if eff else [],
+                "mode": args.mode,
+            }
+        )
+        images.append(ToolImagePayload(data=clean_bytes, mime_type=mime, label=f"{pid}:{args.mode}"))
+
+    ctx.viewed_photo_count += len(items)
+    return ToolExecutionResult.ok(
+        {
+            "viewed": items,
+            "viewed_total": ctx.viewed_photo_count,
+            "viewed_limit": ctx.max_viewed_photos,
+        },
+        images=tuple(images),
+    )
+
+
+def _handle_update_plan(
+    ctx: ToolContext,
+    args: UpdatePlanInput,
+) -> ToolExecutionResult:
+    """Persist structured agent todos into SQLite `agent_sessions.plan_json` and emit SSE update."""
+    todos = [t.model_dump() for t in args.todos]
+    if ctx.agent_session_id:
+        ctx.services.repo.update_agent_session(ctx.agent_session_id, plan_todos=todos)
+    if ctx.on_update_plan is not None:
+        ctx.on_update_plan(todos)
+    return ToolExecutionResult.ok({"todos": todos, "count": len(todos)})
+
+
+def _handle_get_memory(
+    ctx: ToolContext,
+    args: GetMemoryInput,
+) -> ToolExecutionResult:
+    """Read active user preferences from `<APP_DATA_DIR>/preferences.md`."""
+    _ = args
+    pref_path = ctx.services.app_paths.preferences_file
+    if pref_path.is_file():
+        content = pref_path.read_text(encoding="utf-8").strip()
+    else:
+        content = ""
+    return ToolExecutionResult.ok(
+        {
+            "exists": bool(content),
+            "preferences": content[:3000],
+        }
+    )
+
+
+def _handle_propose_rule(
+    ctx: ToolContext,
+    args: ProposeRuleInput,
+) -> ToolExecutionResult:
+    """Propose a text preference rule into `memory_rules_meta` with `status='proposed'` (never auto-activates)."""
+    from lightbox.agent.memory import MemoryManager, serialize_memory_rule
+
+    try:
+        rec = MemoryManager(ctx.services).propose_manual_rule(
+            args.rule_text,
+            rationale=args.rationale,
+            evidence_ids=args.evidence_ids,
+        )
+    except ValueError as exc:
+        return ToolExecutionResult.error(str(exc))
+
+    return ToolExecutionResult.ok(
+        {
+            "rule": serialize_memory_rule(rec),
+            "note": (
+                "Rule recorded as status='proposed' only; it will NOT take effect until explicitly "
+                "accepted by the photographer in Insights -> Memory."
+            ),
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # ToolSpec & ToolRegistry
 # ---------------------------------------------------------------------------
@@ -1106,13 +1330,27 @@ PostExecuteHook = Callable[[ToolSpec, dict[str, Any], ToolExecutionResult, ToolC
 class ToolRegistry:
     """Single source of truth for tool schemas, risk tiers, argument validation, and execution."""
 
-    def __init__(self, specs: Collection[ToolSpec] | None = None) -> None:
+    def __init__(
+        self,
+        specs: Collection[ToolSpec] | None = None,
+        *,
+        attach_hooks: bool = True,
+    ) -> None:
         self._by_name: dict[str, ToolSpec] = {}
         self._by_mcp_name: dict[str, ToolSpec] = {}
         self._pre_hooks: list[PreExecuteHook] = []
         self._post_hooks: list[PostExecuteHook] = []
+        self._audit_hook_attached: bool = False
         for spec in sorted(specs or _build_default_specs(), key=lambda s: s.name):
             self.register(spec)
+        if attach_hooks:
+            from lightbox.agent.hooks import attach_default_hooks
+
+            attach_default_hooks(registry=self)
+
+    def mark_audit_hook_attached(self) -> None:
+        """Prevent duplicate audit writes when `AuditLogHook` handles `post_tool_use` logging."""
+        self._audit_hook_attached = True
 
     def register(self, spec: ToolSpec) -> None:
         if spec.name in self._by_name:
@@ -1216,6 +1454,11 @@ class ToolRegistry:
 
         tool_log_name = spec.mcp_name or spec.name
 
+        # Ensure OutboundPrivacyHook is attached on the active ModelRouter
+        from lightbox.agent.hooks import attach_default_hooks
+
+        attach_default_hooks(router=ctx.services.model_router)
+
         for pre_hook in self._pre_hooks:
             decision, reason = pre_hook(spec, arguments, ctx)
             if decision != "allow":
@@ -1228,7 +1471,13 @@ class ToolRegistry:
                     duration_ms=elapsed_ms,
                     summary=reason or f"Blocked by pre-hook ({decision})",
                 )
-                return ToolExecutionResult.error(reason or f"Blocked by hook ({decision}).")
+                upper_decision: Literal["ALLOW", "DENY", "ASK"] = (
+                    "ASK" if decision == "ask" else "DENY"
+                )
+                return ToolExecutionResult.error(
+                    reason or f"Blocked by hook ({decision}).",
+                    hook_decision=upper_decision,
+                )
 
         try:
             validated = spec.input_model.model_validate(arguments)
@@ -1262,24 +1511,25 @@ class ToolRegistry:
         for post_hook in self._post_hooks:
             post_hook(spec, arguments, result, ctx)
 
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        decision_str = "deny" if result.is_error else "allow"
-        summary_text = (
-            result.error_message
-            if result.is_error
-            else json.dumps(
-                {k: v for k, v in result.data.items() if k not in ("items", "frames", "matches")},
-                ensure_ascii=False,
-            )[:240]
-        )
-        ctx.services.system.record_audit_log(
-            surface=ctx.surface,
-            tool_name=tool_log_name,
-            hook_decision=decision_str,
-            args_redacted=redacted,
-            duration_ms=elapsed_ms,
-            summary=summary_text,
-        )
+        if not self._audit_hook_attached:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            decision_str = "deny" if result.is_error else "allow"
+            summary_text = (
+                result.error_message
+                if result.is_error
+                else json.dumps(
+                    {k: v for k, v in result.data.items() if k not in ("items", "frames", "matches")},
+                    ensure_ascii=False,
+                )[:240]
+            )
+            ctx.services.system.record_audit_log(
+                surface=ctx.surface,
+                tool_name=tool_log_name,
+                hook_decision=decision_str,
+                args_redacted=redacted,
+                duration_ms=elapsed_ms,
+                summary=summary_text,
+            )
         return result
 
 
@@ -1496,6 +1746,60 @@ def _build_default_specs() -> list[ToolSpec]:
             read_only_hint=True,
             destructive_hint=False,
             idempotent_hint=True,
+        ),
+        ToolSpec(
+            name="view_photos",
+            mcp_name=None,
+            description=(
+                "Visually inspect up to 6 EXIF-stripped photo crops or thumbnails in the main Agent context "
+                "(cumulative cap 40 photos per agent session)."
+            ),
+            risk_level="READ_COST",
+            agent_allowed=True,
+            input_model=ViewPhotosInput,
+            handler=_handle_view_photos,
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+        ),
+        ToolSpec(
+            name="update_plan",
+            mcp_name=None,
+            description="Persist and stream the Agent's explicit todo checklist for the current task.",
+            risk_level="ANNOTATE",
+            agent_allowed=True,
+            input_model=UpdatePlanInput,
+            handler=_handle_update_plan,
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+        ),
+        ToolSpec(
+            name="get_memory",
+            mcp_name=None,
+            description="Read active user aesthetic preferences from preferences.md.",
+            risk_level="READ",
+            agent_allowed=True,
+            input_model=GetMemoryInput,
+            handler=_handle_get_memory,
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+        ),
+        ToolSpec(
+            name="propose_rule",
+            mcp_name=None,
+            description=(
+                "Propose a new text culling preference rule for human approval (status='proposed'; "
+                "never activates until explicitly accepted into preferences.md)."
+            ),
+            risk_level="ANNOTATE",
+            agent_allowed=True,
+            input_model=ProposeRuleInput,
+            handler=_handle_propose_rule,
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=False,
         ),
     ]
 

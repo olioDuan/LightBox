@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
@@ -19,6 +20,15 @@ class ModelError(RuntimeError):
 
 class MissingAPIKeyError(ModelError):
     """Raised when a required cloud provider API key is not configured."""
+
+
+class ModelHookDeniedError(ModelError):
+    """Raised when a `pre_model_call` hook blocks an outbound model request."""
+
+    def __init__(self, reason: str, *, decision: Literal["DENY", "ASK"] = "DENY") -> None:
+        self.reason = reason
+        self.decision = decision
+        super().__init__(reason)
 
 
 class BudgetExceededError(ModelError):
@@ -96,6 +106,23 @@ class Message:
     images: tuple[ImageInput, ...] = ()
     tool_calls: tuple[ToolCall, ...] = ()
     tool_results: tuple[ToolResultBlock, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallRequest:
+    """Outbound model request payload inspected by `pre_model_call` hooks (SPEC §7.4)."""
+
+    role: str
+    spec: ModelSpec
+    messages: tuple[Message, ...]
+    session_id: str | None = None
+    session_root_paths: tuple[str, ...] = ()
+
+
+PreModelCallHook = Callable[
+    [ModelCallRequest],
+    tuple[Literal["ALLOW", "DENY", "ASK"], str | None],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +272,10 @@ __all__ = [
     "Message",
     "MissingAPIKeyError",
     "ModelCaps",
+    "ModelCallRequest",
     "ModelError",
+    "ModelHookDeniedError",
+    "PreModelCallHook",
     "ProviderName",
     "ToolCall",
     "ToolResultBlock",

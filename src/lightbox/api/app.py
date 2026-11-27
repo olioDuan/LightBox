@@ -24,6 +24,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from lightbox import __version__
+from lightbox.agent import (
+    AgentRunner,
+    AgentSessionBusyError,
+    IndependentVerifier,
+    MemoryManager,
+    attach_default_hooks,
+    serialize_memory_rule,
+)
 from lightbox.api.events import EventBus
 from lightbox.api.security import (
     LocalSecurityMiddleware,
@@ -107,6 +115,7 @@ class CreatePlanRequest(BaseModel):
     photo_ids: list[str] = Field(min_length=1)
     strategy: Literal["outside_library", "sibling", "subfolder", "custom"] | None = None
     custom_dir: str | None = None
+    skip_llm_verify: bool = False
 
 
 class DraftObviousRequest(BaseModel):
@@ -114,6 +123,7 @@ class DraftObviousRequest(BaseModel):
 
     strategy: Literal["outside_library", "sibling", "subfolder", "custom"] | None = None
     custom_dir: str | None = None
+    skip_llm_verify: bool = False
 
 
 class ApproveAndApplyRequest(BaseModel):
@@ -181,6 +191,47 @@ class PeopleExportRequest(BaseModel):
     lang: str = "zh-CN"
 
 
+class CreateAgentSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+    mode: Literal["chat", "supervisor"] = "chat"
+    message: str | None = None
+    constraints: list[str] = Field(default_factory=list)
+    profile: Literal["balanced", "best", "local"] | None = None
+    lang: str = "zh-CN"
+
+
+class SendAgentMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = ""
+    approve_ask: bool | None = None
+    constraints: list[str] = Field(default_factory=list)
+    profile: Literal["balanced", "best", "local"] | None = None
+    lang: str = "zh-CN"
+
+
+class SavePreferencesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str
+
+
+class ConsolidateMemoryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    force: bool = False
+    profile: Literal["balanced", "best", "local"] | None = None
+
+
+class MemoryRuleDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["accept", "reject"]
+    rule_text: str | None = Field(default=None, max_length=240)
+
+
 def _serialize_plan(
     plan: Any,
     items: list[Any] | tuple[Any, ...],
@@ -227,6 +278,7 @@ def _get_svcs(request: Request) -> Iterator[LightboxServices]:
     factory = getattr(request.app.state, "model_router_factory", None)
     if factory is not None:
         svcs.override_model_router(factory(svcs))
+    attach_default_hooks(router=svcs.model_router)
     embedder_factory = getattr(request.app.state, "embedder_factory", None)
     if embedder_factory is not None:
         svcs.override_embedder(embedder_factory(svcs))
@@ -1198,58 +1250,96 @@ def create_app(
         }
 
     @app.get("/api/plans/{plan_id}")
-    def get_plan(plan_id: str, svcs: SvcsDep) -> dict[str, Any]:
+    def get_plan(
+        plan_id: str,
+        svcs: SvcsDep,
+        lang: Annotated[str, Query()] = "zh-CN",
+    ) -> dict[str, Any]:
         try:
             plan, items = svcs.plan.get_plan(plan_id)
         except PlanError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
-        return _serialize_plan(plan, items)
+        photo_reasons = svcs.review.get_photo_reasons_map(plan.session_id)
+        return _serialize_plan(plan, items, photo_reasons=photo_reasons, lang=lang)
 
     @app.post("/api/sessions/{session_id}/plans")
-    def create_plan(session_id: str, body: CreatePlanRequest, svcs: SvcsDep) -> dict[str, Any]:
-        try:
+    async def create_plan(
+        session_id: str,
+        body: CreatePlanRequest,
+        svcs: SvcsDep,
+    ) -> dict[str, Any]:
+        custom_dir = Path(body.custom_dir) if body.custom_dir else None
+
+        def _draft_and_verify() -> Any:
             draft = svcs.plan.create_plan(
                 session_id,
                 body.photo_ids,
                 strategy=body.strategy,
-                custom_dir=Path(body.custom_dir) if body.custom_dir else None,
+                custom_dir=custom_dir,
             )
+            return IndependentVerifier(svcs).verify_and_finalize_draft_sync(
+                session_id,
+                draft,
+                skip_llm=body.skip_llm_verify,
+                strategy=body.strategy,
+                custom_dir=custom_dir,
+            )
+
+        try:
+            draft = await anyio.to_thread.run_sync(_draft_and_verify)
         except PlanError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
-        assert draft.plan is not None
-        event_bus.publish(
-            "plan.updated",
-            {"plan_id": draft.plan.id, "status": draft.plan.status},
-            session_id=session_id,
-        )
+        if draft.plan is not None:
+            event_bus.publish(
+                "plan.updated",
+                {"plan_id": draft.plan.id, "status": draft.plan.status},
+                session_id=session_id,
+            )
         return {
-            "plan": _serialize_plan(draft.plan, draft.items),
+            "plan": _serialize_plan(draft.plan, draft.items) if draft.plan else None,
+            "selected_count": draft.selected_count,
             "tech_reject_count": draft.tech_reject_count,
             "burst_non_pick_count": draft.burst_non_pick_count,
             "manual_reject_count": draft.manual_reject_count,
             "high_ratio_warning": draft.high_ratio_warning,
             "superseded_plan_ids": list(draft.superseded_plan_ids),
+            "verifier_report": draft.verifier_report,
         }
 
     @app.post("/api/sessions/{session_id}/plans/obvious-rejects")
-    def draft_obvious_rejects(
+    async def draft_obvious_rejects(
         session_id: str,
         svcs: SvcsDep,
         body: DraftObviousRequest | None = None,
         lang: Annotated[str, Query()] = "zh-CN",
     ) -> dict[str, Any]:
         req = body or DraftObviousRequest()
-        try:
+        custom_dir = Path(req.custom_dir) if req.custom_dir else None
+
+        def _draft_and_verify() -> tuple[Any, dict[str, tuple[str, tuple[str, ...]]] | None]:
             draft = svcs.plan.draft_obvious_rejects(
                 session_id,
                 strategy=req.strategy,
-                custom_dir=Path(req.custom_dir) if req.custom_dir else None,
+                custom_dir=custom_dir,
             )
+            verified = IndependentVerifier(svcs).verify_and_finalize_draft_sync(
+                session_id,
+                draft,
+                skip_llm=req.skip_llm_verify,
+                strategy=req.strategy,
+                custom_dir=custom_dir,
+            )
+            reasons = (
+                svcs.review.get_photo_reasons_map(session_id)
+                if verified.plan is not None
+                else None
+            )
+            return verified, reasons
+
+        try:
+            draft, photo_reasons = await anyio.to_thread.run_sync(_draft_and_verify)
         except PlanError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
-        photo_reasons = (
-            svcs.review.get_photo_reasons_map(session_id) if draft.plan is not None else None
-        )
         if draft.plan is not None:
             event_bus.publish(
                 "plan.updated",
@@ -1369,6 +1459,183 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"Folder does not exist: {folder}")
         opened = svcs.system.open_folder(folder)
         return {"opened": opened, "path": str(folder)}
+
+    # --- Single-Main Agent Sessions & Traces (PLAN T13, SPEC §7.1–7.3, §9.2) ---
+
+    @app.get("/api/agent/sessions")
+    def list_agent_sessions(
+        svcs: SvcsDep,
+        session_id: Annotated[str | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    ) -> dict[str, Any]:
+        rows = svcs.repo.list_agent_sessions(session_id=session_id, limit=limit)
+        return {
+            "items": [
+                {
+                    "agent_session_id": r.id,
+                    "session_id": r.session_id,
+                    "mode": r.mode,
+                    "status": r.status,
+                    "stage": str(r.stage_summary.get("stage", "explore")),
+                    "step": r.step,
+                    "spent_usd": round(r.spent_usd, 6),
+                    "latest_user_message": str(r.stage_summary.get("latest_user_message", "")),
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
+        }
+
+    @app.get("/api/agent/sessions/{agent_session_id}")
+    def get_agent_session(agent_session_id: str, svcs: SvcsDep) -> dict[str, Any]:
+        runner = AgentRunner(
+            svcs,
+            base_url_resolver=lambda: f"http://127.0.0.1:{port}",
+        )
+        try:
+            return runner.get_session(agent_session_id).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+
+    @app.post("/api/agent/sessions")
+    async def create_agent_session(
+        body: CreateAgentSessionRequest,
+        svcs: SvcsDep,
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            runner = AgentRunner(
+                svcs,
+                base_url_resolver=lambda: f"http://127.0.0.1:{port}",
+                lang=body.lang,
+            )
+            res = runner.start_session_sync(
+                body.session_id,
+                mode=body.mode,
+                message=body.message,
+                constraints=body.constraints,
+                profile=body.profile,
+                on_event=lambda _etype, payload: event_bus.publish(
+                    "agent.event",
+                    payload,
+                    session_id=body.session_id,
+                ),
+            )
+            return res.to_dict()
+
+        try:
+            return await anyio.to_thread.run_sync(_run)
+        except ValueError as exc:
+            msg = str(exc)
+            status = 404 if msg.startswith("Unknown session_id") else 400
+            raise HTTPException(status_code=status, detail=msg) from None
+
+    @app.post("/api/agent/sessions/{agent_session_id}/messages")
+    async def send_agent_message(
+        agent_session_id: str,
+        body: SendAgentMessageRequest,
+        svcs: SvcsDep,
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            runner = AgentRunner(
+                svcs,
+                base_url_resolver=lambda: f"http://127.0.0.1:{port}",
+                lang=body.lang,
+            )
+            existing = runner.get_session(agent_session_id)
+            res = runner.continue_session_sync(
+                agent_session_id,
+                body.message,
+                approve_ask=body.approve_ask,
+                constraints=body.constraints,
+                profile=body.profile,
+                on_event=lambda _etype, payload: event_bus.publish(
+                    "agent.event",
+                    payload,
+                    session_id=existing.session_id,
+                ),
+            )
+            return res.to_dict()
+
+        try:
+            return await anyio.to_thread.run_sync(_run)
+        except AgentSessionBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except ValueError as exc:
+            msg = str(exc)
+            status = 404 if msg.startswith("Unknown agent_session_id") else 400
+            raise HTTPException(status_code=status, detail=msg) from None
+
+    @app.get("/api/insights/traces")
+    def insights_traces(
+        svcs: SvcsDep,
+        session_id: Annotated[str | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> dict[str, Any]:
+        return svcs.system.get_llm_traces(session_id=session_id, limit=limit)
+
+    # --- Text-Rule Memory Loop (PLAN T14, SPEC §7.6, §9.2) ---
+
+    @app.get("/api/memory/preferences")
+    def get_memory_preferences(svcs: SvcsDep) -> dict[str, Any]:
+        return MemoryManager(svcs).get_state()
+
+    @app.put("/api/memory/preferences")
+    def put_memory_preferences(body: SavePreferencesRequest, svcs: SvcsDep) -> dict[str, Any]:
+        return MemoryManager(svcs).save_preferences(body.content)
+
+    @app.post("/api/memory/consolidate")
+    async def consolidate_memory(
+        svcs: SvcsDep,
+        body: ConsolidateMemoryRequest | None = None,
+    ) -> dict[str, Any]:
+        req = body or ConsolidateMemoryRequest()
+
+        def _run() -> dict[str, Any]:
+            mgr = MemoryManager(svcs)
+            res = mgr.consolidate_sync(force=req.force, profile=req.profile)
+            return {
+                "result": res.to_dict(),
+                "state": mgr.get_state(),
+            }
+
+        try:
+            out = await anyio.to_thread.run_sync(_run)
+        except MissingAPIKeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except ModelError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
+
+        if out["result"]["proposed_rules"]:
+            event_bus.publish(
+                "memory.proposed",
+                {
+                    "count": len(out["result"]["proposed_rules"]),
+                    "rule_ids": [r["rule_id"] for r in out["result"]["proposed_rules"]],
+                },
+            )
+        return out
+
+    @app.post("/api/memory/rules/{rule_id}/decision")
+    def decide_memory_rule(
+        rule_id: str,
+        body: MemoryRuleDecisionRequest,
+        svcs: SvcsDep,
+    ) -> dict[str, Any]:
+        mgr = MemoryManager(svcs)
+        try:
+            updated = mgr.decide_rule(
+                rule_id,
+                decision=body.decision,
+                rule_text=body.rule_text,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            status = 404 if msg.startswith("Unknown rule_id") else 400
+            raise HTTPException(status_code=status, detail=msg) from None
+        return {
+            "rule": serialize_memory_rule(updated),
+            "state": mgr.get_state(),
+        }
 
     # --- Shooting Digest / Insights (PLAN T17, SPEC §9.2 & §13(2)) ---
 

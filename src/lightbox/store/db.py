@@ -383,6 +383,14 @@ CREATE INDEX IF NOT EXISTS idx_face_assignments_cluster ON face_assignments(clus
 CREATE INDEX IF NOT EXISTS idx_face_assignments_status ON face_assignments(status);
 """
 
+MIGRATION_005_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("memory_rules_meta", "status", "TEXT NOT NULL DEFAULT 'proposed'"),
+    ("memory_rules_meta", "rule_text", "TEXT NOT NULL DEFAULT ''"),
+    ("memory_rules_meta", "rationale", "TEXT"),
+    ("memory_rules_meta", "created_at", "REAL"),
+    ("memory_rules_meta", "updated_at", "REAL"),
+)
+
 VEC_PHOTOS_DDL = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS vec_photos "
     "USING vec0(embedding float[768] distance_metric=cosine)"
@@ -393,6 +401,7 @@ MIGRATIONS: tuple[tuple[int, str, str | None], ...] = (
     (2, "002_t045_digest_and_face_fields", None),
     (3, "003_t10_llm_calls_budget_and_cache", None),
     (4, "004_t18_people_classification", MIGRATION_004_SQL),
+    (5, "005_t14_memory_rules_columns", None),
 )
 
 
@@ -464,6 +473,8 @@ class Database:
                     _apply_migration_002(cur)
                 elif version == 3:
                     _apply_migration_003(cur)
+                elif version == 5:
+                    _apply_migration_005(cur)
                 cur.execute(
                     "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, name, time.time()),
@@ -519,6 +530,11 @@ def _apply_migration_003(cur: sqlite3.Cursor) -> None:
     _apply_column_additions(cur, MIGRATION_003_COLUMNS)
     for idx_sql in MIGRATION_003_INDEXES:
         cur.execute(idx_sql)
+
+
+def _apply_migration_005(cur: sqlite3.Cursor) -> None:
+    """Idempotently add T14 status/text/timestamp columns on `memory_rules_meta`."""
+    _apply_column_additions(cur, MIGRATION_005_COLUMNS)
 
 
 def _apply_column_additions(

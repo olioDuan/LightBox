@@ -36,10 +36,11 @@ REASON_USER_UNSURE = "user_unsure"
 REASON_USER_RESET = "user_reset"
 REASON_USER_RESTORED = "user_restored"
 
-# --- VLM fallback reason codes ---
+# --- VLM / Verifier reason codes ---
 REASON_VLM_KEEP = "vlm_keep"
 REASON_VLM_REJECT = "vlm_reject"
 REASON_VLM_UNSURE = "vlm_unsure"
+REASON_VERIFIER_FLAGGED = "verifier_flagged"
 
 TECH_REJECT_REASON_CODES: frozenset[str] = frozenset(
     {
@@ -173,6 +174,10 @@ REASON_MESSAGES: dict[str, dict[str, str]] = {
         "zh-CN": "VLM 视觉复核仍存疑，保留供人工确认",
         "en-US": "VLM triage uncertain; kept for manual review",
     },
+    REASON_VERIFIER_FLAGGED: {
+        "zh-CN": "独立审核员认为可能可用，已自动退回存疑",
+        "en-US": "Flagged by independent verifier as potentially usable; returned to unsure",
+    },
 }
 
 
@@ -231,6 +236,7 @@ __all__ = [
     "REASON_USER_RESET",
     "REASON_USER_RESTORED",
     "REASON_USER_UNSURE",
+    "REASON_VERIFIER_FLAGGED",
     "REASON_VLM_KEEP",
     "REASON_VLM_REJECT",
     "REASON_VLM_UNSURE",

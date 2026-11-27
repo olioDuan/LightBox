@@ -74,6 +74,45 @@ export interface PlanItem {
   reason_labels?: string[];
 }
 
+export interface VerifierFlaggedPhoto {
+  photo_id: string;
+  stem: string;
+  reason: string;
+  action: string;
+}
+
+export interface VerifierLayer2Info {
+  status: "passed" | "flagged" | "skipped";
+  skipped_reason: string | null;
+  model_id: string | null;
+  provider: string | null;
+  family: string | null;
+  cross_family: boolean;
+  checked_count: number;
+  flagged_count: number;
+  summary: string;
+  llm_call_id: string | null;
+  cost_usd: number;
+  cache_hit: boolean;
+}
+
+export interface VerifierReport {
+  layer?: "deterministic" | "two_layer" | string;
+  passed?: boolean;
+  exempt_count?: number;
+  unconfirmed_burst_non_pick_count?: number;
+  incomplete_atomic_pair_count?: number;
+  selected_count?: number;
+  initial_selected_count?: number;
+  total_session_photos?: number;
+  reject_ratio?: number;
+  high_ratio_warning?: boolean;
+  warnings?: string[];
+  layer2?: VerifierLayer2Info;
+  flagged_photos?: VerifierFlaggedPhoto[];
+  [key: string]: unknown;
+}
+
 export interface PlanDetail {
   id: string;
   session_id: string;
@@ -84,7 +123,7 @@ export interface PlanDetail {
   quarantine_dir: string | null;
   approved_by: string | null;
   approved_at: number | null;
-  verifier_report: Record<string, unknown> | null;
+  verifier_report: VerifierReport | null;
   item_count: number;
   items: PlanItem[];
 }
@@ -100,7 +139,7 @@ export interface DraftObviousResponse {
   excluded_unconfirmed_burst: number;
   excluded_in_applying_plan: number;
   superseded_plan_ids: string[];
-  verifier_report: Record<string, unknown>;
+  verifier_report: VerifierReport;
 }
 
 export interface ScanResponse {
@@ -410,6 +449,142 @@ export interface ShootingDigestResponse {
   stable_setups: DigestStableSetup[];
 }
 
+export interface AgentTodoItem {
+  id: string;
+  title: string;
+  status: "pending" | "in_progress" | "done" | "skipped" | string;
+}
+
+export interface AgentEventItem {
+  seq: number;
+  event_type: string;
+  payload: Record<string, unknown>;
+  created_at: number;
+}
+
+export interface AgentSessionSummaryItem {
+  agent_session_id: string;
+  session_id: string;
+  mode: "chat" | "supervisor" | string;
+  status: "running" | "awaiting_user" | "completed" | "failed" | string;
+  stage: "explore" | "review" | "propose" | string;
+  step: number;
+  spent_usd: number;
+  latest_user_message: string;
+  created_at: number;
+}
+
+export interface AgentLatestPlan {
+  plan_id: string;
+  plan_hash: string;
+  count: number;
+  status: string;
+  approve_url: string;
+}
+
+export interface AgentPendingAsk {
+  tool_call: { id: string; name: string; arguments: Record<string, unknown> };
+  reason: string;
+  scope?: "session" | "monthly" | string;
+  suggested_budget_usd?: number;
+  needs_monthly_bypass?: boolean;
+  completed_results?: Array<Record<string, unknown>>;
+  remaining_calls?: Array<Record<string, unknown>>;
+}
+
+export interface AgentSessionDetail {
+  agent_session_id: string;
+  session_id: string;
+  mode: "chat" | "supervisor" | string;
+  status: "running" | "awaiting_user" | "completed" | "failed" | string;
+  stage: "explore" | "review" | "propose" | string;
+  step: number;
+  answer: string;
+  todos: AgentTodoItem[];
+  constraints: string[];
+  spent_usd: number;
+  viewed_photos: number;
+  context_tokens_est: number;
+  stage_rebuilds: number;
+  pending_ask: AgentPendingAsk | null;
+  latest_plan: AgentLatestPlan | null;
+  verifier_report: VerifierReport | null;
+  error: string | null;
+  events: AgentEventItem[];
+}
+
+export interface LlmTraceItem {
+  id: string;
+  role: string;
+  provider: string;
+  model: string;
+  in_tokens: number;
+  out_tokens: number;
+  cached_tokens: number;
+  cost_usd: number;
+  latency_ms: number;
+  cache_hit: boolean;
+  session_id: string | null;
+  created_at: number;
+}
+
+export interface LlmTracesResponse {
+  session_id: string | null;
+  monthly_spent_usd: number;
+  monthly_budget_usd: number;
+  session_spent_usd: number | null;
+  session_budget_usd: number;
+  model_profile: string;
+  total_calls: number;
+  cache_hits: number;
+  cache_hit_rate: number;
+  total_in_tokens: number;
+  total_out_tokens: number;
+  total_cached_tokens: number;
+  total_cost_usd: number;
+  items: LlmTraceItem[];
+}
+
+export interface MemoryRuleItem {
+  rule_id: string;
+  status: "proposed" | "accepted" | "rejected" | string;
+  rule_text: string;
+  rationale: string | null;
+  evidence_ids: number[];
+  condition_dsl_json: string | null;
+  hits: number;
+  conflicts: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface MemoryStateResponse {
+  preferences_md: string;
+  preferences_exists: boolean;
+  rules: MemoryRuleItem[];
+  proposed_count: number;
+  accepted_count: number;
+  rejected_count: number;
+  new_override_count: number;
+  total_override_count: number;
+  min_overrides_threshold: number;
+  ready_to_consolidate: boolean;
+  last_consolidated_at: number | null;
+}
+
+export interface ConsolidateMemoryResponse {
+  result: {
+    status: string;
+    new_override_count: number;
+    analyzed_override_count: number;
+    proposed_rules: MemoryRuleItem[];
+    llm_call_id: string | null;
+    cost_usd: number;
+    model_id: string | null;
+  };
+  state: MemoryStateResponse;
+}
+
 let csrfToken: string | null = null;
 
 export function setCsrfToken(token: string | null): void {
@@ -610,14 +785,16 @@ export const api = {
     sessionId: string,
     photoIds: string[],
     strategy?: "outside_library" | "sibling" | "subfolder",
+    skipLlmVerify = false,
   ) =>
-    apiFetch<{ plan: PlanDetail }>(
+    apiFetch<{ plan: PlanDetail; verifier_report?: VerifierReport }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/plans`,
       {
         method: "POST",
         body: JSON.stringify({
           photo_ids: photoIds,
           ...(strategy ? { strategy } : {}),
+          ...(skipLlmVerify ? { skip_llm_verify: true } : {}),
         }),
       },
     ),
@@ -797,4 +974,80 @@ export const api = {
     if (opts.minSamples !== undefined) params.set("min_samples", String(opts.minSamples));
     return apiFetch<ShootingDigestResponse>(`/api/insights/digest?${params.toString()}`);
   },
+
+  getPlan: (planId: string, lang: Lang = "zh-CN") =>
+    apiFetch<PlanDetail>(
+      `/api/plans/${encodeURIComponent(planId)}?lang=${encodeURIComponent(lang)}`,
+    ),
+
+  listAgentSessions: (sessionId?: string) => {
+    const qs = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+    return apiFetch<{ items: AgentSessionSummaryItem[] }>(`/api/agent/sessions${qs}`);
+  },
+
+  getAgentSession: (agentSessionId: string) =>
+    apiFetch<AgentSessionDetail>(`/api/agent/sessions/${encodeURIComponent(agentSessionId)}`),
+
+  createAgentSession: (payload: {
+    session_id: string;
+    mode?: "chat" | "supervisor";
+    message?: string;
+    constraints?: string[];
+    lang: Lang;
+  }) =>
+    apiFetch<AgentSessionDetail>("/api/agent/sessions", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  sendAgentMessage: (
+    agentSessionId: string,
+    payload: {
+      message: string;
+      approve_ask?: boolean;
+      constraints?: string[];
+      lang: Lang;
+    },
+  ) =>
+    apiFetch<AgentSessionDetail>(
+      `/api/agent/sessions/${encodeURIComponent(agentSessionId)}/messages`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
+
+  getLlmTraces: (opts?: { sessionId?: string; limit?: number }) => {
+    const params = new URLSearchParams();
+    if (opts?.sessionId) params.set("session_id", opts.sessionId);
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    return apiFetch<LlmTracesResponse>(`/api/insights/traces${qs ? `?${qs}` : ""}`);
+  },
+
+  getMemoryPreferences: () => apiFetch<MemoryStateResponse>("/api/memory/preferences"),
+
+  saveMemoryPreferences: (content: string) =>
+    apiFetch<MemoryStateResponse>("/api/memory/preferences", {
+      method: "PUT",
+      body: JSON.stringify({ content }),
+    }),
+
+  consolidateMemory: (force = false) =>
+    apiFetch<ConsolidateMemoryResponse>("/api/memory/consolidate", {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    }),
+
+  decideMemoryRule: (
+    ruleId: string,
+    payload: { decision: "accept" | "reject"; rule_text?: string },
+  ) =>
+    apiFetch<{ rule: MemoryRuleItem; state: MemoryStateResponse }>(
+      `/api/memory/rules/${encodeURIComponent(ruleId)}/decision`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
 };

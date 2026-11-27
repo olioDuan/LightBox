@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from lightbox.store.db import Database, configure_connection
 from lightbox.store.repos import (
+    AgentEventRecord,
+    AgentSessionRecord,
     AssetRecord,
     BurstMemberRecord,
     BurstRecord,
@@ -18,6 +20,7 @@ from lightbox.store.repos import (
     JobRecord,
     LightboxRepository,
     LLMCallRecord,
+    MemoryRuleRecord,
     MetricsRecord,
     OverrideRecord,
     PersonRecord,
@@ -38,6 +41,8 @@ from lightbox.store.vector_index import (
 )
 
 __all__ = [
+    "AgentEventRecord",
+    "AgentSessionRecord",
     "AssetRecord",
     "BurstMemberRecord",
     "BurstRecord",
@@ -54,6 +59,7 @@ __all__ = [
     "JobRecord",
     "LLMCallRecord",
     "LightboxRepository",
+    "MemoryRuleRecord",
     "MetricsRecord",
     "NumpyVectorIndex",
     "OverrideRecord",

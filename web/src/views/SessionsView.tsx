@@ -216,6 +216,7 @@ export function SessionsView({ onOpenReview }: SessionsViewProps) {
   const [error, setError] = useState<string | null>(null);
   const [liveProgress, setLiveProgress] = useState<LiveProgress | null>(null);
   const [activeDraft, setActiveDraft] = useState<DraftObviousResponse | null>(null);
+  const [verifyingPlan, setVerifyingPlan] = useState(false);
 
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -318,11 +319,19 @@ export function SessionsView({ onOpenReview }: SessionsViewProps) {
   async function handleQuickQuarantine(sessionId: string) {
     setError(null);
     setNotice(null);
+    setActiveDraft(null);
+    setVerifyingPlan(true);
     try {
       const draft = await api.draftObviousRejects(sessionId, "subfolder", lang);
       setActiveDraft(draft);
+      if ((draft.verifier_report?.flagged_photos?.length ?? 0) > 0) {
+        void queryClient.invalidateQueries({ queryKey: ["session-summary", sessionId] });
+        void queryClient.invalidateQueries({ queryKey: ["session-photos", sessionId] });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setVerifyingPlan(false);
     }
   }
 
@@ -524,10 +533,14 @@ export function SessionsView({ onOpenReview }: SessionsViewProps) {
         )}
       </div>
 
-      {activeDraft && (
+      {(verifyingPlan || activeDraft) && (
         <QuarantineModal
           draft={activeDraft}
-          onClose={() => setActiveDraft(null)}
+          verifying={verifyingPlan}
+          onClose={() => {
+            setVerifyingPlan(false);
+            setActiveDraft(null);
+          }}
           onApplied={(moved, planId) => {
             setActiveDraft(null);
             setLastAppliedPlanId(planId);

@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from lightbox.config import AppConfig, ModelsConfig, ModelSpec, load_models_config
 from lightbox.logging import get_logger
 from lightbox.models.anthropic_adapter import AnthropicChatModel
-from lightbox.models.images import strip_metadata_and_encode
+from lightbox.models.images import check_outbound_privacy, strip_metadata_and_encode
 from lightbox.models.openai_compat import OpenAICompatChatModel
 from lightbox.models.secrets import resolve_api_key
 from lightbox.models.types import (
@@ -28,7 +28,10 @@ from lightbox.models.types import (
     GenerationResult,
     ImageInput,
     Message,
+    ModelCallRequest,
     ModelError,
+    ModelHookDeniedError,
+    PreModelCallHook,
     ToolSchema,
     Usage,
     compute_cost_usd,
@@ -82,6 +85,29 @@ class ModelRouter:
         self._injected_adapters = dict(adapters or {})
         self._cached_adapters: dict[tuple[str, str], ChatModel] = {}
         self._loop_semaphores: dict[int, asyncio.Semaphore] = {}
+        self._pre_model_call_hooks: list[PreModelCallHook] = []
+        self._pre_model_call_hook_names: set[str] = set()
+        # Mount outbound privacy guard unconditionally on every ModelRouter instance (SPEC §7.4)
+        self.add_pre_model_call_hook(check_outbound_privacy, name="OutboundPrivacyHook")
+
+    def add_pre_model_call_hook(
+        self,
+        hook: PreModelCallHook,
+        *,
+        name: str | None = None,
+    ) -> None:
+        """Register an outbound `pre_model_call` hook (deduplicated by `name` or identity)."""
+        if name is not None:
+            if name in self._pre_model_call_hook_names:
+                return
+            self._pre_model_call_hook_names.add(name)
+        elif hook in self._pre_model_call_hooks:
+            return
+        self._pre_model_call_hooks.append(hook)
+
+    def has_injected_adapter(self, key: str) -> bool:
+        """Return True if a test/custom adapter was injected under `key` (role or model alias)."""
+        return key in self._injected_adapters
 
     def _get_semaphore(self) -> asyncio.Semaphore:
         loop = asyncio.get_running_loop()
@@ -92,8 +118,20 @@ class ModelRouter:
             self._loop_semaphores[key] = sem
         return sem
 
-    def resolve_spec(self, role: str, *, profile: str | None = None) -> tuple[str, ModelSpec]:
+    def resolve_spec(
+        self,
+        role: str,
+        *,
+        profile: str | None = None,
+        model_alias: str | None = None,
+    ) -> tuple[str, ModelSpec]:
         """Resolve `(model_alias, ModelSpec)` for a functional role and profile."""
+        if model_alias is not None:
+            spec = self.models_config.models.get(model_alias)
+            if spec is None:
+                raise ModelError(f"Model alias {model_alias!r} missing from models.toml.")
+            return model_alias, spec
+
         prof_name = profile or self.config.model_profile
         prof = self.models_config.profiles.get(prof_name)
         if prof is None:
@@ -109,14 +147,22 @@ class ModelRouter:
             raise ModelError(f"Model alias {alias!r} (role={role!r}) missing from models.toml.")
         return alias, spec
 
-    def get_model(self, role: str, *, profile: str | None = None) -> ChatModel:
-        """Instantiate or retrieve a `ChatModel` adapter for `role`."""
-        if role in self._injected_adapters:
+    def get_model(
+        self,
+        role: str,
+        *,
+        profile: str | None = None,
+        model_alias: str | None = None,
+    ) -> ChatModel:
+        """Instantiate or retrieve a `ChatModel` adapter for `role` or explicit `model_alias`."""
+        if model_alias is None and role in self._injected_adapters:
             return self._injected_adapters[role]
 
-        alias, spec = self.resolve_spec(role, profile=profile)
+        alias, spec = self.resolve_spec(role, profile=profile, model_alias=model_alias)
         if alias in self._injected_adapters:
             return self._injected_adapters[alias]
+        if role in self._injected_adapters:
+            return self._injected_adapters[role]
 
         prof_name = profile or self.config.model_profile
         cache_id = (prof_name, alias)
@@ -257,12 +303,33 @@ class ModelRouter:
         max_tokens: int = 2048,
         effort: str | None = None,
         profile: str | None = None,
+        model_alias: str | None = None,
         session_id: str | None = None,
         session_budget_usd: float | None = None,
+        bypass_monthly_budget: bool = False,
     ) -> GenerationResult:
-        """Route a request with EXIF stripping, content cache, budget checks, and concurrency cap."""
-        alias, spec = self.resolve_spec(role, profile=profile)
+        """Route a request with EXIF stripping, pre_model_call hooks, content cache, budget checks, and concurrency cap."""
+        alias, spec = self.resolve_spec(role, profile=profile, model_alias=model_alias)
         sanitized_messages = self._sanitize_messages(messages, max_pixels=spec.max_pixels)
+
+        # 0. Code-level `pre_model_call` privacy/security hooks (SPEC §7.4)
+        if self._pre_model_call_hooks:
+            session_roots = tuple(s.root_path for s in self.repo.list_sessions())
+            hook_req = ModelCallRequest(
+                role=role,
+                spec=spec,
+                messages=tuple(sanitized_messages),
+                session_id=session_id,
+                session_root_paths=session_roots,
+            )
+            for hook in self._pre_model_call_hooks:
+                decision, reason = hook(hook_req)
+                if decision != "ALLOW":
+                    raise ModelHookDeniedError(
+                        reason or f"Blocked by pre_model_call hook ({decision}).",
+                        decision=decision,
+                    )
+
         cache_key = self.compute_cache_key(
             spec=spec,
             messages=sanitized_messages,
@@ -318,7 +385,7 @@ class ModelRouter:
             )
 
         # 2. Ensure adapter/API key exists before checking/reserving budget
-        model = self.get_model(role, profile=profile)
+        model = self.get_model(role, profile=profile, model_alias=model_alias)
         semaphore = self._get_semaphore()
         est_cost = self.estimate_call_cost(spec, sanitized_messages, max_tokens=max_tokens)
         is_paid_model = (
@@ -354,20 +421,21 @@ class ModelRouter:
                                 budget_usd=session_limit,
                             )
 
-                    monthly_spent = self.repo.sum_llm_cost(since_ts=_month_start_ts())
-                    db_in_flight = _IN_FLIGHT_BY_DB.get(db_key, 0.0)
-                    projected_monthly = monthly_spent + db_in_flight + est_cost
-                    if (
-                        monthly_spent + db_in_flight >= monthly_limit
-                        or projected_monthly > monthly_limit
-                    ):
-                        raise BudgetExceededError(
-                            "monthly",
-                            spent_usd=monthly_spent,
-                            budget_usd=monthly_limit,
-                        )
+                    if not bypass_monthly_budget:
+                        monthly_spent = self.repo.sum_llm_cost(since_ts=_month_start_ts())
+                        db_in_flight = _IN_FLIGHT_BY_DB.get(db_key, 0.0)
+                        projected_monthly = monthly_spent + db_in_flight + est_cost
+                        if (
+                            monthly_spent + db_in_flight >= monthly_limit
+                            or projected_monthly > monthly_limit
+                        ):
+                            raise BudgetExceededError(
+                                "monthly",
+                                spent_usd=monthly_spent,
+                                budget_usd=monthly_limit,
+                            )
                     reserved = est_cost
-                    _IN_FLIGHT_BY_DB[db_key] = db_in_flight + reserved
+                    _IN_FLIGHT_BY_DB[db_key] = _IN_FLIGHT_BY_DB.get(db_key, 0.0) + reserved
                     if session_id is not None:
                         _IN_FLIGHT_BY_SESSION[(db_key, session_id)] = (
                             _IN_FLIGHT_BY_SESSION.get((db_key, session_id), 0.0) + reserved

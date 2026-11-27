@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, photoImageUrl, type DigestDimension, type PlanDetail } from "../api";
 import { useI18n } from "../i18n";
 
 interface InsightsViewProps {
-  activeTab: "digest" | "trash";
-  onChangeTab: (tab: "digest" | "trash") => void;
+  activeTab: "digest" | "trash" | "traces" | "memory";
+  onChangeTab: (tab: "digest" | "trash" | "traces" | "memory") => void;
 }
 
 function fmtPct(rate: number): string {
@@ -33,6 +33,14 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Memory state (T14)
+  const [prefsDraft, setPrefsDraft] = useState("");
+  const [prefsDirty, setPrefsDirty] = useState(false);
+  const [ruleEdits, setRuleEdits] = useState<Record<string, string>>({});
+  const [memoryBusy, setMemoryBusy] = useState<string | null>(null);
+  const [memoryNotice, setMemoryNotice] = useState<string | null>(null);
+  const [memoryError, setMemoryError] = useState<string | null>(null);
+
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
     queryFn: () => api.listSessions(),
@@ -55,6 +63,90 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
     queryKey: ["plans"],
     queryFn: () => api.listPlans(),
   });
+
+  const tracesQ = useQuery({
+    queryKey: ["llm-traces", sessionId],
+    queryFn: () => api.getLlmTraces({ sessionId: sessionId || undefined, limit: 150 }),
+    enabled: activeTab === "traces",
+  });
+
+  const memoryQ = useQuery({
+    queryKey: ["memory-preferences"],
+    queryFn: () => api.getMemoryPreferences(),
+  });
+
+  useEffect(() => {
+    if (memoryQ.data && !prefsDirty) {
+      setPrefsDraft(memoryQ.data.preferences_md);
+    }
+  }, [memoryQ.data, prefsDirty]);
+
+  async function handleSavePreferences() {
+    setMemoryBusy("save");
+    setMemoryError(null);
+    setMemoryNotice(null);
+    try {
+      const updated = await api.saveMemoryPreferences(prefsDraft);
+      setPrefsDraft(updated.preferences_md);
+      setPrefsDirty(false);
+      setMemoryNotice(t.memorySavedToast);
+      void queryClient.invalidateQueries({ queryKey: ["memory-preferences"] });
+    } catch (err) {
+      setMemoryError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMemoryBusy(null);
+    }
+  }
+
+  async function handleConsolidate(force: boolean) {
+    setMemoryBusy("consolidate");
+    setMemoryError(null);
+    setMemoryNotice(null);
+    try {
+      const res = await api.consolidateMemory(force);
+      void queryClient.invalidateQueries({ queryKey: ["memory-preferences"] });
+      void queryClient.invalidateQueries({ queryKey: ["llm-traces"] });
+      if (res.result.status === "proposed") {
+        setMemoryNotice(t.memoryConsolidateProposed(res.result.proposed_rules.length));
+      } else if (res.result.status === "skipped_insufficient_overrides") {
+        setMemoryNotice(
+          t.memoryConsolidateSkipped(
+            res.result.new_override_count,
+            res.state.min_overrides_threshold,
+          ),
+        );
+      } else {
+        setMemoryNotice(t.memoryConsolidateNoNew);
+      }
+    } catch (err) {
+      setMemoryError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMemoryBusy(null);
+    }
+  }
+
+  async function handleDecideRule(ruleId: string, decision: "accept" | "reject", fallbackText: string) {
+    setMemoryBusy(`rule:${ruleId}`);
+    setMemoryError(null);
+    setMemoryNotice(null);
+    try {
+      const editedText = ruleEdits[ruleId] ?? fallbackText;
+      const res = await api.decideMemoryRule(ruleId, {
+        decision,
+        ...(decision === "accept" ? { rule_text: editedText } : {}),
+      });
+      setPrefsDraft(res.state.preferences_md);
+      setPrefsDirty(false);
+      setMemoryNotice(
+        decision === "accept" ? t.memoryRuleAcceptedToast : t.memoryRuleRejectedToast,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["memory-preferences"] });
+    } catch (err) {
+      setMemoryError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMemoryBusy(null);
+    }
+  }
 
   const plans = (plansQ.data?.items ?? []).filter(
     (p) => p.status === "applied" || p.status === "reverted" || p.status === "applying",
@@ -143,6 +235,35 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
             {activeTrashBatches > 0 && (
               <span className="rounded bg-[#DC4C46]/25 px-1.5 py-0.5 text-[11px] text-[#FCA5A5] tabular-nums">
                 {activeTrashBatches}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => onChangeTab("traces")}
+            className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition ${
+              activeTab === "traces"
+                ? "bg-[#33363B] text-[#F3F4F6]"
+                : "text-[#9CA3AF] hover:text-[#F3F4F6]"
+            }`}
+          >
+            {t.insightsTabTraces}
+          </button>
+          <button
+            type="button"
+            onClick={() => onChangeTab("memory")}
+            className={`flex items-center gap-2 rounded-md px-3.5 py-1.5 text-sm font-medium transition ${
+              activeTab === "memory"
+                ? "bg-[#33363B] text-[#F3F4F6]"
+                : "text-[#9CA3AF] hover:text-[#F3F4F6]"
+            }`}
+          >
+            <span>{t.insightsTabMemory}</span>
+            {((memoryQ.data?.proposed_count ?? 0) > 0 || memoryQ.data?.ready_to_consolidate) && (
+              <span className="rounded bg-[#D99B26]/25 px-1.5 py-0.5 text-[11px] text-[#FCD34D] tabular-nums">
+                {(memoryQ.data?.proposed_count ?? 0) > 0
+                  ? memoryQ.data?.proposed_count
+                  : `${memoryQ.data?.new_override_count ?? 0}+`}
               </span>
             )}
           </button>
@@ -669,6 +790,382 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
             </>
           )}
         </div>
+      ) : activeTab === "memory" ? (
+        <div className="mt-6 space-y-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <div className="space-y-1">
+              <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">
+                {t.memoryTitle}
+              </h1>
+              <p className="text-sm text-[#9CA3AF]">{t.memorySubtitle}</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={memoryBusy !== null}
+                onClick={() => void handleConsolidate(false)}
+                className={`rounded-md px-3.5 py-2 text-xs font-medium transition disabled:opacity-50 ${
+                  memoryQ.data?.ready_to_consolidate
+                    ? "bg-[#D99B26] text-[#1B1C1E] hover:bg-[#E5A935]"
+                    : "border border-[#5B8DEF]/50 bg-[#5B8DEF]/15 text-[#93C5FD] hover:bg-[#5B8DEF]/25"
+                }`}
+              >
+                {memoryBusy === "consolidate" ? t.memoryConsolidating : t.memoryConsolidateBtn}
+              </button>
+              {memoryQ.data &&
+                !memoryQ.data.ready_to_consolidate &&
+                memoryQ.data.total_override_count > 0 && (
+                  <button
+                    type="button"
+                    disabled={memoryBusy !== null}
+                    onClick={() => void handleConsolidate(true)}
+                    className="rounded-md border border-[#33363B] bg-[#242629] px-3 py-2 text-xs text-[#D1D5DB] hover:bg-[#2C2F34] disabled:opacity-50"
+                  >
+                    {t.memoryConsolidateForceBtn}
+                  </button>
+                )}
+            </div>
+          </div>
+
+          {/* Scope & Override Counter Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#33363B] bg-[#242629] px-4 py-3 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded bg-[#3D9A6B]/15 px-2 py-0.5 text-[11px] text-[#86EFAC]">
+                {t.memoryScopeInjected}
+              </span>
+              <span className="rounded bg-[#1B1C1E] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
+                {t.memoryScopeZeroLlm}
+              </span>
+            </div>
+            {memoryQ.data && (
+              <span
+                className={`font-mono text-[11px] tabular-nums ${
+                  memoryQ.data.ready_to_consolidate ? "text-[#FCD34D]" : "text-[#9CA3AF]"
+                }`}
+              >
+                {t.memoryNewOverridesRatio(
+                  memoryQ.data.new_override_count,
+                  memoryQ.data.min_overrides_threshold,
+                )}
+              </span>
+            )}
+          </div>
+
+          {memoryQ.data?.ready_to_consolidate && (
+            <div className="rounded-md border border-[#D99B26]/50 bg-[#D99B26]/10 px-4 py-2.5 text-xs text-[#FCD34D]">
+              {t.memoryReadyHint(memoryQ.data.new_override_count)}
+            </div>
+          )}
+
+          {memoryNotice && (
+            <div className="rounded-md border border-[#3D9A6B]/50 bg-[#3D9A6B]/10 px-4 py-2.5 text-sm text-[#A7F3D0]">
+              {memoryNotice}
+            </div>
+          )}
+
+          {memoryError && (
+            <div className="rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-2.5 text-sm text-[#FCA5A5]">
+              {t.errorPrefix}
+              {memoryError}
+            </div>
+          )}
+
+          {/* Proposed Rules Approval Cards */}
+          {(() => {
+            const allRules = memoryQ.data?.rules ?? [];
+            const proposed = allRules.filter((r) => r.status === "proposed");
+            const decided = allRules.filter((r) => r.status !== "proposed");
+            return (
+              <>
+                <div className="space-y-3 rounded-lg border border-[#33363B] bg-[#242629] p-5">
+                  <h2 className="text-sm font-medium text-[#F3F4F6]">
+                    {t.memoryProposedTitle(proposed.length)}
+                  </h2>
+                  {proposed.length === 0 ? (
+                    <p className="text-xs text-[#9CA3AF]">{t.memoryProposedEmpty}</p>
+                  ) : (
+                    <div className="space-y-3">
+                      {proposed.map((rule) => {
+                        const edited = ruleEdits[rule.rule_id] ?? rule.rule_text;
+                        const isBusy = memoryBusy === `rule:${rule.rule_id}`;
+                        return (
+                          <div
+                            key={rule.rule_id}
+                            className="space-y-2.5 rounded-md border border-[#D99B26]/35 bg-[#1B1C1E] p-3.5"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                              <div className="flex items-center gap-2">
+                                <span className="rounded bg-[#D99B26]/20 px-1.5 py-0.5 font-mono text-[#FCD34D]">
+                                  {rule.rule_id}
+                                </span>
+                                <span className="text-[#9CA3AF] tabular-nums">
+                                  {t.memoryEvidenceCount(rule.evidence_ids.length)}
+                                </span>
+                              </div>
+                            </div>
+                            <input
+                              type="text"
+                              value={edited}
+                              onChange={(e) =>
+                                setRuleEdits((prev) => ({
+                                  ...prev,
+                                  [rule.rule_id]: e.target.value,
+                                }))
+                              }
+                              className="w-full rounded border border-[#33363B] bg-[#242629] px-3 py-2 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+                            />
+                            {rule.rationale && (
+                              <p className="text-[11px] text-[#9CA3AF]">{rule.rationale}</p>
+                            )}
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                onClick={() =>
+                                  void handleDecideRule(rule.rule_id, "reject", rule.rule_text)
+                                }
+                                className="rounded border border-[#33363B] px-3 py-1.5 text-xs text-[#D1D5DB] hover:bg-[#2C2F34] disabled:opacity-50"
+                              >
+                                {t.memoryRejectBtn}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={isBusy || !edited.trim()}
+                                onClick={() =>
+                                  void handleDecideRule(rule.rule_id, "accept", rule.rule_text)
+                                }
+                                className="rounded bg-[#3D9A6B] px-3.5 py-1.5 text-xs font-medium text-white hover:bg-[#32825A] disabled:opacity-50"
+                              >
+                                {t.memoryAcceptBtn}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* preferences.md Direct Markdown Editor */}
+                <div className="space-y-3 rounded-lg border border-[#33363B] bg-[#242629] p-5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h2 className="text-sm font-medium text-[#F3F4F6]">
+                        {t.memoryEditorTitle}
+                      </h2>
+                      <p className="mt-0.5 text-xs text-[#9CA3AF]">{t.memoryEditorHint}</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {prefsDirty && (
+                        <span className="rounded bg-[#D99B26]/20 px-2 py-0.5 text-[11px] text-[#FCD34D]">
+                          {t.memoryUnsavedBadge}
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        disabled={memoryBusy === "save" || !prefsDirty}
+                        onClick={() => void handleSavePreferences()}
+                        className="rounded-md bg-[#F3F4F6] px-3.5 py-1.5 text-xs font-medium text-[#1B1C1E] hover:bg-white disabled:opacity-45"
+                      >
+                        {memoryBusy === "save" ? t.memorySaving : t.memorySaveBtn}
+                      </button>
+                    </div>
+                  </div>
+
+                  <textarea
+                    value={prefsDraft}
+                    onChange={(e) => {
+                      setPrefsDraft(e.target.value);
+                      setPrefsDirty(true);
+                    }}
+                    rows={10}
+                    className="w-full rounded-md border border-[#33363B] bg-[#1B1C1E] p-3 font-mono text-xs leading-relaxed text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+                  />
+                </div>
+
+                {/* Reviewed Rule History */}
+                {decided.length > 0 && (
+                  <div className="space-y-2.5 rounded-lg border border-[#33363B] bg-[#242629] p-5">
+                    <h2 className="text-sm font-medium text-[#F3F4F6]">{t.memoryHistoryTitle}</h2>
+                    <ul className="divide-y divide-[#33363B] text-xs">
+                      {decided.map((r) => (
+                        <li
+                          key={r.rule_id}
+                          className="flex flex-wrap items-center justify-between gap-2 py-2"
+                        >
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="font-mono text-[11px] text-[#9CA3AF]">
+                              {r.rule_id}
+                            </span>
+                            <span className="truncate text-[#E5E7EB]">{r.rule_text}</span>
+                          </div>
+                          <span
+                            className={`shrink-0 rounded px-2 py-0.5 text-[10px] ${
+                              r.status === "accepted"
+                                ? "bg-[#3D9A6B]/20 text-[#86EFAC]"
+                                : "bg-[#2C2F34] text-[#9CA3AF]"
+                            }`}
+                          >
+                            {t.memoryStatusLabels[r.status] ?? r.status}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      ) : activeTab === "traces" ? (
+        <div className="mt-6 space-y-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <div className="space-y-1">
+              <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">
+                {t.tracesTitle}
+              </h1>
+              <p className="text-sm text-[#9CA3AF]">{t.tracesSubtitle}</p>
+            </div>
+            <select
+              value={sessionId}
+              onChange={(e) => setSessionId(e.target.value)}
+              className="rounded-md border border-[#33363B] bg-[#242629] px-3 py-1.5 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+            >
+              <option value="">{t.digestAllSessions}</option>
+              {sessions.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {tracesQ.isLoading ? (
+            <p className="py-10 text-sm text-[#9CA3AF]">{t.loading}</p>
+          ) : tracesQ.isError ? (
+            <div className="rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-3 text-sm text-[#FCA5A5]">
+              {t.errorPrefix}
+              {tracesQ.error instanceof Error ? tracesQ.error.message : String(tracesQ.error)}
+            </div>
+          ) : tracesQ.data ? (
+            <>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-4">
+                  <div className="text-xs text-[#9CA3AF]">{t.tracesMonthlySpend}</div>
+                  <div className="mt-1.5 text-2xl font-semibold text-[#F3F4F6] tabular-nums">
+                    ${tracesQ.data.monthly_spent_usd.toFixed(4)}
+                  </div>
+                  <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#1B1C1E]">
+                    <div
+                      className="h-full bg-[#5B8DEF]"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          tracesQ.data.monthly_budget_usd > 0
+                            ? (tracesQ.data.monthly_spent_usd / tracesQ.data.monthly_budget_usd) * 100
+                            : 0,
+                        ).toFixed(1)}%`,
+                      }}
+                    />
+                  </div>
+                  <div className="mt-1 text-[11px] text-[#9CA3AF] tabular-nums">
+                    {t.tracesBudgetOf(tracesQ.data.monthly_budget_usd.toFixed(2))} ·{" "}
+                    {tracesQ.data.model_profile}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-4">
+                  <div className="text-xs text-[#9CA3AF]">{t.tracesTotalCalls}</div>
+                  <div className="mt-1.5 text-2xl font-semibold text-[#F3F4F6] tabular-nums">
+                    {tracesQ.data.total_calls}
+                  </div>
+                  <div className="mt-1 text-[11px] text-[#9CA3AF] tabular-nums">
+                    ${tracesQ.data.total_cost_usd.toFixed(4)}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-4">
+                  <div className="text-xs text-[#9CA3AF]">{t.tracesCacheHitRate}</div>
+                  <div className="mt-1.5 text-2xl font-semibold text-[#86EFAC] tabular-nums">
+                    {fmtPct(tracesQ.data.cache_hit_rate)}
+                  </div>
+                  <div className="mt-1 text-[11px] text-[#9CA3AF] tabular-nums">
+                    {t.tracesCacheHitHint(tracesQ.data.cache_hits)}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-4">
+                  <div className="text-xs text-[#9CA3AF]">{t.tracesTokensSummary}</div>
+                  <div className="mt-1.5 text-2xl font-semibold text-[#F3F4F6] tabular-nums">
+                    {(tracesQ.data.total_in_tokens + tracesQ.data.total_out_tokens).toLocaleString()}
+                  </div>
+                  <div className="mt-1 text-[11px] text-[#9CA3AF] tabular-nums">
+                    {t.tracesCachedTokensHint(tracesQ.data.total_cached_tokens)}
+                  </div>
+                </div>
+              </div>
+
+              {tracesQ.data.items.length === 0 ? (
+                <div className="rounded-lg border border-[#33363B] bg-[#242629] py-12 text-center">
+                  <p className="text-base text-[#F3F4F6]">{t.tracesEmpty}</p>
+                  <p className="mt-1 text-sm text-[#9CA3AF]">{t.tracesEmptyHint}</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto rounded-lg border border-[#33363B] bg-[#242629]">
+                  <table className="w-full text-left text-xs">
+                    <thead className="border-b border-[#33363B] bg-[#1B1C1E] text-[11px] text-[#9CA3AF]">
+                      <tr>
+                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColTime}</th>
+                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColRole}</th>
+                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColModel}</th>
+                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColTokens}</th>
+                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColLatency}</th>
+                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColCost}</th>
+                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColCache}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#33363B] tabular-nums">
+                      {tracesQ.data.items.map((row) => (
+                        <tr key={row.id} className="hover:bg-[#1B1C1E]/60">
+                          <td className="whitespace-nowrap px-3.5 py-2.5 text-[#9CA3AF]">
+                            {new Date(row.created_at * 1000).toLocaleString()}
+                          </td>
+                          <td className="whitespace-nowrap px-3.5 py-2.5 text-[#F3F4F6]">
+                            {t.tracesRoleLabels[row.role] ?? row.role}
+                          </td>
+                          <td className="whitespace-nowrap px-3.5 py-2.5 font-mono text-[11px] text-[#D1D5DB]">
+                            {row.model}
+                          </td>
+                          <td className="whitespace-nowrap px-3.5 py-2.5 font-mono text-[11px] text-[#D1D5DB]">
+                            {row.in_tokens.toLocaleString()} / {row.cached_tokens.toLocaleString()} /{" "}
+                            {row.out_tokens.toLocaleString()}
+                          </td>
+                          <td className="whitespace-nowrap px-3.5 py-2.5 text-[#9CA3AF]">
+                            {row.latency_ms} ms
+                          </td>
+                          <td className="whitespace-nowrap px-3.5 py-2.5 font-mono text-[#F3F4F6]">
+                            ${row.cost_usd.toFixed(5)}
+                          </td>
+                          <td className="whitespace-nowrap px-3.5 py-2.5">
+                            {row.cache_hit ? (
+                              <span className="rounded bg-[#3D9A6B]/20 px-2 py-0.5 text-[10px] text-[#86EFAC]">
+                                {t.tracesCacheHitBadge}
+                              </span>
+                            ) : (
+                              <span className="rounded bg-[#2C2F34] px-2 py-0.5 text-[10px] text-[#9CA3AF]">
+                                {t.tracesCacheMissBadge}
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          ) : null}
+        </div>
       ) : (
         <div className="mt-6">
           <div className="space-y-1">
@@ -721,6 +1218,35 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
                           >
                             {t.planStatus[plan.status] ?? plan.status}
                           </span>
+                          {plan.verifier_report && (() => {
+                            const l2 = plan.verifier_report.layer2;
+                            const flaggedLen = plan.verifier_report.flagged_photos?.length ?? 0;
+                            if (flaggedLen > 0) {
+                              return (
+                                <span
+                                  title={l2?.model_id ?? undefined}
+                                  className="rounded bg-[#D99B26]/15 px-2 py-0.5 text-[11px] text-[#FCD34D] tabular-nums"
+                                >
+                                  {t.verifierTrashBadgeFlagged(flaggedLen)}
+                                </span>
+                              );
+                            }
+                            if (l2?.status === "passed") {
+                              return (
+                                <span
+                                  title={l2.model_id ?? undefined}
+                                  className="rounded bg-[#5B8DEF]/15 px-2 py-0.5 text-[11px] text-[#93C5FD]"
+                                >
+                                  {t.verifierTrashBadgeTwoLayer}
+                                </span>
+                              );
+                            }
+                            return (
+                              <span className="rounded bg-[#2C2F34] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
+                                {t.verifierTrashBadgeRules}
+                              </span>
+                            );
+                          })()}
                           <span className="text-xs text-[#9CA3AF] tabular-nums">
                             {t.photoCount(canRestore ? activeInBatch : plan.item_count)}
                           </span>

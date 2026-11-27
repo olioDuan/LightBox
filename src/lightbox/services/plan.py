@@ -410,6 +410,60 @@ class PlanService:
             verifier_report=report,
         )
 
+    def run_deterministic_plan_checks(
+        self,
+        session_id: str,
+        items: Sequence[PlanItemRecord],
+        *,
+        total_session_photos: int,
+        tech_reject_count: int = 0,
+        burst_non_pick_count: int = 0,
+        manual_reject_count: int = 0,
+    ) -> dict[str, Any]:
+        """Public wrapper for deterministic Layer 1 plan safety checks (used by `agent.verifier`)."""
+        return self._run_deterministic_plan_checks(
+            session_id,
+            items,
+            total_session_photos=total_session_photos,
+            tech_reject_count=tech_reject_count,
+            burst_non_pick_count=burst_non_pick_count,
+            manual_reject_count=manual_reject_count,
+        )
+
+    def verify_plan_freshness(
+        self,
+        plan_id: str,
+        *,
+        check_hash: bool = True,
+    ) -> tuple[PlanRecord, list[PlanItemRecord]]:
+        """Verify optimistic locking (`decision_version` & `plan_hash`) before approval or execution."""
+        return self.executor.verify_plan_freshness(plan_id, check_hash=check_hash)
+
+    def mark_plan_reviewed(
+        self,
+        plan_id: str,
+        verifier_report: dict[str, Any],
+    ) -> PlanRecord:
+        """Persist final Verifier report JSON and mark a `draft` plan as `reviewed`."""
+        self.repo.update_plan_verifier_report(
+            plan_id,
+            json.dumps(verifier_report, ensure_ascii=False, sort_keys=True),
+        )
+        plan = self.repo.get_plan(plan_id)
+        if plan is None:
+            raise PlanError(f"Unknown plan_id: {plan_id}")
+        if plan.status == "draft":
+            self.repo.update_plan_status(plan_id, "reviewed")
+            plan = self.repo.get_plan(plan_id)
+            assert plan is not None
+        return plan
+
+    def mark_plan_stale(self, plan_id: str) -> None:
+        """Mark a pre-execution plan as `stale` (e.g. replaced after Verifier removes flagged items)."""
+        plan = self.repo.get_plan(plan_id)
+        if plan is not None and plan.status in {"draft", "reviewed", "approved"}:
+            self.repo.update_plan_status(plan_id, "stale")
+
     def get_plan(self, plan_id: str) -> tuple[PlanRecord, list[PlanItemRecord]]:
         plan = self.repo.get_plan(plan_id)
         if plan is None:

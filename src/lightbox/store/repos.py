@@ -261,6 +261,44 @@ class FaceAssignmentRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentSessionRecord:
+    id: str
+    session_id: str
+    mode: str  # 'supervisor' | 'chat'
+    status: str  # 'running' | 'awaiting_user' | 'awaiting_approval' | 'completed' | 'failed'
+    constraints: tuple[str, ...] = ()
+    plan_todos: tuple[dict[str, Any], ...] = ()
+    stage_summary: dict[str, Any] = field(default_factory=dict)
+    step: int = 0
+    spent_usd: float = 0.0
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class AgentEventRecord:
+    agent_session_id: str
+    seq: int
+    event_type: str
+    payload: dict[str, Any]
+    created_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRuleRecord:
+    rule_id: str
+    status: str  # 'proposed' | 'accepted' | 'rejected'
+    rule_text: str
+    rationale: str | None = None
+    evidence_ids: tuple[int, ...] = ()
+    condition_dsl_json: str | None = None
+    hits: int = 0
+    conflicts: int = 0
+    last_matched_at: float | None = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class DigestOverviewRow:
     total_shots: int
     tech_reject: int
@@ -2255,8 +2293,297 @@ class LightboxRepository:
             for r in rows
         ]
 
+    # --- Agent Sessions & Events (T13) ---
+
+    def create_agent_session(self, record: AgentSessionRecord) -> None:
+        ts = record.created_at or time.time()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_sessions(
+                    id, session_id, mode, status, constraints_json,
+                    plan_json, stage_summary_json, step, spent_usd, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.session_id,
+                    record.mode,
+                    record.status,
+                    json.dumps(list(record.constraints), ensure_ascii=False),
+                    json.dumps(list(record.plan_todos), ensure_ascii=False),
+                    json.dumps(record.stage_summary, ensure_ascii=False),
+                    record.step,
+                    record.spent_usd,
+                    ts,
+                ),
+            )
+
+    @staticmethod
+    def _row_to_agent_session(row: sqlite3.Row) -> AgentSessionRecord:
+        raw_constraints = json.loads(row["constraints_json"]) if row["constraints_json"] else []
+        raw_plan = json.loads(row["plan_json"]) if row["plan_json"] else []
+        raw_stage = json.loads(row["stage_summary_json"]) if row["stage_summary_json"] else {}
+        return AgentSessionRecord(
+            id=str(row["id"]),
+            session_id=str(row["session_id"]),
+            mode=str(row["mode"]),
+            status=str(row["status"]),
+            constraints=tuple(str(c) for c in raw_constraints),
+            plan_todos=tuple(dict(t) for t in raw_plan if isinstance(t, dict)),
+            stage_summary=dict(raw_stage) if isinstance(raw_stage, dict) else {},
+            step=int(row["step"] or 0),
+            spent_usd=float(row["spent_usd"] or 0.0),
+            created_at=float(row["created_at"]),
+        )
+
+    def get_agent_session(self, agent_session_id: str) -> AgentSessionRecord | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM agent_sessions WHERE id = ?",
+            (agent_session_id,),
+        ).fetchone()
+        return self._row_to_agent_session(row) if row is not None else None
+
+    def list_agent_sessions(
+        self,
+        *,
+        session_id: str | None = None,
+        limit: int = 20,
+    ) -> list[AgentSessionRecord]:
+        clamped = max(1, min(limit, 100))
+        if session_id is None:
+            rows = self.db.conn.execute(
+                "SELECT * FROM agent_sessions ORDER BY created_at DESC LIMIT ?",
+                (clamped,),
+            ).fetchall()
+        else:
+            rows = self.db.conn.execute(
+                "SELECT * FROM agent_sessions WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, clamped),
+            ).fetchall()
+        return [self._row_to_agent_session(r) for r in rows]
+
+    def update_agent_session(
+        self,
+        agent_session_id: str,
+        *,
+        status: str | None = None,
+        constraints: Sequence[str] | None = None,
+        plan_todos: Sequence[dict[str, Any]] | None = None,
+        stage_summary: dict[str, Any] | None = None,
+        step: int | None = None,
+        spent_usd: float | None = None,
+    ) -> None:
+        sets: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if constraints is not None:
+            sets.append("constraints_json = ?")
+            params.append(json.dumps(list(constraints), ensure_ascii=False))
+        if plan_todos is not None:
+            sets.append("plan_json = ?")
+            params.append(json.dumps(list(plan_todos), ensure_ascii=False))
+        if stage_summary is not None:
+            sets.append("stage_summary_json = ?")
+            params.append(json.dumps(stage_summary, ensure_ascii=False))
+        if step is not None:
+            sets.append("step = ?")
+            params.append(step)
+        if spent_usd is not None:
+            sets.append("spent_usd = ?")
+            params.append(spent_usd)
+        if not sets:
+            return
+        params.append(agent_session_id)
+        with self.db.transaction() as cur:
+            cur.execute(
+                f"UPDATE agent_sessions SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
+
+    def append_agent_event(
+        self,
+        agent_session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        created_at: float | None = None,
+    ) -> AgentEventRecord:
+        ts = created_at if created_at is not None else time.time()
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        with self.db.transaction() as cur:
+            row = cur.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM agent_events WHERE agent_session_id = ?",
+                (agent_session_id,),
+            ).fetchone()
+            next_seq = int(row["max_seq"]) + 1 if row is not None else 1
+            cur.execute(
+                """
+                INSERT INTO agent_events(agent_session_id, seq, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (agent_session_id, next_seq, event_type, payload_json, ts),
+            )
+        return AgentEventRecord(
+            agent_session_id=agent_session_id,
+            seq=next_seq,
+            event_type=event_type,
+            payload=dict(payload),
+            created_at=ts,
+        )
+
+    def list_agent_events(
+        self,
+        agent_session_id: str,
+        *,
+        after_seq: int = 0,
+    ) -> list[AgentEventRecord]:
+        rows = self.db.conn.execute(
+            """
+            SELECT * FROM agent_events
+            WHERE agent_session_id = ? AND seq > ?
+            ORDER BY seq ASC
+            """,
+            (agent_session_id, after_seq),
+        ).fetchall()
+        return [
+            AgentEventRecord(
+                agent_session_id=str(r["agent_session_id"]),
+                seq=int(r["seq"]),
+                event_type=str(r["event_type"]),
+                payload=dict(json.loads(r["payload_json"])) if r["payload_json"] else {},
+                created_at=float(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    # --- Memory Rules Meta (T14) ---
+
+    @staticmethod
+    def _row_to_memory_rule(row: sqlite3.Row) -> MemoryRuleRecord:
+        raw_ev = json.loads(row["evidence_ids_json"]) if row["evidence_ids_json"] else []
+        ev_ids = tuple(int(x) for x in raw_ev if isinstance(x, (int, float)))
+        return MemoryRuleRecord(
+            rule_id=str(row["rule_id"]),
+            status=str(row["status"] or "proposed"),
+            rule_text=str(row["rule_text"] or ""),
+            rationale=str(row["rationale"]) if row["rationale"] is not None else None,
+            evidence_ids=ev_ids,
+            condition_dsl_json=(
+                str(row["condition_dsl_json"]) if row["condition_dsl_json"] is not None else None
+            ),
+            hits=int(row["hits"] or 0),
+            conflicts=int(row["conflicts"] or 0),
+            last_matched_at=(
+                float(row["last_matched_at"]) if row["last_matched_at"] is not None else None
+            ),
+            created_at=float(row["created_at"] or 0.0),
+            updated_at=float(row["updated_at"] or 0.0),
+        )
+
+    def upsert_memory_rule(self, record: MemoryRuleRecord) -> None:
+        now = time.time()
+        created = record.created_at or now
+        updated = record.updated_at or now
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO memory_rules_meta(
+                    rule_id, condition_dsl_json, evidence_ids_json,
+                    hits, conflicts, last_matched_at,
+                    status, rule_text, rationale, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(rule_id) DO UPDATE SET
+                    status = excluded.status,
+                    rule_text = excluded.rule_text,
+                    rationale = excluded.rationale,
+                    evidence_ids_json = excluded.evidence_ids_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record.rule_id,
+                    None,  # PLAN T14: condition_dsl_json MUST stay NULL in v1
+                    json.dumps(list(record.evidence_ids)),
+                    record.hits,
+                    record.conflicts,
+                    record.last_matched_at,
+                    record.status,
+                    record.rule_text,
+                    record.rationale,
+                    created,
+                    updated,
+                ),
+            )
+
+    def get_memory_rule(self, rule_id: str) -> MemoryRuleRecord | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM memory_rules_meta WHERE rule_id = ?",
+            (rule_id,),
+        ).fetchone()
+        return self._row_to_memory_rule(row) if row is not None else None
+
+    def list_memory_rules(self, *, status: str | None = None) -> list[MemoryRuleRecord]:
+        if status is None:
+            rows = self.db.conn.execute(
+                "SELECT * FROM memory_rules_meta ORDER BY COALESCE(created_at, 0) DESC, rule_id DESC"
+            ).fetchall()
+        else:
+            rows = self.db.conn.execute(
+                """
+                SELECT * FROM memory_rules_meta
+                WHERE status = ?
+                ORDER BY COALESCE(created_at, 0) DESC, rule_id DESC
+                """,
+                (status,),
+            ).fetchall()
+        return [self._row_to_memory_rule(r) for r in rows]
+
+    def update_memory_rule_decision(
+        self,
+        rule_id: str,
+        *,
+        status: str,
+        rule_text: str | None = None,
+        updated_at: float | None = None,
+    ) -> MemoryRuleRecord | None:
+        ts = updated_at if updated_at is not None else time.time()
+        with self.db.transaction() as cur:
+            if rule_text is not None:
+                cur.execute(
+                    """
+                    UPDATE memory_rules_meta
+                    SET status = ?, rule_text = ?, condition_dsl_json = NULL, updated_at = ?
+                    WHERE rule_id = ?
+                    """,
+                    (status, rule_text, ts, rule_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE memory_rules_meta
+                    SET status = ?, condition_dsl_json = NULL, updated_at = ?
+                    WHERE rule_id = ?
+                    """,
+                    (status, ts, rule_id),
+                )
+        return self.get_memory_rule(rule_id)
+
+    def get_last_consolidate_ts(self) -> float | None:
+        row = self.db.conn.execute(
+            "SELECT MAX(created_at) AS ts FROM llm_calls WHERE role = 'consolidate'"
+        ).fetchone()
+        if row is not None and row["ts"] is not None:
+            return float(row["ts"])
+        return None
+
 
 __all__ = [
+    "AgentEventRecord",
+    "AgentSessionRecord",
     "AssetRecord",
     "BurstMemberRecord",
     "BurstRecord",
@@ -2271,6 +2598,7 @@ __all__ = [
     "JobRecord",
     "LLMCallRecord",
     "LightboxRepository",
+    "MemoryRuleRecord",
     "MetricsRecord",
     "OverrideRecord",
     "PersonRecord",

@@ -123,7 +123,17 @@ class AnthropicChatModel:
             "messages": wire_messages,
         }
         if system_parts:
-            kwargs["system"] = "\n\n".join(system_parts)
+            system_text = "\n\n".join(system_parts)
+            if self.spec.prompt_cache:
+                kwargs["system"] = [
+                    {
+                        "type": "text",
+                        "text": system_text,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            else:
+                kwargs["system"] = system_text
 
         # SPEC §6.1: Use output_config.format and output_config.effort;
         # NEVER send thinking={"type": "disabled"}, temperature, top_p, or forced tool_choice.
@@ -141,7 +151,7 @@ class AnthropicChatModel:
 
         if tools:
             wire_tools: list[dict[str, Any]] = []
-            for tool in tools:
+            for tool in sorted(tools, key=lambda t: t.name):
                 entry: dict[str, Any] = {
                     "name": tool.name,
                     "description": tool.description,
@@ -150,6 +160,8 @@ class AnthropicChatModel:
                 if tool.strict:
                     entry["strict"] = True
                 wire_tools.append(entry)
+            if self.spec.prompt_cache and wire_tools:
+                wire_tools[-1]["cache_control"] = {"type": "ephemeral"}
             kwargs["tools"] = wire_tools
             kwargs["tool_choice"] = {"type": "auto"}
 

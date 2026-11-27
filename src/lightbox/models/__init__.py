@@ -36,7 +36,7 @@ from lightbox.models.face_embedder import (
     find_face_embedder_model_path,
     get_shared_face_embedder,
 )
-from lightbox.models.images import strip_metadata_and_encode
+from lightbox.models.images import check_outbound_privacy, strip_metadata_and_encode
 from lightbox.models.openai_compat import OpenAICompatChatModel
 from lightbox.models.router import DEFAULT_MAX_CONCURRENCY, ModelRouter
 from lightbox.models.secrets import (
@@ -53,8 +53,11 @@ from lightbox.models.types import (
     ImageInput,
     Message,
     MissingAPIKeyError,
+    ModelCallRequest,
     ModelCaps,
     ModelError,
+    ModelHookDeniedError,
+    PreModelCallHook,
     ProviderName,
     ToolCall,
     ToolResultBlock,
@@ -70,6 +73,7 @@ __all__ = [
     "AnthropicChatModel",
     "BudgetExceededError",
     "ChatModel",
+    "check_outbound_privacy",
     "DEFAULT_MAX_CONCURRENCY",
     "EMBEDDING_DIM",
     "Embedder",
@@ -85,11 +89,14 @@ __all__ = [
     "KEYRING_SERVICE",
     "Message",
     "MissingAPIKeyError",
+    "ModelCallRequest",
     "ModelCaps",
     "ModelError",
+    "ModelHookDeniedError",
     "ModelRouter",
     "OpenAICompatChatModel",
     "PROVIDER_ENV_VARS",
+    "PreModelCallHook",
     "ProviderName",
     "SCENE_VOCAB",
     "SCENE_VOCAB_NPY_PATH",

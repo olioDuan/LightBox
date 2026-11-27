@@ -472,6 +472,24 @@ class TriageService:
 
         return member_ids, tuple(images)
 
+    def _read_effective_preferences(self) -> str:
+        """Read accepted/user-edited text preferences from `preferences.md` for VLM alignment (SPEC §7.6)."""
+        pref_path = self.app_paths.preferences_file
+        if not pref_path.is_file():
+            return ""
+        try:
+            raw = pref_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        if not raw or "No custom aesthetic or culling preference rules have been approved yet." in raw:
+            return ""
+        substantive = [
+            line for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")
+        ]
+        if not substantive:
+            return ""
+        return raw[:2000]
+
     def _build_yellow_messages(
         self,
         photo: PhotoRecord,
@@ -500,6 +518,9 @@ class TriageService:
             "Conservative rule: never reject a potentially good or creatively intentional shot. "
             "If uncertain, return decision='unsure'. Return strict JSON matching the schema."
         )
+        prefs = self._read_effective_preferences()
+        if prefs:
+            system_prompt = f"{system_prompt}\n\nActive photographer preferences:\n{prefs}"
         user_prompt = (
             f"Photo handle: {photo.id}\n"
             f"Engine flags: {reasons}\n"
@@ -539,6 +560,9 @@ class TriageService:
             "You are selecting the best frame from a burst sequence. "
             "Evaluate sharpness, eyes open, and natural expression. Return strict JSON."
         )
+        prefs = self._read_effective_preferences()
+        if prefs:
+            system_prompt = f"{system_prompt}\n\nActive photographer preferences:\n{prefs}"
         user_prompt = (
             f"Burst group {burst_detail.burst.id} ({len(member_ids)} frames, numbered #1..#{len(member_ids)}).\n"
             + "\n".join(lines)
@@ -558,6 +582,7 @@ class TriageService:
         max_photos: int = 50,
         profile: str | None = None,
         session_budget_usd: float | None = None,
+        bypass_monthly_budget: bool = False,
         job_id: str | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
     ) -> TriageResult:
@@ -688,6 +713,7 @@ class TriageService:
                     profile=prof_name,
                     session_id=session_id,
                     session_budget_usd=eff_budget,
+                    bypass_monthly_budget=bypass_monthly_budget,
                 )
                 # Account spend immediately after paid call returns, even if persistence below fails
                 _record_usage(res.cache_hit, res.cost_usd)
@@ -804,6 +830,7 @@ class TriageService:
                     profile=prof_name,
                     session_id=session_id,
                     session_budget_usd=eff_budget,
+                    bypass_monthly_budget=bypass_monthly_budget,
                 )
                 # Account spend immediately after paid call returns, even if persistence below fails
                 _record_usage(res.cache_hit, res.cost_usd)
@@ -954,6 +981,7 @@ class TriageService:
         max_photos: int = 50,
         profile: str | None = None,
         session_budget_usd: float | None = None,
+        bypass_monthly_budget: bool = False,
         job_id: str | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
     ) -> TriageResult:
@@ -963,6 +991,7 @@ class TriageService:
             max_photos=max_photos,
             profile=profile,
             session_budget_usd=session_budget_usd,
+            bypass_monthly_budget=bypass_monthly_budget,
             job_id=job_id,
             on_progress=on_progress,
         )

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
+import { AgentDrawer } from "./components/AgentDrawer";
 import { getMessages, I18nContext, type Lang } from "./i18n";
 import { InsightsView } from "./views/InsightsView";
 import { PeopleView } from "./views/PeopleView";
@@ -7,12 +8,14 @@ import { ReviewView } from "./views/ReviewView";
 import { SearchView } from "./views/SearchView";
 import { SessionsView } from "./views/SessionsView";
 
+type InsightsTab = "digest" | "trash" | "traces" | "memory";
+
 type Route =
   | { name: "sessions" }
   | { name: "review"; sessionId: string }
   | { name: "search" }
   | { name: "people" }
-  | { name: "insights"; tab: "digest" | "trash" };
+  | { name: "insights"; tab: InsightsTab };
 
 function parseRoute(pathname: string, search = ""): Route {
   const reviewMatch = pathname.match(/^\/sessions\/([^/]+)\/review\/?$/);
@@ -27,7 +30,15 @@ function parseRoute(pathname: string, search = ""): Route {
   }
   if (pathname === "/insights" || pathname === "/insights/") {
     const params = new URLSearchParams(search);
-    const tab = params.get("tab") === "trash" ? "trash" : "digest";
+    const raw = params.get("tab");
+    const tab: InsightsTab =
+      raw === "trash"
+        ? "trash"
+        : raw === "traces"
+          ? "traces"
+          : raw === "memory"
+            ? "memory"
+            : "digest";
     return { name: "insights", tab };
   }
   return { name: "sessions" };
@@ -40,6 +51,22 @@ export function App() {
   const [lang, setLangState] = useState<Lang>("zh-CN");
   const [authState, setAuthState] = useState<"checking" | "authed" | "needs_confirm">("checking");
   const [authError, setAuthError] = useState<string | null>(null);
+  const [agentOpen, setAgentOpen] = useState(false);
+
+  // Global ⌘K / Ctrl+K shortcut to toggle the built-in Agent side drawer
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        if (authState !== "authed") return;
+        e.preventDefault();
+        setAgentOpen((prev) => !prev);
+      } else if (e.key === "Escape" && agentOpen) {
+        setAgentOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [agentOpen, authState]);
 
   const navigate = (path: string) => {
     window.history.pushState({}, "", path);
@@ -157,13 +184,30 @@ export function App() {
             )}
           </div>
 
-          <button
-            type="button"
-            onClick={() => setLang(lang === "zh-CN" ? "en-US" : "zh-CN")}
-            className="rounded-md border border-[#33363B] px-2.5 py-1 text-xs text-[#D1D5DB] hover:bg-[#242629]"
-          >
-            {lang === "zh-CN" ? "EN" : "中文"}
-          </button>
+          <div className="flex items-center gap-2">
+            {authState === "authed" && (
+              <button
+                type="button"
+                onClick={() => setAgentOpen((prev) => !prev)}
+                className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs transition ${
+                  agentOpen
+                    ? "border-[#5B8DEF]/60 bg-[#5B8DEF]/20 text-[#93C5FD]"
+                    : "border-[#33363B] bg-[#242629] text-[#E5E7EB] hover:bg-[#2C2F34]"
+                }`}
+              >
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#5B8DEF]" />
+                <span>{t.navAgentBtn}</span>
+                <kbd className="font-mono text-[10px] text-[#9CA3AF]">⌘K</kbd>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setLang(lang === "zh-CN" ? "en-US" : "zh-CN")}
+              className="rounded-md border border-[#33363B] px-2.5 py-1 text-xs text-[#D1D5DB] hover:bg-[#242629]"
+            >
+              {lang === "zh-CN" ? "EN" : "中文"}
+            </button>
+          </div>
         </header>
 
         {authState === "checking" ? (
@@ -196,10 +240,20 @@ export function App() {
         ) : route.name === "insights" ? (
           <InsightsView
             activeTab={route.tab}
-            onChangeTab={(tab) => navigate(tab === "trash" ? "/insights?tab=trash" : "/insights")}
+            onChangeTab={(tab) =>
+              navigate(tab === "digest" ? "/insights" : `/insights?tab=${tab}`)
+            }
           />
         ) : (
           <SessionsView onOpenReview={(id) => navigate(`/sessions/${encodeURIComponent(id)}/review`)} />
+        )}
+
+        {authState === "authed" && (
+          <AgentDrawer
+            open={agentOpen}
+            activeSessionId={route.name === "review" ? route.sessionId : null}
+            onClose={() => setAgentOpen(false)}
+          />
         )}
       </div>
     </I18nContext.Provider>

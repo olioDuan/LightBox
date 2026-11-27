@@ -136,6 +136,7 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
   const [selectedBurstPickId, setSelectedBurstPickId] = useState<string | null>(null);
   const [burstZoomed, setBurstZoomed] = useState(false);
   const [activeDraft, setActiveDraft] = useState<DraftObviousResponse | null>(null);
+  const [verifyingPlan, setVerifyingPlan] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const positionedTokenRef = useRef<number>(0);
@@ -535,13 +536,20 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
     setError(null);
     setToast(null);
     setShowCompleteModal(false);
+    setActiveDraft(null);
+    setVerifyingPlan(true);
     try {
       const draft = await api.draftObviousRejects(sessionId, "subfolder", lang);
       setActiveDraft(draft);
+      if ((draft.verifier_report?.flagged_photos?.length ?? 0) > 0) {
+        void refreshSession();
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setVerifyingPlan(false);
     }
-  }, [lang, sessionId]);
+  }, [lang, refreshSession, sessionId]);
 
   const handleResetReview = useCallback(async () => {
     if (!window.confirm(t.resetReviewConfirm)) return;
@@ -567,7 +575,7 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
   // Global keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (activeDraft) return;
+      if (activeDraft || verifyingPlan) return;
       if (showCompleteModal) {
         if (e.key === "Escape") {
           e.preventDefault();
@@ -1367,10 +1375,14 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
         </div>
       )}
 
-      {activeDraft && (
+      {(verifyingPlan || activeDraft) && (
         <QuarantineModal
           draft={activeDraft}
-          onClose={() => setActiveDraft(null)}
+          verifying={verifyingPlan}
+          onClose={() => {
+            setVerifyingPlan(false);
+            setActiveDraft(null);
+          }}
           onApplied={(moved, planId) => {
             setActiveDraft(null);
             setLastAction(null);

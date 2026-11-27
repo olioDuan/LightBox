@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -289,6 +290,60 @@ class SystemService:
             duration_ms=duration_ms,
             summary=summary,
         )
+
+    def get_llm_traces(
+        self,
+        *,
+        session_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return lightweight `llm_calls` trace ledger and monthly spend summary (PLAN T13)."""
+        repo = LightboxRepository(self.db)
+        cfg = load_config(self.app_paths)
+        calls = repo.list_llm_calls(session_id=session_id, limit=limit)
+        now = datetime.now(tz=UTC)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+        monthly_spent = repo.sum_llm_cost(since_ts=month_start)
+        session_spent = repo.sum_llm_cost(session_id=session_id) if session_id else None
+
+        total_in = sum(c.in_tokens for c in calls)
+        total_out = sum(c.out_tokens for c in calls)
+        total_cached = sum(c.cached_tokens for c in calls)
+        total_cost = sum(c.cost_usd for c in calls)
+        cache_hits = sum(1 for c in calls if c.cache_hit)
+
+        return {
+            "session_id": session_id,
+            "monthly_spent_usd": round(monthly_spent, 6),
+            "monthly_budget_usd": cfg.budget.monthly_budget_usd,
+            "session_spent_usd": round(session_spent, 6) if session_spent is not None else None,
+            "session_budget_usd": cfg.budget.session_budget_usd,
+            "model_profile": cfg.model_profile,
+            "total_calls": len(calls),
+            "cache_hits": cache_hits,
+            "cache_hit_rate": round(cache_hits / len(calls), 4) if calls else 0.0,
+            "total_in_tokens": total_in,
+            "total_out_tokens": total_out,
+            "total_cached_tokens": total_cached,
+            "total_cost_usd": round(total_cost, 6),
+            "items": [
+                {
+                    "id": c.id,
+                    "role": c.role,
+                    "provider": c.provider,
+                    "model": c.model,
+                    "in_tokens": c.in_tokens,
+                    "out_tokens": c.out_tokens,
+                    "cached_tokens": c.cached_tokens,
+                    "cost_usd": round(c.cost_usd, 6),
+                    "latency_ms": c.latency_ms,
+                    "cache_hit": c.cache_hit,
+                    "session_id": c.session_id,
+                    "created_at": c.created_at,
+                }
+                for c in calls
+            ],
+        }
 
 
 def _toml_str(value: str) -> str:

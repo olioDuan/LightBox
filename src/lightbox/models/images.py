@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import io
 import math
+import os
+import re
 from typing import Literal
 
 from PIL import Image, ImageOps
+
+from lightbox.models.secrets import PROVIDER_ENV_VARS
+from lightbox.models.types import ModelCallRequest
+
+_ABS_PATH_RE = re.compile(
+    r"""(?:^|[\s"'`(\[:=])(/(?:Users|home|Volumes|mnt|media|tmp|private|var|opt|root)/[^\s"'`)\]]+|[A-Za-z]:\\[^\s"'`)\]]+)"""
+)
+_API_KEY_PREFIX_RE = re.compile(
+    r"\b(?:sk-ant-[A-Za-z0-9_\-]{12,}|sk-proj-[A-Za-z0-9_\-]{12,}|sk-[A-Za-z0-9]{20,}|AIzaSy[A-Za-z0-9_\-]{16,})\b"
+)
 
 
 def strip_metadata_and_encode(
@@ -57,4 +69,53 @@ def strip_metadata_and_encode(
     return buf.getvalue(), mime
 
 
-__all__ = ["strip_metadata_and_encode"]
+def check_outbound_privacy(
+    request: ModelCallRequest,
+) -> tuple[Literal["ALLOW", "DENY", "ASK"], str | None]:
+    """Non-bypassable outbound privacy check: EXIF-free images, no API keys, no absolute paths."""
+    env_secrets: list[str] = []
+    for var_names in PROVIDER_ENV_VARS.values():
+        for var in var_names:
+            val = os.environ.get(var, "").strip()
+            if len(val) >= 8:
+                env_secrets.append(val)
+
+    for msg in request.messages:
+        for img in msg.images:
+            try:
+                with Image.open(io.BytesIO(img.data)) as im:
+                    exif = im.getexif()
+                    has_exif = bool(exif and len(exif) > 0)
+                    has_raw_meta = any(
+                        k in im.info for k in ("exif", "xmp", "XML:com.adobe.xmp")
+                    )
+                    if has_exif or has_raw_meta:
+                        return (
+                            "DENY",
+                            f"Outbound image {img.label or '<unnamed>'} still contains EXIF/XMP metadata.",
+                        )
+            except Exception as exc:
+                return (
+                    "DENY",
+                    f"Outbound image {img.label or '<unnamed>'} could not be verified: {exc}",
+                )
+
+        texts = [msg.text, *(tr.content for tr in msg.tool_results)]
+        for text in texts:
+            if not text:
+                continue
+            if _API_KEY_PREFIX_RE.search(text) or any(sec in text for sec in env_secrets):
+                return ("DENY", "Outbound model request contains a potential API key or secret.")
+            for root_path in request.session_root_paths:
+                if root_path and len(root_path) > 3 and root_path in text:
+                    return (
+                        "DENY",
+                        "Outbound model request contains an absolute session directory path.",
+                    )
+            if _ABS_PATH_RE.search(text):
+                return ("DENY", "Outbound model request contains an absolute filesystem path.")
+
+    return ("ALLOW", None)
+
+
+__all__ = ["check_outbound_privacy", "strip_metadata_and_encode"]

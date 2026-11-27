@@ -63,8 +63,15 @@ def test_db_pragmas_and_idempotent_migrations(tmp_path: Path) -> None:
 
         first = db.migrate()
         second = db.migrate()
-        assert first == [1, 2, 3, 4]
+        assert first == [1, 2, 3, 4, 5]
         assert second == []
+
+        # Verify migration 005 memory_rules_meta columns exist
+        mem_cols = {
+            str(r["name"])
+            for r in db.conn.execute("PRAGMA table_info(memory_rules_meta)").fetchall()
+        }
+        assert {"status", "rule_text", "rationale", "created_at", "updated_at"} <= mem_cols
 
         # Verify migration 002 & 003 columns exist
         exif_cols = {

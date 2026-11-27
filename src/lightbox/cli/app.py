@@ -384,6 +384,147 @@ def mcp(
 
 
 @app.command()
+def chat(
+    session_id: Annotated[str, typer.Argument(help="Scanned photo session ID to chat about.")],
+    supervisor: Annotated[
+        bool,
+        typer.Option("--supervisor", help="Start with the structured supervisor review goal."),
+    ] = False,
+    constraint: Annotated[
+        list[str] | None,
+        typer.Option("--constraint", "-c", help="Hard constraint injected on every stage."),
+    ] = None,
+) -> None:
+    """Start an interactive terminal REPL with the built-in Lightbox culling Agent."""
+    from lightbox.agent import AgentRunner
+
+    with LightboxServices.open() as svcs:
+        try:
+            summary = svcs.review.get_session_summary(session_id)
+        except ValueError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from None
+
+        runner = AgentRunner(svcs)
+        typer.echo(
+            f"=== Lightbox Agent Chat ({summary.session.name} · {summary.active_total_photos} photos) ==="
+        )
+        typer.echo("Type a culling request (or 'exit' to quit).")
+
+        def _print_result(res: Any) -> None:
+            if res.todos:
+                typer.echo("  [Plan]")
+                for item in res.todos:
+                    typer.echo(f"    - [{item.get('status', 'pending')}] {item.get('title', '')}")
+            if res.verifier_report:
+                l2 = res.verifier_report.get("layer2", {})
+                flagged = res.verifier_report.get("flagged_photos", [])
+                typer.echo(
+                    f"  [Verifier] layer={res.verifier_report.get('layer')} "
+                    f"status={l2.get('status')} flagged={len(flagged)}"
+                )
+            if res.latest_plan:
+                typer.echo(
+                    f"  [Draft Plan] {res.latest_plan.get('plan_id')} "
+                    f"({res.latest_plan.get('count')} photos) -> {res.latest_plan.get('approve_url')}"
+                )
+            if res.status == "awaiting_user" and res.pending_ask:
+                typer.secho(
+                    f"  [ASK] {res.pending_ask.get('reason')}",
+                    fg=typer.colors.YELLOW,
+                )
+            elif res.error:
+                typer.secho(f"  [Error] {res.error}", fg=typer.colors.RED)
+            elif res.answer:
+                typer.echo(f"\nAssistant ({res.stage} · ${res.spent_usd:.4f}):\n{res.answer}\n")
+
+        agent_session_id: str | None = None
+        if supervisor:
+            res = runner.start_session_sync(
+                session_id,
+                mode="supervisor",
+                constraints=constraint or (),
+            )
+            agent_session_id = res.agent_session_id
+            _print_result(res)
+
+        while True:
+            try:
+                user_line = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                typer.echo("")
+                break
+            if not user_line:
+                continue
+            if user_line.lower() in {"exit", "quit", "/exit", "/quit"}:
+                break
+
+            if agent_session_id is None:
+                res = runner.start_session_sync(
+                    session_id,
+                    mode="chat",
+                    message=user_line,
+                    constraints=constraint or (),
+                )
+                agent_session_id = res.agent_session_id
+            else:
+                res = runner.continue_session_sync(agent_session_id, user_line)
+            _print_result(res)
+
+
+@app.command()
+def memory(
+    action: Annotated[
+        Literal["show", "consolidate"],
+        typer.Argument(help="Memory action: 'show' preferences/rules or 'consolidate' recent overrides."),
+    ] = "show",
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Run consolidation even if fewer than 5 new overrides exist."),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON output."),
+    ] = False,
+) -> None:
+    """Inspect `<APP_DATA_DIR>/preferences.md` or consolidate manual overrides into proposed text rules."""
+    from lightbox.agent import MemoryManager
+    from lightbox.models import ModelError
+
+    with LightboxServices.open() as svcs:
+        mgr = MemoryManager(svcs)
+        if action == "show":
+            state = mgr.get_state()
+            if as_json:
+                typer.echo(json.dumps(state, indent=2, ensure_ascii=False))
+                return
+            typer.echo(f"=== Lightbox Preferences ({svcs.app_paths.preferences_file}) ===")
+            typer.echo(state["preferences_md"].rstrip())
+            typer.echo(
+                f"\nNew overrides since last consolidation: {state['new_override_count']} / "
+                f"{state['min_overrides_threshold']} | Proposed rules awaiting approval: {state['proposed_count']}"
+            )
+            return
+
+        try:
+            res = mgr.consolidate_sync(force=force)
+        except ModelError as exc:
+            typer.secho(f"Consolidation failed: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from None
+
+        if as_json:
+            typer.echo(json.dumps(res.to_dict(), indent=2, ensure_ascii=False))
+            return
+
+        typer.echo(
+            f"Consolidate status: {res.status} "
+            f"(new_overrides={res.new_override_count}, proposed={len(res.proposed_rules)})"
+        )
+        for rule in res.proposed_rules:
+            typer.echo(f"  - [{rule.rule_id}] (proposed) {rule.rule_text}")
+
+
+@app.command()
 def doctor(
     as_json: Annotated[
         bool,
