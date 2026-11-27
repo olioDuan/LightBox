@@ -403,3 +403,95 @@ def test_propose_rule_tool_and_memory_rest_api_endpoints(
         )
         assert put_res.status_code == 200
         assert "Manual rule from textarea" in put_res.json()["preferences_md"]
+
+
+def test_rejecting_accepted_rule_removes_from_preferences_and_prompts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: rejecting an already-accepted rule MUST remove its bullet from preferences.md and prompts."""
+    _clear_keys(monkeypatch)
+    shoot_dir = tmp_path / "shoot"
+    build_demo_dataset(shoot_dir)
+
+    with LightboxServices.open(tmp_path / "home") as svcs:
+        scan = svcs.scan.scan_folder(shoot_dir, max_workers=1)
+        photos = [p for p in svcs.repo.list_photos(scan.session_id) if not p.is_protected]
+
+        fake_agent = _RecordingAgentModel()
+        fake_vlm = _RecordingTriageModel()
+        svcs.override_model_router(
+            ModelRouter(
+                svcs.repo,
+                svcs.app_paths,
+                svcs.config,
+                adapters={"agent": fake_agent, "triage_vlm": fake_vlm},
+            )
+        )
+
+        mgr = MemoryManager(svcs)
+        rule_text = "Always keep dramatic high-contrast monochrome shadows"
+        rec = mgr.propose_manual_rule(rule_text, rationale="test")
+
+        # 1. Accept -> written to preferences.md and injected into Agent & VLM
+        mgr.decide_rule(rec.rule_id, decision="accept")
+        assert rec.rule_id in svcs.review.read_preferences_markdown()
+        assert rule_text in svcs.review.read_preferences_markdown()
+
+        # 2. Reject the same already-accepted rule -> MUST disappear from preferences.md, Agent, and VLM!
+        rej = mgr.decide_rule(rec.rule_id, decision="reject")
+        assert rej.status == "rejected"
+        prefs_after = svcs.review.read_preferences_markdown()
+        assert rec.rule_id not in prefs_after
+        assert rule_text not in prefs_after
+
+        asyncio.run(AgentRunner(svcs).start_session(scan.session_id, mode="chat", message="Check"))
+        assert rule_text not in fake_agent.received_messages[-1][0].text
+
+        svcs.review.set_verdict(photos[0].id, bucket="yellow", source="engine")
+        svcs.triage.run_triage_sync(scan.session_id, max_photos=1)
+        assert rule_text not in fake_vlm.received_messages[-1][0].text
+
+
+def test_preferences_with_absolute_folder_path_does_not_fail_vlm_triage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: folder paths typed into preferences.md are redacted before VLM triage so privacy hook never blocks."""
+    _clear_keys(monkeypatch)
+    shoot_dir = tmp_path / "shoot"
+    build_demo_dataset(shoot_dir)
+
+    with LightboxServices.open(tmp_path / "home") as svcs:
+        scan = svcs.scan.scan_folder(shoot_dir, max_workers=1)
+        photos = [p for p in svcs.repo.list_photos(scan.session_id) if not p.is_protected]
+        for p in photos[:3]:
+            svcs.review.set_verdict(p.id, bucket="yellow", source="engine")
+
+        MemoryManager(svcs).save_preferences(
+            "# Lightbox Preferences\n\n"
+            "- /Users/olio/Clients 下是客户的照片，不要淘汰\n"
+            "- /data/photos/wedding 里的连拍优先保留笑容自然的那张\n"
+        )
+
+        fake_vlm = _RecordingTriageModel()
+        svcs.override_model_router(
+            ModelRouter(
+                svcs.repo,
+                svcs.app_paths,
+                svcs.config,
+                adapters={"triage_vlm": fake_vlm},
+            )
+        )
+
+        res = svcs.triage.run_triage_sync(scan.session_id, max_photos=3)
+        assert res.status == "completed"
+        assert res.failed_count == 0
+        assert res.reviewed_yellow == 3
+        assert len(fake_vlm.received_messages) == 3
+
+        vlm_sys = fake_vlm.received_messages[0][0].text
+        assert "/Users/olio/Clients" not in vlm_sys
+        assert "/data/photos/wedding" not in vlm_sys
+        assert "<redacted_path>" in vlm_sys
+        assert "不要淘汰" in vlm_sys

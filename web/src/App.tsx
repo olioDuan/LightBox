@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import { AgentDrawer } from "./components/AgentDrawer";
+import { Button, Loading, Tabs, type TabItem } from "./components/ui";
+import { Sparkles } from "reicon-react";
 import { getMessages, I18nContext, type Lang } from "./i18n";
 import { InsightsView } from "./views/InsightsView";
 import { PeopleView } from "./views/PeopleView";
@@ -121,111 +123,76 @@ export function App() {
     }
   }
 
+  const navItems: TabItem<"sessions" | "search" | "people" | "insights">[] = [
+    { id: "sessions", label: t.navSessions },
+    { id: "search", label: t.navSearch },
+    { id: "people", label: t.navPeople },
+    { id: "insights", label: t.navRestore },
+  ];
+  const navValue = route.name === "review" ? "sessions" : route.name;
+
   return (
     <I18nContext.Provider value={i18nValue}>
-      <div className="min-h-screen bg-[#1B1C1E] text-[#F3F4F6]">
-        {/* Quiet top navigation bar */}
-        <header className="flex h-[52px] items-center justify-between border-b border-[#33363B] bg-[#1B1C1E] px-5">
-          <div className="flex items-center gap-6">
+      <div className="min-h-screen bg-paper text-ink">
+        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-6 bg-paper px-4 sm:px-8">
+          <div className="flex min-w-0 items-center gap-4 sm:gap-8">
             <button
               type="button"
               onClick={() => navigate("/")}
-              className="text-base font-semibold tracking-tight text-[#F3F4F6]"
+              aria-label={t.appName}
+              className="flex items-center gap-2 text-lg font-semibold tracking-tight text-ink"
             >
-              {t.appName}
+              <span aria-hidden="true" className="h-4 w-4 rounded-[5px] border-[1.5px] border-ink" />
+              <span className="hidden sm:inline">{t.appName}</span>
             </button>
             {authState === "authed" && (
-              <nav className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={() => navigate("/")}
-                  className={`rounded-md px-3 py-1.5 text-sm ${
-                    route.name === "sessions"
-                      ? "bg-[#242629] text-[#F3F4F6]"
-                      : "text-[#9CA3AF] hover:text-[#F3F4F6]"
-                  }`}
-                >
-                  {t.navSessions}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => navigate("/search")}
-                  className={`rounded-md px-3 py-1.5 text-sm ${
-                    route.name === "search"
-                      ? "bg-[#242629] text-[#F3F4F6]"
-                      : "text-[#9CA3AF] hover:text-[#F3F4F6]"
-                  }`}
-                >
-                  {t.navSearch}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => navigate("/people")}
-                  className={`rounded-md px-3 py-1.5 text-sm ${
-                    route.name === "people"
-                      ? "bg-[#242629] text-[#F3F4F6]"
-                      : "text-[#9CA3AF] hover:text-[#F3F4F6]"
-                  }`}
-                >
-                  {t.navPeople}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => navigate("/insights")}
-                  className={`rounded-md px-3 py-1.5 text-sm ${
-                    route.name === "insights"
-                      ? "bg-[#242629] text-[#F3F4F6]"
-                      : "text-[#9CA3AF] hover:text-[#F3F4F6]"
-                  }`}
-                >
-                  {t.navRestore}
-                </button>
+              <nav className="scrollbar-none -mx-1 min-w-0 overflow-x-auto px-1">
+                <Tabs
+                  items={navItems}
+                  value={navValue}
+                  size="sm"
+                  wrap={false}
+                  onChange={(id) =>
+                    navigate(id === "sessions" ? "/" : id === "insights" ? "/insights" : `/${id}`)
+                  }
+                />
               </nav>
             )}
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1">
             {authState === "authed" && (
-              <button
-                type="button"
+              <Button
+                variant={agentOpen ? "primary" : "ghost"}
+                size="sm"
+                icon={Sparkles}
+                aria-pressed={agentOpen}
+                aria-keyshortcuts="Meta+K Control+K"
+                title={`${t.navAgentBtn} ⌘K`}
                 onClick={() => setAgentOpen((prev) => !prev)}
-                className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs transition ${
-                  agentOpen
-                    ? "border-[#5B8DEF]/60 bg-[#5B8DEF]/20 text-[#93C5FD]"
-                    : "border-[#33363B] bg-[#242629] text-[#E5E7EB] hover:bg-[#2C2F34]"
-                }`}
               >
-                <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#5B8DEF]" />
-                <span>{t.navAgentBtn}</span>
-                <kbd className="font-mono text-[10px] text-[#9CA3AF]">⌘K</kbd>
-              </button>
+                <span className="hidden sm:inline">{t.navAgentBtn}</span>
+              </Button>
             )}
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => setLang(lang === "zh-CN" ? "en-US" : "zh-CN")}
-              className="rounded-md border border-[#33363B] px-2.5 py-1 text-xs text-[#D1D5DB] hover:bg-[#242629]"
             >
               {lang === "zh-CN" ? "EN" : "中文"}
-            </button>
+            </Button>
           </div>
         </header>
 
         {authState === "checking" ? (
-          <div className="flex h-[calc(100vh-52px)] items-center justify-center text-sm text-[#9CA3AF]">
-            {t.loading}
-          </div>
+          <Loading label={t.loading} className="h-[calc(100vh-64px)]" />
         ) : authState === "needs_confirm" ? (
-          <div className="mx-auto flex max-w-md flex-col items-start gap-4 px-6 py-24">
-            <h1 className="text-xl font-medium text-[#F3F4F6]">{t.authPromptTitle}</h1>
-            <p className="text-sm leading-relaxed text-[#9CA3AF]">{t.authPromptDesc}</p>
-            {authError && <p className="text-sm text-[#FCA5A5]">{authError}</p>}
-            <button
-              type="button"
-              onClick={() => void handleConfirmLocal()}
-              className="rounded-md bg-[#F3F4F6] px-4 py-2 text-sm font-medium text-[#1B1C1E] hover:bg-white"
-            >
+          <div className="mx-auto flex min-h-[calc(100vh-64px)] max-w-sm flex-col items-center justify-center gap-8 px-6 pb-16 text-center">
+            <h1 className="text-lg font-semibold text-ink">{t.authPromptTitle}</h1>
+            {authError && <p className="text-sm text-mark">{authError}</p>}
+            <Button variant="primary" size="lg" onClick={() => void handleConfirmLocal()}>
               {t.authPromptAction}
-            </button>
+            </Button>
           </div>
         ) : route.name === "review" ? (
           <ReviewView

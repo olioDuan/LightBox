@@ -9,7 +9,99 @@ import {
   type PhotoItem,
 } from "../api";
 import { QuarantineModal } from "../components/QuarantineModal";
+import { verdictForPhoto } from "../components/photoMarks";
+import {
+  Button,
+  Dialog,
+  EmptyState,
+  Icon,
+  IconButton,
+  Kbd,
+  Loading,
+  Notice,
+  NoticeDock,
+  ProgressLine,
+  Tabs,
+  StatusDot,
+  Thumb,
+  VERDICT_STYLE,
+  useJustMarked,
+  type ReiconGlyph,
+  type Verdict,
+} from "../components/ui";
 import { useI18n, type Messages } from "../i18n";
+import {
+  ArrowLeft,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  HelpCircle,
+  Lock,
+  Maximize,
+  SkipNext,
+  Sparkles,
+  Trash,
+  Undo,
+  X,
+} from "reicon-react";
+
+/** Verdict action: tinted at rest, filled when hovered or when it is the photo's current verdict. */
+function VerdictButton({
+  verdict,
+  icon: Glyph,
+  label,
+  hotkey,
+  current,
+  disabled,
+  onClick,
+}: {
+  verdict: Verdict;
+  icon: ReiconGlyph;
+  label: string;
+  hotkey: string;
+  current: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  const v = VERDICT_STYLE[verdict];
+  const filled = current && verdict !== "skip";
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      aria-pressed={current}
+      aria-keyshortcuts={hotkey}
+      onClick={onClick}
+      data-verdict={verdict}
+      className={`verdict-btn group inline-flex h-12 min-w-[112px] items-center justify-center gap-2 rounded-btn px-4 text-sm font-semibold transition-[background-color,color,border-color] duration-150 disabled:pointer-events-none disabled:opacity-40 ${
+        verdict === "skip" ? "border-[1.5px] border-dashed" : ""
+      }`}
+      style={
+        {
+          "--v": v.color,
+          "--v-soft": v.soft,
+          "--v-ink": v.ink,
+          background: filled ? v.color : verdict === "skip" ? "transparent" : v.soft,
+          color: filled ? (verdict === "unsure" ? "var(--color-ink)" : "#fff") : v.ink,
+          borderColor: verdict === "skip" ? (current ? "var(--color-ink-2)" : v.color) : undefined,
+        } as React.CSSProperties
+      }
+    >
+      <Glyph size={18} strokeWidth={verdict === "skip" ? 1.5 : 2} />
+      <span>{label}</span>
+      <kbd className="ml-1 font-sans text-xs font-medium opacity-60">{hotkey}</kbd>
+    </button>
+  );
+}
+
+/** i18n strip labels carry their own glyph prefix (✓ / ? / ✕); the UI draws marks instead. */
+function plainLabel(label: string | null): string {
+  return (label ?? "").replace(/^[✓?✕×]\s*/, "");
+}
+
+function plainLink(label: string): string {
+  return label.replace(/\s*→\s*$/, "");
+}
 
 type FilterTab =
   | "all"
@@ -140,6 +232,7 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const positionedTokenRef = useRef<number>(0);
+  const [justMarkedId, setJustMarkedId] = useJustMarked();
 
   // Reset per-session state when switching sessions
   useEffect(() => {
@@ -350,7 +443,7 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
     horizontal: true,
     count: photos.length,
     getScrollElement: () => stripParentRef.current,
-    estimateSize: () => 124,
+    estimateSize: () => 120,
     overscan: 8,
   });
 
@@ -422,6 +515,7 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
         // Once explicitly tagged (keep / unsure / reject), clear skipped flag and record Undo
         setSkippedIds((prev) => prev.filter((id) => id !== photo.photo_id));
         setLastAction({ kind: "verdict", photoId: photo.photo_id });
+        setJustMarkedId(photo.photo_id);
         setLastAppliedPlanId(null);
 
         if (wasRed && bucket === "normal" && !reasonTag) {
@@ -455,7 +549,7 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
         setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [clampedIdx, photos.length, refreshSession, summary, t, tab],
+    [clampedIdx, photos.length, refreshSession, setJustMarkedId, summary, t, tab],
   );
 
   const handleSkip = useCallback(
@@ -717,232 +811,177 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
     yellowCount,
   ]);
 
-  return (
-    <div className="flex h-[calc(100vh-52px)] flex-col bg-[#1B1C1E]">
-      {/* Top workspace toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#33363B] bg-[#242629] px-5 py-2.5">
-        <div className="flex flex-wrap items-center gap-2.5">
-          <button
-            type="button"
-            onClick={onBack}
-            className="text-sm text-[#9CA3AF] hover:text-[#F3F4F6]"
-          >
-            {t.backToSessions}
-          </button>
-          <span className="text-[#4B5563]">/</span>
-          <span className="text-sm font-medium text-[#F3F4F6]">
-            {summary?.session.name ?? sessionId}
-          </span>
+  const progressPct =
+    summary && summary.active_total_photos > 0
+      ? Math.round(((summary.active_total_photos - unreviewedCount) / summary.active_total_photos) * 100)
+      : 0;
+  const activeVisual = activePhoto
+    ? getSlideVisual(activePhoto, skippedSet.has(activePhoto.photo_id), t)
+    : null;
+  const activeVerdict = activePhoto
+    ? verdictForPhoto(activePhoto, skippedSet.has(activePhoto.photo_id))
+    : null;
 
-          <div className="ml-1 flex flex-wrap items-center gap-1">
-            {tabs.map((item) => {
-              const active = tab === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => {
-                    if (item.id === "all") {
-                      enterAllTab();
-                    } else {
-                      setShowCompleteModal(false);
-                      setTab(item.id);
-                      setSelectedIdx(0);
-                      setRescueBannerPhotoId(null);
-                    }
-                  }}
-                  className={`rounded-md px-2.5 py-1 text-xs tabular-nums ${
-                    active
-                      ? "bg-[#F3F4F6] font-medium text-[#1B1C1E]"
-                      : "text-[#D1D5DB] hover:bg-[#2C2F34]"
+  return (
+    <div className="flex h-[calc(100vh-64px)] flex-col bg-paper">
+      {/* Row 1 — back arrow sits under the logo mark, the session name under the wordmark */}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 sm:px-8">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-6 gap-y-2">
+          <div className="flex min-w-0 items-center">
+            <IconButton
+              icon={ArrowLeft}
+              label={t.backToSessions}
+              onClick={onBack}
+              className="-ml-3"
+            />
+            <h1 className="-ml-1 max-w-[20rem] truncate text-lg font-semibold text-ink">
+              {summary?.session.name ?? sessionId}
+            </h1>
+          </div>
+          {summary && tab !== "bursts" && (
+            <div className="flex min-w-0 items-center gap-4 text-sm tabular-nums">
+              <ProgressLine value={progressPct} className="w-24 shrink-0" />
+              {tab === "revisit" ? (
+                <span className="truncate font-medium text-ink">{t.revisitBanner(photos.length)}</span>
+              ) : unreviewedCount === 0 ? (
+                <span
+                  className={`truncate font-medium ${
+                    actionableRed > 0
+                      ? "text-reject-ink"
+                      : yellowCount > 0
+                        ? "text-unsure-ink"
+                        : "text-keep-ink"
                   }`}
                 >
-                  {item.label}
-                  {item.count !== undefined ? ` ${item.count}` : ""}
-                </button>
-              );
-            })}
-          </div>
+                  {actionableRed > 0
+                    ? t.progressDoneWithTrash(actionableRed)
+                    : yellowCount > 0
+                      ? t.progressDoneWithUnsure(yellowCount)
+                      : t.progressAllDone}
+                </span>
+              ) : (
+                <span className="truncate text-ink-2">
+                  {t.progressSummary(summary.reviewed_count, unreviewedCount, actionableRed, yellowCount)}
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
-        <button
-          type="button"
-          disabled={actionableRed === 0}
-          onClick={() => void handleOpenQuarantine()}
-          className={`shrink-0 rounded-md px-3.5 py-1.5 text-sm font-medium tabular-nums ${
-            actionableRed > 0
-              ? "bg-[#DC4C46] text-white hover:bg-[#C63E38]"
-              : "cursor-not-allowed border border-[#33363B] bg-[#1B1C1E] text-[#6B7280]"
-          }`}
-        >
-          {t.oneClickWithCount(actionableRed)}
-        </button>
-      </div>
-
-      {/* Always-visible quiet review progress strip */}
-      {summary && tab !== "bursts" && (
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#33363B] bg-[#1F2124] px-5 py-1.5 text-xs text-[#9CA3AF] tabular-nums">
-          <div className="flex flex-wrap items-center gap-4">
-            {tab === "revisit" ? (
-              <span className="text-[#FCD34D]">{t.revisitBanner(photos.length)}</span>
-            ) : unreviewedCount === 0 ? (
-              <span
-                className={
-                  actionableRed > 0
-                    ? "text-[#FCA5A5]"
-                    : yellowCount > 0
-                      ? "text-[#FCD34D]"
-                      : "text-[#86EFAC]"
-                }
-              >
-                {actionableRed > 0
-                  ? t.progressDoneWithTrash(actionableRed)
-                  : yellowCount > 0
-                    ? t.progressDoneWithUnsure(yellowCount)
-                    : t.progressAllDone}
-              </span>
-            ) : (
-              <span>
-                {t.progressSummary(
-                  summary.reviewed_count,
-                  unreviewedCount,
-                  actionableRed,
-                  yellowCount,
-                )}
-              </span>
-            )}
-            {tab === "all" && leftRedCount > 0 && (
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedIdx(0);
-                  setRescueBannerPhotoId(null);
-                }}
-                className="text-[#FCA5A5]/90 hover:underline"
-              >
-                {t.leftRedGroupedHint(leftRedCount)}
-              </button>
-            )}
-            {quarantinedCount > 0 && (
-              <button
-                type="button"
-                onClick={onGoInsights}
-                className="text-[#93C5FD] hover:underline"
-              >
-                {t.alreadyQuarantinedLink(quarantinedCount)}
-              </button>
-            )}
-          </div>
+        <div className="flex shrink-0 items-center gap-2">
           {tab !== "revisit" &&
+            tab !== "bursts" &&
             sessionStats.undecided.length > 0 &&
             (sessionStats.unsure > 0 ||
               sessionStats.skippedOnly > 0 ||
               sessionStats.kept > 0 ||
               sessionStats.reject > 0) && (
-              <button
-                type="button"
-                onClick={enterRevisitPass}
-                className="rounded border border-[#D99B26]/50 bg-[#D99B26]/10 px-2.5 py-0.5 text-[#FCD34D] hover:bg-[#D99B26]/20"
-              >
+              <Button variant="secondary" onClick={enterRevisitPass}>
                 {t.progressRevisitBtn(sessionStats.undecided.length)}
-              </button>
+              </Button>
             )}
+          {actionableRed > 0 && (
+            <Button variant="mark" icon={Trash} onClick={() => void handleOpenQuarantine()}>
+              {t.oneClickWithCount(actionableRed)}
+            </Button>
+          )}
         </div>
-      )}
+      </div>
 
-      {/* Action feedback toast with instant 1-click Undo or Open Trash Folder */}
-      {toast && (
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#3D9A6B]/40 bg-[#3D9A6B]/15 px-5 py-2 text-xs text-[#A7F3D0]">
-          <span>{toast}</span>
-          <div className="flex items-center gap-2">
-            {lastAction && (
-              <button
-                type="button"
-                onClick={() => void handleUndo()}
-                className="rounded border border-[#A7F3D0]/40 px-2 py-0.5 text-[#ECFDF5] hover:bg-[#3D9A6B]/30"
-              >
-                {t.actionUndo} (⌘Z)
-              </button>
-            )}
-            {lastAppliedPlanId && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void api.openPlanFolder(lastAppliedPlanId)}
-                  className="rounded border border-[#A7F3D0]/40 px-2 py-0.5 text-[#ECFDF5] hover:bg-[#3D9A6B]/30"
-                >
-                  {t.openTrashFolder}
-                </button>
-                <button
-                  type="button"
-                  onClick={onGoInsights}
-                  className="rounded border border-[#A7F3D0]/40 px-2 py-0.5 text-[#ECFDF5] hover:bg-[#3D9A6B]/30"
-                >
-                  {t.goTrashBin}
-                </button>
-              </>
-            )}
-          </div>
+      {/* Row 2 — filters as one segmented control, each verdict carrying its color */}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 pb-4 pt-2 sm:px-8">
+        <Tabs
+          variant="segmented"
+          value={tab}
+          items={tabs.map((item) => ({
+            id: item.id,
+            label: item.label,
+            count: item.count,
+            attention: item.id === "red" && (item.count ?? 0) > 0,
+            verdict:
+              item.id === "yellow"
+                ? "unsure"
+                : item.id === "red"
+                  ? "reject"
+                  : item.id === "kept"
+                    ? "keep"
+                    : item.id === "exempt"
+                      ? "protected"
+                      : undefined,
+          }))}
+          onChange={(id) => {
+            if (id === "all") {
+              enterAllTab();
+            } else {
+              setShowCompleteModal(false);
+              setTab(id);
+              setSelectedIdx(0);
+              setRescueBannerPhotoId(null);
+            }
+          }}
+        />
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+          {tab === "all" && leftRedCount > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedIdx(0);
+                setRescueBannerPhotoId(null);
+              }}
+              className="inline-flex items-center gap-1 text-ink-2 hover:text-ink"
+            >
+              <StatusDot verdict="reject" className="-ml-2" />
+              {t.leftRedGroupedHint(leftRedCount)}
+            </button>
+          )}
+          {quarantinedCount > 0 && (
+            <button
+              type="button"
+              onClick={onGoInsights}
+              className="inline-flex items-center gap-1 text-ink-2 hover:text-ink"
+            >
+              <Icon as={Trash} />
+              {plainLink(t.alreadyQuarantinedLink(quarantinedCount))}
+            </button>
+          )}
         </div>
-      )}
-      {error && (
-        <div className="border-b border-[#DC4C46]/40 bg-[#DC4C46]/15 px-5 py-2 text-xs text-[#FCA5A5]">
-          {t.errorPrefix}
-          {error}
-        </div>
-      )}
+      </div>
 
       {/* Main Content */}
       {tab === "bursts" ? (
-        <div className="flex flex-1 flex-col overflow-hidden">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#33363B] bg-[#202530] px-5 py-2.5 text-xs text-[#BFDBFE]">
-            <span>{t.burstBanner}</span>
-            {activeBurst && (
-              <div className="flex items-center gap-2">
-                <span className="tabular-nums text-[#F3F4F6]">
-                  {t.burstGroupLabel(clampedBurstIdx + 1, bursts.length)}
-                </span>
-                <span className="rounded bg-[#2C2F34] px-2 py-0.5 text-[#D1D5DB]">
-                  {activeBurst.confirmed ? t.burstConfirmed : t.burstUnconfirmed}
-                </span>
-              </div>
-            )}
-          </div>
+        <div className="flex min-h-0 flex-1 flex-col bg-table px-4 py-6 sm:px-8">
+          {activeBurst && (
+            <div className="flex items-center gap-4 pb-6 text-sm tabular-nums">
+              <span className="font-semibold text-ink">
+                {t.burstGroupLabel(clampedBurstIdx + 1, bursts.length)}
+              </span>
+              <span className={activeBurst.confirmed ? "text-ink-2" : "text-ink-3"}>
+                {activeBurst.confirmed ? t.burstConfirmed : t.burstUnconfirmed}
+              </span>
+            </div>
+          )}
 
           {bursts.length === 0 ? (
-            <div className="flex flex-1 items-center justify-center text-sm text-[#9CA3AF]">
-              {t.burstNoGroups}
-            </div>
+            <EmptyState title={t.burstNoGroups} className="flex-1" />
           ) : (
-            <div className="flex flex-1 flex-col overflow-hidden p-5">
-              <div className="grid flex-1 grid-cols-2 gap-4 overflow-hidden lg:grid-cols-4">
+            <>
+              <div className="grid min-h-0 flex-1 grid-cols-2 content-center gap-4 overflow-y-auto lg:grid-cols-4">
                 {activeBurst.members.slice(0, 4).map((member, i) => {
                   const chosen = member.photo_id === selectedBurstPickId;
                   return (
                     <button
                       key={member.photo_id}
                       type="button"
+                      aria-pressed={chosen}
                       onClick={() => setSelectedBurstPickId(member.photo_id)}
-                      className={`flex flex-col overflow-hidden rounded-md border bg-[#242629] text-left ${
-                        chosen ? "border-[#3D9A6B] ring-2 ring-[#3D9A6B]/50" : "border-[#33363B]"
-                      }`}
+                      className="group flex min-h-0 flex-col gap-2 text-left"
                     >
-                      <div className="flex items-center justify-between border-b border-[#33363B] px-3 py-1.5 text-xs">
-                        <span className="font-medium text-[#F3F4F6] tabular-nums">#{i + 1}</span>
-                        <div className="flex items-center gap-1.5">
-                          {member.rank === 1 && (
-                            <span className="rounded bg-[#3D9A6B]/20 px-1.5 py-0.5 text-[#86EFAC]">
-                              {t.burstRecommended}
-                            </span>
-                          )}
-                          {chosen && (
-                            <span className="rounded bg-[#3D9A6B] px-1.5 py-0.5 text-white">
-                              {t.burstSelected}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="flex min-h-[220px] flex-1 items-center justify-center overflow-hidden bg-[#161719] p-2">
+                      <div
+                        key={chosen ? `pick-${member.photo_id}` : member.photo_id}
+                        className={`relative aspect-[4/3] w-full overflow-hidden rounded-tile border-2 bg-paper bg-clip-padding transition-[border-color] duration-200 ${
+                          chosen ? "verdict-pop border-keep" : "border-transparent group-hover:border-line"
+                        }`}
+                      >
                         <img
                           src={photoImageUrl(
                             member.photo_id,
@@ -950,98 +989,93 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
                             burstZoomed ? "sharpest" : undefined,
                           )}
                           alt=""
-                          className="max-h-full max-w-full object-contain"
+                          className="h-full w-full object-contain"
                         />
+                        {chosen && (
+                          <span className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-keep text-white">
+                            <Check size={16} strokeWidth={2} />
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 text-sm">
+                        <Kbd className={chosen ? "bg-keep text-white" : "bg-paper"}>{i + 1}</Kbd>
+                        {member.rank === 1 && (
+                          <span className="inline-flex items-center gap-1 text-ink-2">
+                            <Icon as={Sparkles} />
+                            {t.burstRecommended}
+                          </span>
+                        )}
+                        {chosen && <span className="ml-auto font-medium text-keep-ink">{t.burstSelected}</span>}
                       </div>
                     </button>
                   );
                 })}
               </div>
 
-              <div className="mt-4 flex items-center justify-between">
-                <button
-                  type="button"
+              <div className="flex items-center justify-between gap-4 pt-6">
+                <Button
+                  variant={burstZoomed ? "primary" : "secondary"}
+                  icon={Maximize}
+                  aria-pressed={burstZoomed}
                   onClick={() => setBurstZoomed((z) => !z)}
-                  className="rounded-md border border-[#33363B] bg-[#242629] px-3.5 py-2 text-xs text-[#F3F4F6] hover:bg-[#2C2F34]"
                 >
                   {t.burstSyncZoom}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleConfirmBurst()}
-                  className="rounded-md bg-[#3D9A6B] px-4 py-2 text-sm font-medium text-white hover:bg-[#32825A]"
-                >
+                </Button>
+                <Button variant="primary" onClick={() => void handleConfirmBurst()}>
                   {t.burstConfirmNext}
-                </button>
+                </Button>
               </div>
-            </div>
+            </>
           )}
         </div>
       ) : (
-        <div className="flex flex-1 flex-col overflow-hidden">
-          {/* Center Loupe Stage */}
-          <div className="relative flex flex-1 items-center justify-center overflow-hidden bg-[#161719] p-4">
+        <div className="flex min-h-0 flex-1 flex-col">
+          {/* Loupe stage */}
+          <div className="intent relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-table p-6 sm:px-20">
             {photosLoading ? (
-              <span className="text-sm text-[#9CA3AF]">{t.loading}</span>
+              <Loading label={t.loading} />
             ) : !activePhoto ? (
-              <div className="max-w-md space-y-4 rounded-lg border border-[#33363B] bg-[#242629] p-6 text-center">
-                <h2 className="text-lg font-medium text-[#F3F4F6]">
+              <div className="flex max-w-md flex-col items-center gap-4 text-center">
+                <h2 className="text-lg font-semibold text-ink">
                   {unreviewedCount === 0 ? t.reviewCompleteTitle : t.noPhotosInBucket}
                 </h2>
-                <p className="text-sm text-[#9CA3AF] tabular-nums">
+                <p className="text-sm text-ink-2 tabular-nums">
                   {unreviewedCount > 0
                     ? t.reviewRemainingDesc(unreviewedCount, actionableRed)
                     : actionableRed > 0 || yellowCount > 0
                       ? t.reviewCompleteDesc(keptCount, yellowCount, actionableRed)
                       : t.reviewCompleteClean(keptCount)}
                 </p>
-                <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
+                <div className="flex flex-wrap items-center justify-center gap-2 pt-4">
                   {tab !== "all" && (summary?.active_total_photos ?? 0) > 0 && (
-                    <button
-                      type="button"
-                      onClick={enterAllTab}
-                      className="rounded-md bg-[#F3F4F6] px-4 py-2 text-sm font-medium text-[#1B1C1E] hover:bg-white"
-                    >
+                    <Button variant="primary" onClick={enterAllTab}>
                       {t.reviewViewAll}
-                    </button>
+                    </Button>
                   )}
                   {actionableRed > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => void handleOpenQuarantine()}
-                      className="rounded-md bg-[#DC4C46] px-4 py-2 text-sm font-medium text-white hover:bg-[#C63E38] tabular-nums"
-                    >
+                    <Button variant="mark" icon={Trash} onClick={() => void handleOpenQuarantine()}>
                       {t.reviewCompleteConfirm(actionableRed)}
-                    </button>
+                    </Button>
                   )}
                   {yellowCount > 0 && tab !== "yellow" && (
-                    <button
-                      type="button"
+                    <Button
+                      variant="secondary"
                       onClick={() => {
                         setTab("yellow");
                         setSelectedIdx(0);
                       }}
-                      className="rounded-md border border-[#D99B26]/60 bg-[#D99B26]/15 px-4 py-2 text-sm font-medium text-[#FCD34D] hover:bg-[#D99B26]/25 tabular-nums"
                     >
                       {t.reviewCompleteUnsure(yellowCount)}
-                    </button>
+                    </Button>
                   )}
                   {tab === "unreviewed" && (summary?.active_total_photos ?? 0) > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => void handleResetReview()}
-                      className="rounded-md border border-[#33363B] px-4 py-2 text-sm text-[#D1D5DB] hover:bg-[#2C2F34]"
-                    >
+                    <Button variant="ghost" onClick={() => void handleResetReview()}>
                       {t.resetReview}
-                    </button>
+                    </Button>
                   )}
-                  <button
-                    type="button"
-                    onClick={onBack}
-                    className="rounded-md border border-[#33363B] px-4 py-2 text-sm text-[#D1D5DB] hover:bg-[#2C2F34]"
-                  >
+                  <Button variant="ghost" onClick={onBack}>
                     {t.backToSessions}
-                  </button>
+                  </Button>
                 </div>
               </div>
             ) : (
@@ -1049,24 +1083,16 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
                 {photos.length > 1 && (
                   <button
                     type="button"
-                    aria-label="Previous photo"
+                    aria-label={t.uiPrevPhoto}
+                    title={t.uiPrevPhoto}
                     disabled={clampedIdx <= 0}
                     onClick={() => {
                       setSelectedIdx((i) => Math.max(0, i - 1));
                       setRescueBannerPhotoId(null);
                     }}
-                    className="absolute left-4 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-white/15 bg-black/50 text-[#F3F4F6] transition hover:bg-black/75 disabled:cursor-not-allowed disabled:opacity-25"
+                    className="reveal absolute left-4 top-1/2 z-10 flex h-12 w-12 -translate-y-1/2 items-center justify-center rounded-full bg-paper text-ink transition hover:bg-table-2 disabled:invisible sm:left-6"
                   >
-                    <svg
-                      aria-hidden="true"
-                      viewBox="0 0 20 20"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      className="h-5 w-5"
-                    >
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M12.5 4.5 7 10l5.5 5.5" />
-                    </svg>
+                    <Icon as={ChevronLeft} />
                   </button>
                 )}
 
@@ -1074,136 +1100,131 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
                   key={activePhoto.photo_id}
                   src={photoImageUrl(activePhoto.photo_id, "loupe")}
                   alt={activePhoto.stem}
-                  className="max-h-full max-w-full select-none object-contain"
+                  className="loupe-enter max-h-full max-w-full select-none rounded-[4px] object-contain"
                 />
 
                 {photos.length > 1 && (
                   <button
                     type="button"
-                    aria-label="Next photo"
+                    aria-label={t.uiNextPhoto}
+                    title={t.uiNextPhoto}
                     disabled={clampedIdx >= photos.length - 1}
                     onClick={() => {
                       setSelectedIdx((i) => Math.min(photos.length - 1, i + 1));
                       setRescueBannerPhotoId(null);
                     }}
-                    className="absolute right-4 top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-white/15 bg-black/50 text-[#F3F4F6] transition hover:bg-black/75 disabled:cursor-not-allowed disabled:opacity-25"
+                    className="reveal absolute right-4 top-1/2 z-10 flex h-12 w-12 -translate-y-1/2 items-center justify-center rounded-full bg-paper text-ink transition hover:bg-table-2 disabled:invisible sm:right-6"
                   >
-                    <svg
-                      aria-hidden="true"
-                      viewBox="0 0 20 20"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      className="h-5 w-5"
-                    >
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 4.5 13 10l-5.5 5.5" />
-                    </svg>
+                    <Icon as={ChevronRight} />
                   </button>
                 )}
               </>
             )}
           </div>
 
-          {/* Compact Reason + 5-Action Bar */}
+          {/* Caption + verdict bar */}
           {activePhoto && (
-            <div className="border-t border-[#33363B] bg-[#242629] px-5 py-2.5">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex min-w-0 flex-wrap items-center gap-2.5 text-xs">
-                  <span className="rounded bg-[#1B1C1E] px-2 py-0.5 font-mono font-medium text-[#F3F4F6] tabular-nums">
+            <div className="bg-paper px-4 py-4 sm:px-8">
+              <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-4">
+                <div className="flex min-w-0 flex-1 items-center gap-4 text-sm tabular-nums">
+                  <span className="text-lg font-semibold text-ink">
                     {formatSeq(activePhoto.seq_no, totalForSeq)}
                   </span>
-                  <span className="font-medium text-[#F3F4F6]">{activePhoto.stem}</span>
-                  <span className="tabular-nums text-[#9CA3AF]">
-                    ({clampedIdx + 1} / {photos.length})
-                  </span>
-                  {(() => {
-                    const visual = getSlideVisual(
-                      activePhoto,
-                      skippedSet.has(activePhoto.photo_id),
-                      t,
-                    );
-                    return visual.label ? (
-                      <span
-                        className={`rounded px-2 py-0.5 font-medium ${
-                          activePhoto.bucket === "red"
-                            ? "border border-[#DC4C46]/60 bg-[#DC4C46]/20 text-[#FCA5A5]"
-                            : `bg-[#1B1C1E] ${visual.labelClass}`
-                        }`}
-                      >
-                        {visual.label}
+                  <div className="min-w-0">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="truncate font-medium text-ink">{activePhoto.stem}</span>
+                      <span className="shrink-0 text-ink-3">
+                        {clampedIdx + 1} / {photos.length}
                       </span>
-                    ) : null;
-                  })()}
-                  {activePhoto.reason_labels.length > 0 && (
-                    <span className="text-[#9CA3AF]">
-                      {activePhoto.reason_labels.join("；")}
-                    </span>
-                  )}
+                    </div>
+                    <div className="flex min-w-0 items-center gap-2 text-ink-2">
+                      {activeVisual?.label && activeVerdict && (
+                        <span
+                          className="inline-flex shrink-0 items-center gap-1 font-medium"
+                          style={{ color: VERDICT_STYLE[activeVerdict].ink }}
+                        >
+                          {activeVerdict === "protected" ? (
+                            <Icon as={Lock} className="-ml-1" />
+                          ) : (
+                            <StatusDot verdict={activeVerdict} className="-ml-2" />
+                          )}
+                          {plainLabel(activeVisual.label)}
+                        </span>
+                      )}
+                      {activePhoto.reason_labels.length > 0 && (
+                        <span className="truncate" title={activePhoto.reason_labels.join("；")}>
+                          {activePhoto.reason_labels.join("；")}
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2 text-xs">
-                  <button
-                    type="button"
+                <div className="flex flex-wrap items-center gap-2">
+                  <VerdictButton
+                    verdict="keep"
+                    icon={Check}
+                    label={t.actionKeep}
+                    hotkey="P"
+                    current={activeVerdict === "keep"}
                     onClick={() => void applyVerdict(activePhoto, "normal")}
-                    className="rounded border border-[#3D9A6B]/60 bg-[#3D9A6B]/15 px-3 py-1.5 font-medium text-[#86EFAC] hover:bg-[#3D9A6B]/25"
-                  >
-                    {t.actionKeep} (P)
-                  </button>
-                  <button
-                    type="button"
+                  />
+                  <VerdictButton
+                    verdict="unsure"
+                    icon={HelpCircle}
+                    label={t.actionUnsure}
+                    hotkey="U"
+                    current={activeVerdict === "unsure"}
                     onClick={() => void applyVerdict(activePhoto, "yellow")}
-                    className="rounded border border-[#D99B26]/60 bg-[#D99B26]/15 px-3 py-1.5 font-medium text-[#FCD34D] hover:bg-[#D99B26]/25"
-                  >
-                    {t.actionUnsure} (U)
-                  </button>
-                  <button
-                    type="button"
+                  />
+                  <VerdictButton
+                    verdict="skip"
+                    icon={SkipNext}
+                    label={t.actionSkip}
+                    hotkey="S"
+                    current={activeVerdict === "skip"}
                     onClick={() => handleSkip(activePhoto)}
-                    className="rounded border border-[#33363B] bg-[#1B1C1E] px-3 py-1.5 text-[#D1D5DB] hover:bg-[#2C2F34]"
-                  >
-                    {t.actionSkip} (S)
-                  </button>
-                  <button
-                    type="button"
+                  />
+                  <VerdictButton
+                    verdict="reject"
+                    icon={X}
+                    label={t.actionReject}
+                    hotkey="X"
+                    current={activeVerdict === "reject"}
                     disabled={activePhoto.is_protected}
                     onClick={() => void applyVerdict(activePhoto, "red")}
-                    className="rounded border border-[#DC4C46]/60 bg-[#DC4C46]/15 px-3 py-1.5 font-medium text-[#FCA5A5] hover:bg-[#DC4C46]/25 disabled:opacity-40"
-                  >
-                    {t.actionReject} (X)
-                  </button>
-                  <button
-                    type="button"
+                  />
+                  <IconButton
+                    icon={Undo}
+                    label={`${t.actionUndo} ⌘Z`}
                     onClick={() => void handleUndo(activePhoto.photo_id)}
-                    className="rounded border border-[#33363B] bg-[#1B1C1E] px-2.5 py-1.5 text-[#9CA3AF] hover:bg-[#2C2F34] hover:text-[#F3F4F6]"
-                  >
-                    {t.actionUndo} (⌘Z)
-                  </button>
+                  />
                 </div>
               </div>
 
-              {/* Non-blocking quick rescue reason strip when rescuing a red photo */}
+              {/* Optional rescue reason after pulling a photo back from the reject pile */}
               {rescueBannerPhotoId === activePhoto.photo_id && (
-                <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-[#33363B] pt-2 text-xs">
-                  <span className="text-[#9CA3AF]">{t.rescueReasonPrompt}</span>
+                <div className="fade-enter mt-4 flex flex-wrap items-center gap-2 text-sm">
+                  <span className="mr-2 text-ink-2">{t.rescueReasonPrompt}</span>
                   {t.rescueReasons.map((r) => (
-                    <button
+                    <Button
                       key={r.tag}
-                      type="button"
+                      variant="secondary"
+                      size="sm"
                       onClick={() => void applyVerdict(activePhoto, "normal", r.tag)}
-                      className="rounded border border-[#33363B] bg-[#1B1C1E] px-2.5 py-1 text-[#D1D5DB] hover:bg-[#2C2F34]"
                     >
                       {r.label}
-                    </button>
+                    </Button>
                   ))}
                 </div>
               )}
             </div>
           )}
 
-          {/* Virtualized Bottom Filmstrip — Slide-Mount Cards + Mouse-Wheel Horizontal Scroll */}
+          {/* Virtualized filmstrip — every frame framed in its verdict color */}
           <div
             ref={stripParentRef}
-            className="h-32 shrink-0 overflow-x-auto border-t border-[#33363B] bg-[#1B1C1E] px-3 py-2"
+            className="scrollbar-none h-[124px] shrink-0 overflow-x-auto bg-paper px-4 pb-4 sm:px-8"
           >
             <div
               className="relative h-full"
@@ -1216,10 +1237,13 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
                 const visual = getSlideVisual(item, skippedSet.has(item.photo_id), t);
                 const isPartitionBoundary =
                   tab === "all" && leftRedCount > 0 && vItem.index === leftRedCount;
+                const verdict = verdictForPhoto(item, skippedSet.has(item.photo_id));
                 return (
                   <button
                     key={item.photo_id}
                     type="button"
+                    aria-current={isSelected ? "true" : undefined}
+                    aria-label={`${formatSeq(item.seq_no, totalForSeq)} ${item.stem} ${plainLabel(visual.label)}`}
                     onClick={() => {
                       setSelectedIdx(vItem.index);
                       setRescueBannerPhotoId(null);
@@ -1232,45 +1256,38 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
                       height: "100%",
                       transform: `translateX(${vItem.start}px)`,
                     }}
-                    className={`group flex flex-col overflow-hidden rounded border bg-[#242629] ${
-                      visual.borderClass
-                    } ${isSelected ? "ring-2 ring-[#F3F4F6]" : ""} ${
-                      isPartitionBoundary ? "shadow-[-5px_0_0_0_rgba(220,76,70,0.45)]" : ""
-                    }`}
+                    className="group flex flex-col gap-1 pt-1 text-left"
                   >
-                    <div className="relative min-h-0 flex-1 w-full overflow-hidden bg-[#141517]">
-                      <img
-                        src={photoImageUrl(item.photo_id, "grid")}
-                        alt=""
-                        loading="lazy"
-                        className={`h-full w-full object-cover transition ${
-                          visual.isFinalized
-                            ? isSelected
-                              ? "grayscale-[45%] brightness-90"
-                              : "grayscale opacity-60 group-hover:grayscale-[30%] group-hover:opacity-90"
-                            : ""
-                        }`}
+                    {isPartitionBoundary && (
+                      <span
+                        aria-hidden="true"
+                        className="absolute -left-1 top-1 h-20 w-[2px] rounded-full bg-reject"
                       />
-                      {visual.isFinalized && (
-                        <div
-                          className={`pointer-events-none absolute inset-0 transition ${
-                            isSelected
-                              ? "bg-[#6B7280]/20"
-                              : "bg-[#6B7280]/40 group-hover:bg-[#6B7280]/15"
-                          }`}
-                        />
-                      )}
-                    </div>
-                    <div className="flex h-5 w-full shrink-0 items-center justify-between border-t border-[#2E3136] bg-[#18191B] px-1.5 text-[10px] leading-none tabular-nums">
-                      <span className="font-mono text-[#9CA3AF]">
+                    )}
+                    <Thumb
+                      key={`${item.photo_id}:${verdict ?? "none"}`}
+                      src={photoImageUrl(item.photo_id, "grid")}
+                      verdict={verdict}
+                      pop={justMarkedId === item.photo_id}
+                      veiled={visual.isFinalized && !isSelected}
+                      className={`h-20 w-full transition-[box-shadow,transform] duration-200 ${
+                        isSelected
+                          ? "shadow-[0_0_0_2px_var(--color-paper),0_0_0_4px_var(--color-ink)]"
+                          : "group-hover:-translate-y-0.5"
+                      }`}
+                    />
+                    <span className="flex h-5 items-center justify-between px-1 text-xs tabular-nums">
+                      <span className={isSelected ? "font-semibold text-ink" : "text-ink-3"}>
                         {formatSeq(item.seq_no, totalForSeq)}
                       </span>
-                      {visual.label && (
-                        <span className={`font-medium ${visual.labelClass}`}>
-                          {visual.label}
+                      {verdict === "protected" ? (
+                        <Lock size={14} strokeWidth={1.5} className="text-ink-3" />
+                      ) : verdict ? (
+                        <span className="font-medium" style={{ color: VERDICT_STYLE[verdict].ink }}>
+                          {plainLabel(visual.label)}
                         </span>
-                      )}
-                    </div>
+                      ) : null}
+                    </span>
                   </button>
                 );
               })}
@@ -1279,100 +1296,92 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
         </div>
       )}
 
-      {/* Smart Round-Completion Modal (locks background controls against misclicks) */}
+      <NoticeDock bottom={tab === "bursts" ? 112 : 280}>
+        {toast && (
+          <Notice
+            onDismiss={() => setToast(null)}
+            dismissLabel={t.uiDismiss}
+            actions={[
+              ...(lastAction ? [{ label: `${t.actionUndo} ⌘Z`, onClick: () => void handleUndo() }] : []),
+              ...(lastAppliedPlanId
+                ? [
+                    { label: t.openTrashFolder, onClick: () => void api.openPlanFolder(lastAppliedPlanId) },
+                    { label: t.goTrashBin, onClick: onGoInsights },
+                  ]
+                : []),
+            ]}
+          >
+            {toast}
+          </Notice>
+        )}
+        {error && (
+          <Notice tone="error" onDismiss={() => setError(null)} dismissLabel={t.uiDismiss}>
+            {t.errorPrefix}
+            {error}
+          </Notice>
+        )}
+      </NoticeDock>
+
+      {/* Round-completion dialog (locks background controls against misclicks) */}
       {showCompleteModal && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/75 p-4 backdrop-blur-[2px]"
-        >
-          <div className="w-full max-w-lg rounded-xl border border-[#33363B] bg-[#242629] p-6 shadow-2xl">
-            <div className="space-y-1.5">
-              <h2 className="text-lg font-semibold text-[#F3F4F6]">
-                {sessionStats.undecided.length === 0
-                  ? t.completeModalAllDoneTitle
-                  : t.completeModalReachedEndTitle}
-              </h2>
-              <p className="text-sm text-[#9CA3AF]">
-                {sessionStats.undecided.length === 0
-                  ? t.completeModalAllDoneSubtitle(sessionStats.total)
-                  : t.completeModalPendingSubtitle(sessionStats.undecided.length)}
-              </p>
-            </div>
+        <Dialog labelledBy="complete-title" width={600}>
+          <div className="p-8 sm:p-12">
+            <h2 id="complete-title" className="text-lg font-semibold text-ink">
+              {sessionStats.undecided.length === 0
+                ? t.completeModalAllDoneTitle
+                : t.completeModalReachedEndTitle}
+            </h2>
+            <p className="mt-1 text-sm text-ink-2 tabular-nums">
+              {sessionStats.undecided.length === 0
+                ? t.completeModalAllDoneSubtitle(sessionStats.total)
+                : t.completeModalPendingSubtitle(sessionStats.undecided.length)}
+            </p>
 
-            <div className="mt-5 grid grid-cols-2 gap-2.5 sm:grid-cols-4">
-              <div className="rounded-lg border border-[#3D9A6B]/35 bg-[#3D9A6B]/10 px-3 py-2.5 text-center">
-                <div className="text-xl font-semibold text-[#86EFAC] tabular-nums">
-                  {sessionStats.kept}
+            <dl className="mt-12 grid grid-cols-2 gap-x-8 gap-y-8 sm:grid-cols-4">
+              {(
+                [
+                  ["keep", sessionStats.kept, t.completeStatKept],
+                  ["reject", sessionStats.reject, t.completeStatReject],
+                  ["unsure", sessionStats.unsure, t.completeStatUnsure],
+                  ["skip", sessionStats.pendingCount, t.completeStatPending],
+                ] as const
+              ).map(([kind, value, label]) => (
+                <div key={label}>
+                  <dd className="text-[32px] font-semibold leading-10 text-ink tabular-nums">{value}</dd>
+                  <dt className="mt-1 flex items-center gap-1 text-sm text-ink-2">
+                    <StatusDot verdict={kind} className="-ml-2" />
+                    {label}
+                  </dt>
                 </div>
-                <div className="mt-0.5 text-xs text-[#9CA3AF]">{t.completeStatKept}</div>
-              </div>
-              <div className="rounded-lg border border-[#DC4C46]/35 bg-[#DC4C46]/10 px-3 py-2.5 text-center">
-                <div className="text-xl font-semibold text-[#FCA5A5] tabular-nums">
-                  {sessionStats.reject}
-                </div>
-                <div className="mt-0.5 text-xs text-[#9CA3AF]">{t.completeStatReject}</div>
-              </div>
-              <div className="rounded-lg border border-[#D99B26]/35 bg-[#D99B26]/10 px-3 py-2.5 text-center">
-                <div className="text-xl font-semibold text-[#FCD34D] tabular-nums">
-                  {sessionStats.unsure}
-                </div>
-                <div className="mt-0.5 text-xs text-[#9CA3AF]">{t.completeStatUnsure}</div>
-              </div>
-              <div className="rounded-lg border border-[#5B8DEF]/35 bg-[#5B8DEF]/10 px-3 py-2.5 text-center">
-                <div className="text-xl font-semibold text-[#93C5FD] tabular-nums">
-                  {sessionStats.pendingCount}
-                </div>
-                <div className="mt-0.5 text-xs text-[#9CA3AF]">{t.completeStatPending}</div>
-              </div>
-            </div>
+              ))}
+            </dl>
 
-            <div className="mt-5 flex flex-wrap items-center justify-end gap-2.5">
-              <button
-                type="button"
-                onClick={() => setShowCompleteModal(false)}
-                className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-4 py-2 text-sm text-[#D1D5DB] hover:bg-[#2C2F34]"
-              >
+            <div className="mt-12 flex flex-wrap items-center justify-end gap-2">
+              <Button variant="ghost" onClick={() => setShowCompleteModal(false)}>
                 {t.completeActionClose}
-              </button>
+              </Button>
               {tab === "revisit" && (
-                <button
-                  type="button"
-                  onClick={enterAllTab}
-                  className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-4 py-2 text-sm text-[#D1D5DB] hover:bg-[#2C2F34]"
-                >
+                <Button variant="secondary" onClick={enterAllTab}>
                   {t.reviewViewAll}
-                </button>
+                </Button>
               )}
               {sessionStats.reject > 0 && (
-                <button
-                  type="button"
+                <Button
+                  variant={sessionStats.undecided.length === 0 ? "mark" : "secondary"}
+                  icon={Trash}
                   onClick={() => void handleOpenQuarantine()}
-                  className={`rounded-md px-4 py-2 text-sm font-medium tabular-nums ${
-                    sessionStats.undecided.length === 0
-                      ? "bg-[#DC4C46] text-white hover:bg-[#C63E38]"
-                      : "border border-[#DC4C46]/60 bg-[#DC4C46]/15 text-[#FCA5A5] hover:bg-[#DC4C46]/25"
-                  }`}
                 >
                   {t.completeActionQuarantine(sessionStats.reject)}
-                </button>
+                </Button>
               )}
               {sessionStats.undecided.length > 0 && (
-                <button
-                  type="button"
-                  onClick={enterRevisitPass}
-                  className="rounded-md bg-[#D99B26] px-4 py-2 text-sm font-medium text-[#1B1C1E] hover:bg-[#E5A935] tabular-nums"
-                >
+                <Button variant="primary" onClick={enterRevisitPass}>
                   {t.completeActionRevisit(sessionStats.undecided.length)}
-                </button>
+                </Button>
               )}
             </div>
-
-            <p className="mt-4 border-t border-[#33363B] pt-3 text-xs text-[#9CA3AF]">
-              {t.completeModalHint}
-            </p>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {(verifyingPlan || activeDraft) && (

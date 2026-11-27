@@ -13,11 +13,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from lightbox.agent.context import redact_path_aliases_in_text
 from lightbox.agent.hooks import attach_default_hooks, wrap_untrusted_metadata
 from lightbox.models import Message, ModelError
 from lightbox.paths import AppPaths
-from lightbox.services import DEFAULT_PREFERENCES_MD, LightboxServices
+from lightbox.services import (
+    DEFAULT_PREFERENCES_MD,
+    LightboxServices,
+    extract_effective_preferences_for_prompt,
+)
 from lightbox.store import MemoryRuleRecord, OverrideRecord
 
 MIN_OVERRIDES_FOR_CONSOLIDATE = 5
@@ -140,30 +143,22 @@ def append_rule_to_preferences(app_paths: AppPaths, rule_id: str, rule_text: str
     return write_preferences(app_paths, updated)
 
 
-def extract_effective_preferences_for_prompt(app_paths: AppPaths, *, max_chars: int = 3000) -> str:
-    """Return active user preferences from `preferences.md` for prompt injection (empty if none set).
-
-    Strictly reads ONLY `preferences.md` so `proposed` or `rejected` rules in `memory_rules_meta`
-    can never leak into Agent or VLM prompts.
-    """
+def remove_rule_from_preferences(app_paths: AppPaths, rule_id: str) -> str:
+    """Remove any `- [rule_id] ...` line from `<APP_DATA_DIR>/preferences.md` (idempotent)."""
     pref = app_paths.preferences_file
     if not pref.is_file():
-        return ""
-    try:
-        raw = pref.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-    if not raw or _PLACEHOLDER_FRAGMENT in raw:
-        return ""
+        return read_preferences(app_paths)
 
-    # Ignore blank/heading-only documents with no substantive preference lines
-    substantive = [
-        line for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")
-    ]
-    if not substantive:
-        return ""
-    safe = redact_path_aliases_in_text(raw, {})
-    return safe[:max_chars]
+    current = read_preferences(app_paths)
+    pattern = re.compile(rf"^\s*-\s*\[{re.escape(rule_id)}\].*(?:\n|$)", flags=re.MULTILINE)
+    if not pattern.search(current):
+        return current
+
+    updated = pattern.sub("", current)
+    updated = re.sub(r"\n{3,}", "\n\n", updated).rstrip("\n")
+    if updated:
+        updated += "\n"
+    return write_preferences(app_paths, updated)
 
 
 class MemoryManager:
@@ -404,6 +399,7 @@ class MemoryManager:
             status="rejected",
         )
         assert updated is not None
+        remove_rule_from_preferences(self.services.app_paths, rule_id)
         return updated
 
 
@@ -418,6 +414,7 @@ __all__ = [
     "append_rule_to_preferences",
     "extract_effective_preferences_for_prompt",
     "read_preferences",
+    "remove_rule_from_preferences",
     "serialize_memory_rule",
     "write_preferences",
 ]

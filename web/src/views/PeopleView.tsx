@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type DragEvent, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
@@ -9,7 +9,122 @@ import {
   type PeoplePhotoItem,
   type SimilarFaceCandidate,
 } from "../api";
+import {
+  Button,
+  Dialog,
+  EmptyState,
+  Icon,
+  Loading,
+  Menu,
+  Notice,
+  NoticeDock,
+  Tabs,
+  type MenuItem,
+} from "../components/ui";
 import { useI18n } from "../i18n";
+import {
+  Check,
+  ChevronDown,
+  EyeOff,
+  Export,
+  Folder,
+  Link,
+  Scissor,
+  Scan,
+  Users,
+} from "reicon-react";
+
+/** Drop the parenthetical explanation some labels carry. */
+function headline(label: string): string {
+  return label.split(/\s*[（(]/)[0];
+}
+
+function Avatar({ src, label, size = 28 }: { src: string | null; label: string; size?: number }) {
+  const [failed, setFailed] = useState(false);
+  return src && !failed ? (
+    <img
+      src={src}
+      alt=""
+      onError={() => setFailed(true)}
+      className="shrink-0 rounded-full bg-table object-cover"
+      style={{ width: size, height: size }}
+    />
+  ) : (
+    <span
+      className="flex shrink-0 items-center justify-center rounded-full bg-table text-xs font-medium text-ink-2"
+      style={{ width: size, height: size }}
+    >
+      {label.slice(0, 1)}
+    </span>
+  );
+}
+
+function CheckDot({ checked }: { checked: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-[6px] transition-colors ${
+        checked ? "bg-ink text-white" : "shadow-[inset_0_0_0_1.5px_var(--color-ink-3)]"
+      }`}
+    >
+      {checked && <Check size={14} strokeWidth={2} />}
+    </span>
+  );
+}
+
+function FaceChip({
+  label,
+  tone,
+  open,
+  disabled,
+  onToggle,
+  onClose,
+  menuItems,
+  menuHeader,
+}: {
+  label: string;
+  tone: "named" | "unnamed" | "ignored";
+  open: boolean;
+  disabled: boolean;
+  onToggle: () => void;
+  onClose: () => void;
+  menuItems: MenuItem[];
+  menuHeader: ReactNode;
+}) {
+  const ref = useRef<HTMLButtonElement | null>(null);
+  return (
+    <>
+      <button
+        ref={ref}
+        type="button"
+        disabled={disabled}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={onToggle}
+        className={`inline-flex h-8 items-center gap-1 rounded-chip pl-3 pr-1 text-sm transition-colors ${
+          tone === "ignored"
+            ? "cursor-default text-ink-3 line-through"
+            : tone === "named"
+              ? `font-medium text-ink ${open ? "bg-table-2" : "bg-table hover:bg-table-2"}`
+              : `text-ink-2 ${open ? "bg-table-2" : "bg-table hover:bg-table-2 hover:text-ink"}`
+        }`}
+      >
+        <span className="max-w-[10rem] truncate">{label}</span>
+        {tone !== "ignored" && <ChevronDown size={16} strokeWidth={1.5} className="text-ink-3" />}
+      </button>
+      {tone !== "ignored" && (
+        <Menu
+          anchorRef={ref}
+          open={open}
+          onClose={onClose}
+          items={menuItems}
+          header={menuHeader}
+          width={256}
+        />
+      )}
+    </>
+  );
+}
 
 interface PeopleViewProps {
   onOpenReview: (sessionId: string) => void;
@@ -114,98 +229,78 @@ function ExportPeopleModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-lg rounded-xl border border-[#33363B] bg-[#1F2124] p-5 shadow-2xl">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h2 className="text-lg font-medium text-[#F3F4F6]">{t.peopleExportModalTitle}</h2>
-            <p className="mt-1 text-xs text-[#9CA3AF]">{t.peopleExportModalDesc}</p>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded px-2 py-1 text-xs text-[#9CA3AF] hover:bg-[#2C2F34] hover:text-[#F3F4F6]"
-          >
-            ✕
-          </button>
+    <Dialog labelledBy="export-title" width={560} onDismiss={busy ? undefined : onClose}>
+      <form onSubmit={(e) => void handleExport(e)} className="flex min-h-0 flex-col p-8 sm:p-12">
+        <h2 id="export-title" className="text-lg font-semibold text-ink" title={t.peopleExportModalDesc}>
+          {t.peopleExportModalTitle}
+        </h2>
+
+        <div className="mt-8 flex gap-2">
+          <input
+            type="text"
+            value={targetDir}
+            onChange={(e) => setTargetDir(e.target.value)}
+            placeholder={t.peopleExportTargetPlaceholder}
+            aria-label={t.peopleExportTargetLabel}
+            className="field min-w-0 flex-1"
+          />
+          <Button variant="secondary" icon={Folder} onClick={() => void handlePickFolder()}>
+            {t.peopleExportPickFolder}
+          </Button>
         </div>
 
-        <form onSubmit={(e) => void handleExport(e)} className="mt-4 space-y-4">
-          <div className="space-y-1.5">
-            <label className="block text-xs font-medium text-[#D1D5DB]">
-              {t.peopleExportTargetLabel}
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={targetDir}
-                onChange={(e) => setTargetDir(e.target.value)}
-                placeholder={t.peopleExportTargetPlaceholder}
-                className="flex-1 rounded-md border border-[#33363B] bg-[#1B1C1E] px-3 py-2 text-xs text-[#F3F4F6] placeholder-[#6B7280] focus:border-[#5B8DEF] focus:outline-none"
-              />
-              <button
-                type="button"
-                onClick={() => void handlePickFolder()}
-                className="shrink-0 rounded-md border border-[#33363B] bg-[#242629] px-3 py-2 text-xs text-[#E5E7EB] hover:bg-[#2C2F34]"
+        <div
+          role="group"
+          aria-label={t.peopleExportSelectGroups}
+          className="-mx-2 mt-8 max-h-64 overflow-y-auto"
+        >
+          {exportableOptions.map((opt) => {
+            const checked = selectedKeys.includes(opt.key);
+            return (
+              <label
+                key={opt.key}
+                className="flex h-12 cursor-pointer items-center justify-between gap-4 rounded-btn px-2 text-sm hover:bg-table"
               >
-                {t.peopleExportPickFolder}
-              </button>
-            </div>
-          </div>
-
-          <div className="space-y-1.5">
-            <div className="text-xs font-medium text-[#D1D5DB]">{t.peopleExportSelectGroups}</div>
-            <div className="max-h-48 space-y-1.5 overflow-y-auto rounded-md border border-[#33363B] bg-[#1B1C1E] p-2.5">
-              {exportableOptions.map((opt) => (
-                <label
-                  key={opt.key}
-                  className="flex cursor-pointer items-center justify-between gap-2 rounded px-2 py-1 text-xs hover:bg-[#242629]"
-                >
-                  <span className="flex items-center gap-2 text-[#E5E7EB]">
-                    <input
-                      type="checkbox"
-                      checked={selectedKeys.includes(opt.key)}
-                      onChange={() => toggleKey(opt.key)}
-                      className="rounded border-[#4B5563]"
-                    />
-                    <span>{opt.label}</span>
+                <span className="flex min-w-0 items-center gap-4">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleKey(opt.key)}
+                    className="peer sr-only"
+                  />
+                  <CheckDot checked={checked} />
+                  <span className={`truncate ${checked ? "font-medium text-ink" : "text-ink-2"}`}>
+                    {opt.label}
                   </span>
-                  <span className="text-[#9CA3AF] tabular-nums">{t.photoCount(opt.count)}</span>
-                </label>
-              ))}
-            </div>
-          </div>
+                </span>
+                <span className="shrink-0 text-ink-3 tabular-nums">{t.photoCount(opt.count)}</span>
+              </label>
+            );
+          })}
+        </div>
 
-          <p className="rounded-md border border-[#3D9A6B]/40 bg-[#3D9A6B]/10 px-3 py-2 text-xs text-[#A7F3D0]">
-            {t.peopleExportSafety}
+        {error && (
+          <p className="mt-6 text-sm text-mark">
+            {t.errorPrefix}
+            {error}
           </p>
+        )}
 
-          {error && (
-            <p className="rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-3 py-2 text-xs text-[#FCA5A5]">
-              {t.errorPrefix}
-              {error}
-            </p>
-          )}
-
-          <div className="flex justify-end gap-2 pt-1">
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-md border border-[#33363B] px-3.5 py-2 text-xs text-[#D1D5DB] hover:bg-[#2C2F34]"
-            >
-              {t.modalCancel}
-            </button>
-            <button
-              type="submit"
-              disabled={busy || !targetDir.trim() || selectedKeys.length === 0}
-              className="rounded-md bg-[#3D9A6B] px-4 py-2 text-xs font-medium text-white hover:bg-[#32825A] disabled:opacity-50"
-            >
-              {busy ? t.peopleExporting : t.peopleExportConfirm}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+        <div className="mt-8 flex justify-end gap-2" title={t.peopleExportSafety}>
+          <Button variant="ghost" onClick={onClose}>
+            {t.modalCancel}
+          </Button>
+          <Button
+            type="submit"
+            variant="primary"
+            icon={Export}
+            disabled={busy || !targetDir.trim() || selectedKeys.length === 0}
+          >
+            {busy ? t.peopleExporting : t.peopleExportConfirm}
+          </Button>
+        </div>
+      </form>
+    </Dialog>
   );
 }
 
@@ -646,15 +741,137 @@ export function PeopleView({ onOpenReview }: PeopleViewProps) {
     return t.peopleClusterLabel(f.face_idx + 1);
   }
 
-  return (
-    <div className="mx-auto max-w-6xl px-6 py-8">
-      {/* Header & actions */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">{t.peopleTitle}</h1>
-          <p className="text-sm text-[#9CA3AF]">{t.peopleSubtitle}</p>
-        </div>
+  const renderEntityRow = (
+    ref: EntityRef,
+    label: string,
+    count: number,
+    avatar: string | null,
+    active: boolean,
+    onSelect: () => void,
+  ) => {
+    const key = entityKey(ref);
+    const checked = batchSelectedKeys.includes(key);
+    const isDropTarget = dropHoverKey === key;
+    return (
+      <div
+        key={key}
+        draggable={!batchMergeMode && !mutating}
+        onDragStart={(e) => handleEntityDragStart(e, ref)}
+        onDragOver={(e) => handleEntityDragOver(e, ref)}
+        onDragLeave={() => {
+          if (dropHoverKey === key) setDropHoverKey(null);
+        }}
+        onDrop={(e) => handleEntityDrop(e, ref)}
+        onDragEnd={handleEntityDragEnd}
+        className={`rounded-btn transition-shadow ${
+          isDropTarget ? "shadow-[inset_0_0_0_2px_var(--color-ink)]" : ""
+        } ${draggedKey === key ? "opacity-40" : ""}`}
+      >
+        <button
+          type="button"
+          aria-pressed={batchMergeMode ? checked : active}
+          onClick={() => {
+            if (batchMergeMode) {
+              toggleBatchSelect(key);
+              return;
+            }
+            onSelect();
+          }}
+          className={`flex h-12 w-full items-center justify-between gap-2 rounded-btn px-2 text-left text-sm transition-colors ${
+            active || checked ? "bg-table text-ink" : "text-ink-2 hover:bg-table hover:text-ink"
+          } ${batchMergeMode ? "" : "cursor-grab active:cursor-grabbing"}`}
+        >
+          <span className="flex min-w-0 items-center gap-2">
+            {batchMergeMode && <CheckDot checked={checked} />}
+            <Avatar src={avatar} label={label} />
+            <span className={`truncate ${active || checked ? "font-medium" : ""}`}>
+              {isDropTarget ? t.peopleDropToMerge(label) : label}
+            </span>
+          </span>
+          <span className="shrink-0 text-ink-3 tabular-nums">{count}</span>
+        </button>
+      </div>
+    );
+  };
 
+  const specialRow = (kind: "group_photo" | "no_face", label: string, count: number) => {
+    const active = selection.kind === kind;
+    return (
+      <button
+        type="button"
+        aria-pressed={active}
+        onClick={() => {
+          setSelection({ kind });
+          setMergeTarget("");
+          setActiveFaceMenu(null);
+        }}
+        className={`flex h-12 w-full items-center justify-between gap-2 rounded-btn px-2 text-left text-sm transition-colors ${
+          active ? "bg-table font-medium text-ink" : "text-ink-2 hover:bg-table hover:text-ink"
+        }`}
+      >
+        <span className="flex items-center gap-2">
+          <span className="flex h-7 w-7 items-center justify-center">
+            <Icon as={kind === "group_photo" ? Users : Scan} />
+          </span>
+          {label}
+        </span>
+        <span className="text-ink-3 tabular-nums">{count}</span>
+      </button>
+    );
+  };
+
+  const mergeOptions = (excludeKey: string) => [
+    ...(data?.people ?? [])
+      .filter((p) => `person:${p.person_id}` !== excludeKey)
+      .map((p) => ({ value: `person:${p.person_id}`, label: p.name })),
+    ...(data?.unnamed_clusters ?? [])
+      .filter((c) => `cluster:${c.cluster_id}` !== excludeKey)
+      .map((c) => {
+        const num = clusterIndexById.get(c.cluster_id) ?? 1;
+        return {
+          value: `cluster:${c.cluster_id}`,
+          label: `${t.peopleClusterLabel(num)} (${t.photoCount(c.photos.length)})`,
+        };
+      }),
+  ];
+
+  const renderMergeControl = (source: EntityRef) => (
+    <div className="flex items-center gap-2">
+      <select
+        value={mergeTarget}
+        onChange={(e) => setMergeTarget(e.target.value)}
+        aria-label={t.peopleMergePlaceholder}
+        className={`field ${mergeTarget ? "" : "text-ink-2"}`}
+      >
+        <option value="">{t.peopleMergePlaceholder}</option>
+        {mergeOptions(entityKey(source)).map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+      {mergeTarget && (
+        <Button
+          variant="secondary"
+          icon={Link}
+          disabled={mutating}
+          className="fade-enter"
+          onClick={() => {
+            const targetRef = parseEntityKey(mergeTarget);
+            if (targetRef) void performPairMerge(source, targetRef);
+          }}
+        >
+          {t.peopleMergeAction}
+        </Button>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="mx-auto max-w-6xl px-6 pb-32 pt-12 sm:px-12">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <h1 className="text-lg font-semibold text-ink">{t.peopleTitle}</h1>
         <div className="flex flex-wrap items-center gap-2">
           <select
             aria-label={t.searchAllSessions}
@@ -663,7 +880,7 @@ export function PeopleView({ onOpenReview }: PeopleViewProps) {
               setSessionId(e.target.value);
               setGroupHeadcountFilter(null);
             }}
-            className="rounded-md border border-[#33363B] bg-[#242629] px-2.5 py-2 text-xs text-[#E5E7EB] focus:border-[#5B8DEF] focus:outline-none"
+            className={`field ${sessionId ? "font-medium" : "text-ink-2"}`}
           >
             <option value="">{t.searchAllSessions}</option>
             {sessions.map((s) => (
@@ -672,565 +889,253 @@ export function PeopleView({ onOpenReview }: PeopleViewProps) {
               </option>
             ))}
           </select>
-
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            icon={Scan}
             disabled={indexing || sessions.length === 0}
             onClick={() => void handleIndexPeople()}
-            className="rounded-md border border-[#5B8DEF]/50 bg-[#5B8DEF]/15 px-3.5 py-2 text-xs font-medium text-[#93C5FD] hover:bg-[#5B8DEF]/25 disabled:opacity-50"
           >
             {indexing ? t.peopleIndexing : t.peopleIndexAction}
-          </button>
-
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="primary"
+            icon={Export}
             disabled={!data || data.total_kept_photos === 0}
             onClick={() => setShowExportModal(true)}
-            className="rounded-md bg-[#3D9A6B] px-3.5 py-2 text-xs font-medium text-white hover:bg-[#32825A] disabled:opacity-50"
           >
             {t.peopleExportAction}
-          </button>
+          </Button>
         </div>
       </div>
 
-      {notice && (
-        <div className="mt-4 rounded-md border border-[#3D9A6B]/50 bg-[#3D9A6B]/10 px-4 py-2.5 text-sm text-[#A7F3D0]">
-          {notice}
-        </div>
-      )}
-
-      {(error || peopleQ.error) && (
-        <div className="mt-4 rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-2.5 text-sm text-[#FCA5A5]">
-          {t.errorPrefix}
-          {error ?? (peopleQ.error instanceof Error ? peopleQ.error.message : "")}
-        </div>
-      )}
-
-      {/* Main split layout: sidebar + photo grid */}
-      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[270px_1fr]">
-        {/* Sidebar */}
-        <aside className="space-y-4 rounded-lg border border-[#33363B] bg-[#242629] p-3.5">
-          {/* Batch merge mode header */}
+      <div className="mt-12 grid grid-cols-1 gap-12 lg:grid-cols-[248px_1fr]">
+        {/* Sidebar: people, faces waiting for a name, special groups — separated by space only */}
+        <aside className="flex flex-col gap-8 lg:sticky lg:top-24 lg:max-h-[calc(100vh-128px)] lg:self-start lg:overflow-y-auto">
           {totalMergeableEntities >= 2 && (
-            <div className="flex items-center justify-between gap-2 border-b border-[#33363B] pb-2.5">
-              <span className="text-[11px] text-[#9CA3AF]">
-                {batchMergeMode ? t.peopleBatchMergeHint : t.peopleDragHint}
-              </span>
-              <button
-                type="button"
+            <div className="flex flex-col gap-2" title={batchMergeMode ? t.peopleBatchMergeHint : t.peopleDragHint}>
+              <Button
+                variant={batchMergeMode ? "secondary" : "ghost"}
+                size="sm"
+                icon={Link}
+                className="self-start"
                 onClick={() => {
                   setBatchMergeMode((m) => !m);
                   setBatchSelectedKeys([]);
                 }}
-                className={`shrink-0 rounded-md px-2.5 py-1 text-[11px] font-medium transition ${
-                  batchMergeMode
-                    ? "border border-[#33363B] bg-[#1B1C1E] text-[#D1D5DB] hover:bg-[#2C2F34]"
-                    : "border border-[#5B8DEF]/50 bg-[#5B8DEF]/15 text-[#93C5FD] hover:bg-[#5B8DEF]/25"
-                }`}
               >
                 {batchMergeMode ? t.peopleBatchMergeCancel : t.peopleBatchMergeStart}
-              </button>
+              </Button>
+              {batchMergeMode && (
+                <Button
+                  variant="primary"
+                  disabled={mutating || batchSelectedKeys.length < 2}
+                  onClick={() => void handleBatchMergeConfirm()}
+                >
+                  {t.peopleBatchMergeConfirm(batchSelectedKeys.length)}
+                </Button>
+              )}
             </div>
           )}
 
-          {batchMergeMode && (
-            <button
-              type="button"
-              disabled={mutating || batchSelectedKeys.length < 2}
-              onClick={() => void handleBatchMergeConfirm()}
-              className="w-full rounded-md bg-[#5B8DEF] px-3 py-2 text-xs font-medium text-white hover:bg-[#4A7CE0] disabled:cursor-not-allowed disabled:opacity-45"
-            >
-              {t.peopleBatchMergeConfirm(batchSelectedKeys.length)}
-            </button>
+          {(data?.people.length ?? 0) > 0 && (
+            <div className="flex flex-col" aria-label={t.peopleNamedSection}>
+              {(data?.people ?? []).map((p) =>
+                renderEntityRow(
+                  { kind: "person", id: p.person_id },
+                  p.name,
+                  p.photo_count,
+                  p.cover_photo_id && p.cover_face_idx !== null
+                    ? photoFaceCropUrl(p.cover_photo_id, p.cover_face_idx, 64)
+                    : null,
+                  !batchMergeMode && selection.kind === "person" && selection.personId === p.person_id,
+                  () => {
+                    setSelection({ kind: "person", personId: p.person_id });
+                    setNameInput(p.name);
+                    setMergeTarget("");
+                    setActiveFaceMenu(null);
+                  },
+                ),
+              )}
+            </div>
           )}
 
-          {/* Named people */}
-          <div>
-            <div className="mb-2 px-1 text-[11px] font-medium uppercase tracking-wider text-[#9CA3AF]">
-              {t.peopleNamedSection}
-            </div>
-            {(data?.people.length ?? 0) === 0 ? (
-              <p className="px-1 text-xs text-[#6B7280]">—</p>
-            ) : (
-              <div className="space-y-1">
-                {(data?.people ?? []).map((p) => {
-                  const ref: EntityRef = { kind: "person", id: p.person_id };
-                  const key = entityKey(ref);
-                  const active =
-                    !batchMergeMode &&
-                    selection.kind === "person" &&
-                    selection.personId === p.person_id;
-                  const checked = batchSelectedKeys.includes(key);
-                  const isDropTarget = dropHoverKey === key;
-                  return (
-                    <div
-                      key={p.person_id}
-                      draggable={!batchMergeMode && !mutating}
-                      onDragStart={(e) => handleEntityDragStart(e, ref)}
-                      onDragOver={(e) => handleEntityDragOver(e, ref)}
-                      onDragLeave={() => {
-                        if (dropHoverKey === key) setDropHoverKey(null);
-                      }}
-                      onDrop={(e) => handleEntityDrop(e, ref)}
-                      onDragEnd={handleEntityDragEnd}
-                      className={`rounded-md transition ${
-                        isDropTarget ? "ring-2 ring-[#5B8DEF] bg-[#5B8DEF]/15" : ""
-                      }`}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (batchMergeMode) {
-                            toggleBatchSelect(key);
-                            return;
-                          }
-                          setSelection({ kind: "person", personId: p.person_id });
-                          setNameInput(p.name);
-                          setMergeTarget("");
-                          setActiveFaceMenu(null);
-                        }}
-                        className={`flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition ${
-                          checked
-                            ? "bg-[#5B8DEF]/20 text-[#F3F4F6] ring-1 ring-[#5B8DEF]/60"
-                            : active
-                              ? "bg-[#33363B] text-[#F3F4F6]"
-                              : "text-[#D1D5DB] hover:bg-[#2C2F34]"
-                        }`}
-                      >
-                        <span className="flex min-w-0 items-center gap-2">
-                          {batchMergeMode && (
-                            <input
-                              type="checkbox"
-                              readOnly
-                              checked={checked}
-                              className="pointer-events-none h-3.5 w-3.5 shrink-0 rounded border-[#4B5563]"
-                            />
-                          )}
-                          {p.cover_photo_id && p.cover_face_idx !== null ? (
-                            <img
-                              src={photoFaceCropUrl(p.cover_photo_id, p.cover_face_idx, 64)}
-                              alt={p.name}
-                              className="h-7 w-7 shrink-0 rounded-full bg-[#1B1C1E] object-cover"
-                            />
-                          ) : (
-                            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#1B1C1E] text-[11px] text-[#9CA3AF]">
-                              {p.name.slice(0, 1)}
-                            </span>
-                          )}
-                          <span className="truncate font-medium">
-                            {isDropTarget ? t.peopleDropToMerge(p.name) : p.name}
-                          </span>
-                        </span>
-                        <span className="shrink-0 text-[#9CA3AF] tabular-nums">
-                          {p.photo_count}
-                        </span>
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* Faces waiting to be named (`人脸 1`, `人脸 2`, ...) */}
           {(data?.unnamed_clusters.length ?? 0) > 0 && (
-            <div className="border-t border-[#33363B] pt-3">
-              <div className="mb-2 px-1 text-[11px] font-medium uppercase tracking-wider text-[#9CA3AF]">
-                {t.peopleClustersSection} ({data?.unnamed_clusters.length ?? 0})
-              </div>
-              <div className="max-h-72 space-y-1 overflow-y-auto">
-                {(data?.unnamed_clusters ?? []).map((clu, idx) => {
-                  const ref: EntityRef = { kind: "cluster", id: clu.cluster_id };
-                  const key = entityKey(ref);
-                  const label = t.peopleClusterLabel(idx + 1);
-                  const active =
-                    !batchMergeMode &&
-                    selection.kind === "cluster" &&
-                    selection.clusterId === clu.cluster_id;
-                  const checked = batchSelectedKeys.includes(key);
-                  const isDropTarget = dropHoverKey === key;
-                  return (
-                    <div
-                      key={clu.cluster_id}
-                      draggable={!batchMergeMode && !mutating}
-                      onDragStart={(e) => handleEntityDragStart(e, ref)}
-                      onDragOver={(e) => handleEntityDragOver(e, ref)}
-                      onDragLeave={() => {
-                        if (dropHoverKey === key) setDropHoverKey(null);
-                      }}
-                      onDrop={(e) => handleEntityDrop(e, ref)}
-                      onDragEnd={handleEntityDragEnd}
-                      className={`rounded-md transition ${
-                        isDropTarget ? "ring-2 ring-[#5B8DEF] bg-[#5B8DEF]/15" : ""
-                      }`}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (batchMergeMode) {
-                            toggleBatchSelect(key);
-                            return;
-                          }
-                          setSelection({ kind: "cluster", clusterId: clu.cluster_id });
-                          setNameInput("");
-                          setMergeTarget("");
-                          setActiveFaceMenu(null);
-                        }}
-                        className={`flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition ${
-                          checked
-                            ? "bg-[#5B8DEF]/20 text-[#F3F4F6] ring-1 ring-[#5B8DEF]/60"
-                            : active
-                              ? "bg-[#33363B] text-[#F3F4F6]"
-                              : "text-[#D1D5DB] hover:bg-[#2C2F34]"
-                        }`}
-                      >
-                        <span className="flex min-w-0 items-center gap-2">
-                          {batchMergeMode && (
-                            <input
-                              type="checkbox"
-                              readOnly
-                              checked={checked}
-                              className="pointer-events-none h-3.5 w-3.5 shrink-0 rounded border-[#4B5563]"
-                            />
-                          )}
-                          <img
-                            src={photoFaceCropUrl(clu.cover_photo_id, clu.cover_face_idx, 64)}
-                            alt={label}
-                            className="h-7 w-7 shrink-0 rounded-full bg-[#1B1C1E] object-cover"
-                          />
-                          <span className="truncate font-medium">
-                            {isDropTarget ? t.peopleDropToMerge(label) : label}
-                          </span>
-                        </span>
-                        <span className="shrink-0 text-[#9CA3AF] tabular-nums">
-                          {clu.photos.length}
-                        </span>
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
+            <div className="flex flex-col" aria-label={t.peopleClustersSection}>
+              {(data?.unnamed_clusters ?? []).map((clu, idx) =>
+                renderEntityRow(
+                  { kind: "cluster", id: clu.cluster_id },
+                  t.peopleClusterLabel(idx + 1),
+                  clu.photos.length,
+                  photoFaceCropUrl(clu.cover_photo_id, clu.cover_face_idx, 64),
+                  !batchMergeMode && selection.kind === "cluster" && selection.clusterId === clu.cluster_id,
+                  () => {
+                    setSelection({ kind: "cluster", clusterId: clu.cluster_id });
+                    setNameInput("");
+                    setMergeTarget("");
+                    setActiveFaceMenu(null);
+                  },
+                ),
+              )}
             </div>
           )}
 
-          {/* Other groups: Group Photos & No Face */}
-          <div className="border-t border-[#33363B] pt-3">
-            <div className="mb-2 px-1 text-[11px] font-medium uppercase tracking-wider text-[#9CA3AF]">
-              {t.peopleSpecialSection}
-            </div>
-            <div className="space-y-1">
-              <button
-                type="button"
-                onClick={() => {
-                  setSelection({ kind: "group_photo" });
-                  setMergeTarget("");
-                  setActiveFaceMenu(null);
-                }}
-                className={`flex w-full items-center justify-between rounded-md px-2.5 py-2 text-xs ${
-                  selection.kind === "group_photo"
-                    ? "bg-[#33363B] font-medium text-[#F3F4F6]"
-                    : "text-[#D1D5DB] hover:bg-[#2C2F34]"
-                }`}
-              >
-                <span>{t.peopleGroupPhotos}</span>
-                <span className="text-[#9CA3AF] tabular-nums">
-                  {data?.group_photo_total_count ?? 0}
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setSelection({ kind: "no_face" });
-                  setMergeTarget("");
-                  setActiveFaceMenu(null);
-                }}
-                className={`flex w-full items-center justify-between rounded-md px-2.5 py-2 text-xs ${
-                  selection.kind === "no_face"
-                    ? "bg-[#33363B] font-medium text-[#F3F4F6]"
-                    : "text-[#D1D5DB] hover:bg-[#2C2F34]"
-                }`}
-              >
-                <span>{t.peopleNoFace}</span>
-                <span className="text-[#9CA3AF] tabular-nums">
-                  {data?.no_face_photos.length ?? 0}
-                </span>
-              </button>
-            </div>
+          <div className="flex flex-col" aria-label={t.peopleSpecialSection}>
+            {specialRow("group_photo", t.peopleGroupPhotos, data?.group_photo_total_count ?? 0)}
+            {specialRow("no_face", t.peopleNoFace, data?.no_face_photos.length ?? 0)}
           </div>
         </aside>
 
-        {/* Main content area */}
-        <section className="min-w-0 space-y-4">
-          {/* Active group toolbar */}
-          <div className="flex flex-col gap-3 rounded-lg border border-[#33363B] bg-[#242629] p-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2.5">
-                <h2 className="text-base font-medium text-[#F3F4F6]">{activeTitle}</h2>
-                <span className="rounded bg-[#1B1C1E] px-2 py-0.5 text-xs text-[#9CA3AF] tabular-nums">
-                  {t.peopleFullCount(activePhotos.length)}
-                </span>
-              </div>
+        {/* Main */}
+        <section className="min-w-0">
+          <div className="flex flex-col gap-6">
+            <div className="flex items-baseline gap-4">
+              <h2 className="truncate text-lg font-semibold text-ink">{activeTitle}</h2>
+              <span className="shrink-0 text-sm text-ink-3 tabular-nums">
+                {t.peopleFullCount(activePhotos.length)}
+              </span>
             </div>
 
-            {/* Group photo headcount + named-person filter chips */}
             {selection.kind === "group_photo" && (
-              <div className="space-y-2">
+              <div className="flex flex-col gap-2">
                 {availableHeadcounts.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setGroupHeadcountFilter(null)}
-                      className={`rounded-full px-3 py-1 text-xs ${
-                        groupHeadcountFilter === null
-                          ? "bg-[#F3F4F6] font-medium text-[#1B1C1E]"
-                          : "border border-[#33363B] bg-[#1B1C1E] text-[#D1D5DB] hover:bg-[#2C2F34]"
-                      }`}
-                    >
-                      {t.peopleHeadcountAll}
-                    </button>
-                    {availableHeadcounts.map((hc) => (
-                      <button
-                        key={String(hc)}
-                        type="button"
-                        onClick={() =>
-                          setGroupHeadcountFilter(groupHeadcountFilter === hc ? null : hc)
-                        }
-                        className={`rounded-full px-3 py-1 text-xs tabular-nums ${
-                          groupHeadcountFilter === hc
-                            ? "bg-[#F3F4F6] font-medium text-[#1B1C1E]"
-                            : "border border-[#33363B] bg-[#1B1C1E] text-[#D1D5DB] hover:bg-[#2C2F34]"
-                        }`}
-                      >
-                        {hc === "5+" ? t.peopleHeadcountFilterMore : t.peopleHeadcountFilter(hc)}
-                      </button>
-                    ))}
-                  </div>
+                  <Tabs
+                    size="sm"
+                    value={groupHeadcountFilter === null ? "all" : String(groupHeadcountFilter)}
+                    items={[
+                      { id: "all", label: t.peopleHeadcountAll },
+                      ...availableHeadcounts.map((hc) => ({
+                        id: String(hc),
+                        label: hc === "5+" ? t.peopleHeadcountFilterMore : t.peopleHeadcountFilter(hc),
+                      })),
+                    ]}
+                    onChange={(id) => {
+                      if (id === "all") {
+                        setGroupHeadcountFilter(null);
+                        return;
+                      }
+                      const hc: number | "5+" = id === "5+" ? "5+" : Number(id);
+                      setGroupHeadcountFilter(groupHeadcountFilter === hc ? null : hc);
+                    }}
+                  />
                 )}
-
                 {(data?.people.length ?? 0) > 0 && (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setGroupPersonFilter("")}
-                      className={`rounded-full px-3 py-1 text-xs ${
-                        groupPersonFilter === ""
-                          ? "bg-[#5B8DEF] font-medium text-white"
-                          : "border border-[#33363B] bg-[#1B1C1E] text-[#D1D5DB] hover:bg-[#2C2F34]"
-                      }`}
-                    >
-                      {t.peopleFilterAllGroups}
-                    </button>
-                    {(data?.people ?? []).map((p) => (
-                      <button
-                        key={p.person_id}
-                        type="button"
-                        onClick={() =>
-                          setGroupPersonFilter(groupPersonFilter === p.person_id ? "" : p.person_id)
-                        }
-                        className={`rounded-full px-3 py-1 text-xs ${
-                          groupPersonFilter === p.person_id
-                            ? "bg-[#5B8DEF] font-medium text-white"
-                            : "border border-[#33363B] bg-[#1B1C1E] text-[#D1D5DB] hover:bg-[#2C2F34]"
-                        }`}
-                      >
-                        {t.peopleFilterContains(p.name)}
-                        {p.group_photo_count > 0 ? ` (${p.group_photo_count})` : ""}
-                      </button>
-                    ))}
-                  </div>
+                  <Tabs
+                    size="sm"
+                    value={groupPersonFilter || "all"}
+                    items={[
+                      { id: "all", label: t.peopleFilterAllGroups },
+                      ...(data?.people ?? []).map((p) => ({
+                        id: p.person_id,
+                        label: t.peopleFilterContains(p.name),
+                        count: p.group_photo_count > 0 ? p.group_photo_count : undefined,
+                      })),
+                    ]}
+                    onChange={(id) => {
+                      if (id === "all") {
+                        setGroupPersonFilter("");
+                        return;
+                      }
+                      setGroupPersonFilter(groupPersonFilter === id ? "" : id);
+                    }}
+                  />
                 )}
               </div>
             )}
 
-            {/* Unnamed face controls: Name / Merge / Ignore */}
             {selectedCluster && (
-              <div className="flex flex-wrap items-center gap-2 pt-1">
+              <div className="flex flex-wrap items-center gap-2">
                 <form
                   onSubmit={(e) => void handleNameCluster(selectedCluster.cluster_id, e)}
-                  className="flex items-center gap-1.5"
+                  className="flex items-center gap-2"
                 >
                   <input
                     type="text"
                     value={nameInput}
                     onChange={(e) => setNameInput(e.target.value)}
                     placeholder={t.peopleNamePlaceholder}
-                    className="w-48 rounded-md border border-[#33363B] bg-[#1B1C1E] px-2.5 py-1.5 text-xs text-[#F3F4F6] placeholder-[#6B7280] focus:border-[#5B8DEF] focus:outline-none"
+                    aria-label={t.peopleNameAction}
+                    className="field w-64"
                   />
-                  <button
-                    type="submit"
-                    disabled={mutating || !nameInput.trim()}
-                    className="rounded-md bg-[#F3F4F6] px-3 py-1.5 text-xs font-medium text-[#1B1C1E] hover:bg-white disabled:opacity-50"
-                  >
+                  <Button type="submit" variant="primary" disabled={mutating || !nameInput.trim()}>
                     {t.peopleNameAction}
-                  </button>
+                  </Button>
                 </form>
-
-                <div className="flex items-center gap-1.5">
-                  <select
-                    value={mergeTarget}
-                    onChange={(e) => setMergeTarget(e.target.value)}
-                    className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-2 py-1.5 text-xs text-[#E5E7EB]"
-                  >
-                    <option value="">{t.peopleMergePlaceholder}</option>
-                    {(data?.people ?? []).map((p) => (
-                      <option key={p.person_id} value={`person:${p.person_id}`}>
-                        {p.name}
-                      </option>
-                    ))}
-                    {(data?.unnamed_clusters ?? [])
-                      .filter((c) => c.cluster_id !== selectedCluster.cluster_id)
-                      .map((c) => {
-                        const num = clusterIndexById.get(c.cluster_id) ?? 1;
-                        return (
-                          <option key={c.cluster_id} value={`cluster:${c.cluster_id}`}>
-                            {t.peopleClusterLabel(num)} ({t.photoCount(c.photos.length)})
-                          </option>
-                        );
-                      })}
-                  </select>
-                  <button
-                    type="button"
-                    disabled={mutating || !mergeTarget}
-                    onClick={() => {
-                      const targetRef = parseEntityKey(mergeTarget);
-                      if (targetRef) {
-                        void performPairMerge(
-                          { kind: "cluster", id: selectedCluster.cluster_id },
-                          targetRef,
-                        );
-                      }
-                    }}
-                    className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-2.5 py-1.5 text-xs text-[#E5E7EB] hover:bg-[#2C2F34] disabled:opacity-50"
-                  >
-                    {t.peopleMergeAction}
-                  </button>
-                </div>
-
-                <button
-                  type="button"
+                {renderMergeControl({ kind: "cluster", id: selectedCluster.cluster_id })}
+                <Button
+                  variant="ghost"
+                  icon={EyeOff}
                   disabled={mutating}
                   onClick={() => void handleIgnoreCluster(selectedCluster.cluster_id)}
-                  className="rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-2.5 py-1.5 text-xs text-[#FCA5A5] hover:bg-[#DC4C46]/20 disabled:opacity-50"
                 >
-                  {t.peopleIgnoreCluster}
-                </button>
+                  {headline(t.peopleIgnoreCluster)}
+                </Button>
               </div>
             )}
 
-            {/* Named person controls: Rename / Merge into another person */}
             {selectedPerson && (
-              <div className="flex flex-wrap items-center gap-2 pt-1">
+              <div className="flex flex-wrap items-center gap-2">
                 <form
                   onSubmit={(e) => void handleRenamePerson(selectedPerson.person_id, e)}
-                  className="flex items-center gap-1.5"
+                  className="flex items-center gap-2"
                 >
                   <input
                     type="text"
                     value={nameInput}
                     onChange={(e) => setNameInput(e.target.value)}
                     placeholder={t.peopleNamePlaceholder}
-                    className="w-44 rounded-md border border-[#33363B] bg-[#1B1C1E] px-2.5 py-1.5 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+                    aria-label={t.peopleRenameAction}
+                    className="field w-56"
                   />
-                  <button
-                    type="submit"
-                    disabled={mutating || !nameInput.trim()}
-                    className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-3 py-1.5 text-xs text-[#E5E7EB] hover:bg-[#2C2F34] disabled:opacity-50"
-                  >
-                    {t.peopleRenameAction}
-                  </button>
+                  {nameInput.trim() && nameInput.trim() !== selectedPerson.name && (
+                    <Button type="submit" variant="secondary" disabled={mutating} className="fade-enter">
+                      {t.peopleRenameAction}
+                    </Button>
+                  )}
                 </form>
-
-                {totalMergeableEntities > 1 && (
-                  <div className="flex items-center gap-1.5">
-                    <select
-                      value={mergeTarget}
-                      onChange={(e) => setMergeTarget(e.target.value)}
-                      className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-2 py-1.5 text-xs text-[#E5E7EB]"
-                    >
-                      <option value="">{t.peopleMergePlaceholder}</option>
-                      {(data?.people ?? [])
-                        .filter((p) => p.person_id !== selectedPerson.person_id)
-                        .map((p) => (
-                          <option key={p.person_id} value={`person:${p.person_id}`}>
-                            {p.name}
-                          </option>
-                        ))}
-                      {(data?.unnamed_clusters ?? []).map((c) => {
-                        const num = clusterIndexById.get(c.cluster_id) ?? 1;
-                        return (
-                          <option key={c.cluster_id} value={`cluster:${c.cluster_id}`}>
-                            {t.peopleClusterLabel(num)} ({t.photoCount(c.photos.length)})
-                          </option>
-                        );
-                      })}
-                    </select>
-                    <button
-                      type="button"
-                      disabled={mutating || !mergeTarget}
-                      onClick={() => {
-                        const targetRef = parseEntityKey(mergeTarget);
-                        if (targetRef) {
-                          void performPairMerge(
-                            { kind: "person", id: selectedPerson.person_id },
-                            targetRef,
-                          );
-                        }
-                      }}
-                      className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-2.5 py-1.5 text-xs text-[#E5E7EB] hover:bg-[#2C2F34] disabled:opacity-50"
-                    >
-                      {t.peopleMergeAction}
-                    </button>
-                  </div>
-                )}
+                {totalMergeableEntities > 1 &&
+                  renderMergeControl({ kind: "person", id: selectedPerson.person_id })}
               </div>
             )}
 
-            {/* Smart "Possibly the same person?" 1-click visual merge bar */}
             {activeEntityRef && activeSimilar.length > 0 && (
-              <div className="mt-1 space-y-2 rounded-lg border border-[#5B8DEF]/35 bg-[#5B8DEF]/10 p-3">
-                <div className="text-xs font-medium text-[#BFDBFE]">{t.peopleSimilarTitle}</div>
-                <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-col gap-4">
+                <p className="text-sm font-medium text-ink" title={t.peopleSimilarTitle}>
+                  {headline(t.peopleSimilarTitle)}
+                </p>
+                <div className="flex flex-wrap gap-x-8 gap-y-4">
                   {activeSimilar.map((cand) => {
                     const label = getCandidateLabel(cand);
                     const pct = Math.max(1, Math.min(99, Math.round(cand.similarity * 100)));
                     return (
-                      <div
-                        key={`${cand.kind}:${cand.target_id}`}
-                        className="flex items-center gap-2 rounded-lg border border-[#33363B] bg-[#1F2124] px-2.5 py-1.5 text-xs"
-                      >
-                        {cand.cover_photo_id && cand.cover_face_idx !== null ? (
-                          <img
-                            src={photoFaceCropUrl(cand.cover_photo_id, cand.cover_face_idx, 64)}
-                            alt={label}
-                            className="h-8 w-8 shrink-0 rounded-full bg-[#1B1C1E] object-cover"
-                          />
-                        ) : (
-                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#1B1C1E] text-xs text-[#9CA3AF]">
-                            {label.slice(0, 1)}
-                          </span>
-                        )}
-                        <div className="min-w-0">
-                          <div className="font-medium text-[#F3F4F6]">{label}</div>
-                          <div className="text-[11px] text-[#9CA3AF] tabular-nums">
-                            {t.photoCount(cand.photo_count)} · {t.peopleSimilarScore(pct)}
+                      <div key={`${cand.kind}:${cand.target_id}`} className="flex items-center gap-4">
+                        <Avatar
+                          size={40}
+                          label={label}
+                          src={
+                            cand.cover_photo_id && cand.cover_face_idx !== null
+                              ? photoFaceCropUrl(cand.cover_photo_id, cand.cover_face_idx, 64)
+                              : null
+                          }
+                        />
+                        <div className="min-w-0 text-sm">
+                          <div className="font-medium text-ink">{label}</div>
+                          <div className="text-ink-3 tabular-nums">
+                            {t.photoCount(cand.photo_count)}
+                            <span className="ml-2">{t.peopleSimilarScore(pct)}</span>
                           </div>
                         </div>
-                        <button
-                          type="button"
+                        <Button
+                          variant="secondary"
+                          size="sm"
                           disabled={mutating}
                           onClick={() => {
                             if (!activeEntityRef) return;
-                            const candRef: EntityRef = {
-                              kind: cand.kind,
-                              id: cand.target_id,
-                            };
-                            // Merge candidate into active entity (performPairMerge keeps named person if one side is named)
+                            const candRef: EntityRef = { kind: cand.kind, id: cand.target_id };
                             void performPairMerge(candRef, activeEntityRef);
                           }}
-                          className="ml-1 shrink-0 rounded-md bg-[#5B8DEF] px-2.5 py-1 text-[11px] font-medium text-white hover:bg-[#4A7CE0] disabled:opacity-50"
                         >
                           {t.peopleSimilarMergeBtn}
-                        </button>
+                        </Button>
                       </div>
                     );
                   })}
@@ -1239,50 +1144,54 @@ export function PeopleView({ onOpenReview }: PeopleViewProps) {
             )}
           </div>
 
-          {/* Photo grid (full untruncated list) */}
-          {peopleQ.isLoading ? (
-            <p className="py-10 text-sm text-[#9CA3AF]">{t.loading}</p>
-          ) : activePhotos.length === 0 ? (
-            <div className="rounded-lg border border-dashed border-[#33363B] py-14 text-center">
-              <p className="text-base text-[#F3F4F6]">{t.peopleEmptyGroup}</p>
-              <p className="mt-1 text-sm text-[#9CA3AF]">{t.peopleEmptyHint}</p>
-            </div>
-          ) : (
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4">
-              {activePhotos.map((item) => (
-                <div
-                  key={item.photo_id}
-                  className="group relative flex flex-col rounded-lg border border-[#33363B] bg-[#242629]"
-                >
-                  <div className="relative aspect-[4/3] w-full overflow-hidden rounded-t-lg bg-[#1B1C1E]">
-                    <img
-                      src={photoImageUrl(item.photo_id, "grid")}
-                      alt={item.stem}
-                      loading="lazy"
-                      className="h-full w-full object-cover"
-                    />
-                    {item.valid_face_count >= 2 && (
-                      <span className="absolute left-2 top-2 rounded bg-black/70 px-2 py-0.5 text-[11px] font-medium text-[#F3F4F6] tabular-nums">
-                        {t.peopleHeadcountBadge(item.valid_face_count)}
-                      </span>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => onOpenReview(item.session_id)}
-                      className="absolute right-2 top-2 rounded bg-[#1B1C1E]/85 px-2 py-0.5 text-[11px] text-[#E5E7EB] opacity-0 transition hover:bg-[#2C2F34] group-hover:opacity-100 focus:opacity-100"
-                    >
-                      {t.searchOpenSession}
-                    </button>
-                  </div>
+          {/* Photo grid */}
+          <div className="mt-12">
+            {peopleQ.isLoading ? (
+              <Loading label={t.loading} />
+            ) : activePhotos.length === 0 ? (
+              <EmptyState title={t.peopleEmptyGroup}>
+                {sessions.length > 0 && (
+                  <Button
+                    variant="secondary"
+                    icon={Scan}
+                    disabled={indexing}
+                    onClick={() => void handleIndexPeople()}
+                  >
+                    {indexing ? t.peopleIndexing : t.peopleIndexAction}
+                  </Button>
+                )}
+              </EmptyState>
+            ) : (
+              <div className="grid grid-cols-1 gap-x-4 gap-y-8 sm:grid-cols-2 xl:grid-cols-3">
+                {activePhotos.map((item) => (
+                  <article key={item.photo_id} className="intent flex min-w-0 flex-col gap-2">
+                    <div className="relative aspect-[4/3] w-full overflow-hidden rounded-tile bg-table">
+                      <img
+                        src={photoImageUrl(item.photo_id, "grid")}
+                        alt={item.stem}
+                        loading="lazy"
+                        className="h-full w-full object-cover"
+                      />
+                      {item.valid_face_count >= 2 && (
+                        <span className="absolute left-2 top-2 rounded-chip bg-paper/90 px-2 py-1 text-xs font-medium text-ink tabular-nums">
+                          {t.peopleHeadcountBadge(item.valid_face_count)}
+                        </span>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        className="reveal absolute right-2 top-2 bg-paper/90"
+                        onClick={() => onOpenReview(item.session_id)}
+                      >
+                        {t.searchOpenSession}
+                      </Button>
+                    </div>
 
-                  <div className="flex flex-1 flex-col justify-between gap-1.5 p-2.5">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-xs font-medium text-[#F3F4F6]">
+                    <div className="min-w-0 px-1 text-sm">
+                      <div className="truncate font-medium text-ink" title={item.stem}>
                         {item.stem}
-                      </span>
-                      <span className="shrink-0 text-[11px] text-[#9CA3AF]">
-                        {item.session_name}
-                      </span>
+                      </div>
+                      <div className="truncate text-ink-3">{item.session_name}</div>
                     </div>
 
                     {item.faces.length > 0 && (
@@ -1295,165 +1204,143 @@ export function PeopleView({ onOpenReview }: PeopleViewProps) {
                             f.person_id !== null ||
                             (f.cluster_id !== null &&
                               (clusterById.get(f.cluster_id)?.face_count ?? 0) > 1);
+                          const reassignTargets: MenuItem[] = [
+                            ...(data?.people ?? [])
+                              .filter((p) => p.person_id !== f.person_id)
+                              .map((p) => ({
+                                key: `person:${p.person_id}`,
+                                label: p.name,
+                                icon: (
+                                  <Avatar
+                                    size={20}
+                                    label={p.name}
+                                    src={
+                                      p.cover_photo_id && p.cover_face_idx !== null
+                                        ? photoFaceCropUrl(p.cover_photo_id, p.cover_face_idx, 64)
+                                        : null
+                                    }
+                                  />
+                                ),
+                                disabled: mutating,
+                                onSelect: () =>
+                                  void handleReassignFace(f.content_fp, f.face_idx, {
+                                    kind: "person",
+                                    id: p.person_id,
+                                  }),
+                              })),
+                            ...(data?.unnamed_clusters ?? [])
+                              .filter((c) => c.cluster_id !== f.cluster_id)
+                              .map((c) => {
+                                const num = clusterIndexById.get(c.cluster_id) ?? 1;
+                                return {
+                                  key: `cluster:${c.cluster_id}`,
+                                  label: t.peopleClusterLabel(num),
+                                  icon: (
+                                    <Avatar
+                                      size={20}
+                                      label={t.peopleClusterLabel(num)}
+                                      src={photoFaceCropUrl(c.cover_photo_id, c.cover_face_idx, 64)}
+                                    />
+                                  ),
+                                  disabled: mutating,
+                                  onSelect: () =>
+                                    void handleReassignFace(f.content_fp, f.face_idx, {
+                                      kind: "cluster",
+                                      id: c.cluster_id,
+                                    }),
+                                };
+                              }),
+                          ];
+                          const menuItems: MenuItem[] = [
+                            ...(canSplit
+                              ? [
+                                  {
+                                    key: "split",
+                                    label: headline(t.peopleFaceSplitAction),
+                                    icon: <Icon as={Scissor} />,
+                                    disabled: mutating,
+                                    onSelect: () => void handleSplitFace(f.content_fp, f.face_idx),
+                                  },
+                                ]
+                              : []),
+                            ...(totalMergeableEntities > 1 && reassignTargets.length > 0
+                              ? [
+                                  {
+                                    key: "reassign",
+                                    label: t.peopleFaceReassignTitle,
+                                    icon: <Icon as={Users} />,
+                                    submenu: reassignTargets,
+                                  },
+                                ]
+                              : []),
+                            {
+                              key: "ignore",
+                              label: t.peopleIgnoreFace,
+                              icon: <Icon as={EyeOff} />,
+                              tone: "mark" as const,
+                              groupStart: true,
+                              disabled: mutating,
+                              onSelect: () => void handleIgnoreFace(f.content_fp, f.face_idx),
+                            },
+                          ];
                           return (
-                            <div key={f.face_idx} className="relative">
-                              <button
-                                type="button"
-                                disabled={mutating || f.status === "ignored"}
-                                onClick={() =>
-                                  setActiveFaceMenu(
-                                    menuOpen
-                                      ? null
-                                      : { photoId: item.photo_id, faceIdx: f.face_idx },
-                                  )
-                                }
-                                className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition ${
-                                  f.status === "ignored"
-                                    ? "cursor-default bg-[#1B1C1E] text-[#6B7280] line-through"
-                                    : f.person_name
-                                      ? "bg-[#3D9A6B]/20 text-[#A7F3D0] hover:bg-[#3D9A6B]/35"
-                                      : "bg-[#5B8DEF]/20 text-[#93C5FD] hover:bg-[#5B8DEF]/35"
-                                } ${menuOpen ? "ring-1 ring-[#F3F4F6]" : ""}`}
-                              >
-                                <span>{renderFaceLabel(f)}</span>
-                                {f.status !== "ignored" && (
-                                  <span className="text-[9px] opacity-70">▾</span>
-                                )}
-                              </button>
-
-                              {/* Single-face correction popover (Split / Reassign / Ignore) */}
-                              {menuOpen && (
-                                <div className="absolute left-0 top-full z-30 mt-1 w-52 rounded-lg border border-[#3F434A] bg-[#1F2124] p-2 text-xs shadow-2xl">
-                                  <div className="mb-1.5 flex items-center justify-between border-b border-[#33363B] pb-1.5">
-                                    <span className="flex items-center gap-1.5 font-medium text-[#F3F4F6]">
-                                      <img
-                                        src={photoFaceCropUrl(item.photo_id, f.face_idx, 64)}
-                                        alt=""
-                                        className="h-5 w-5 rounded-full object-cover"
-                                      />
-                                      <span className="truncate">{renderFaceLabel(f)}</span>
-                                    </span>
-                                    <button
-                                      type="button"
-                                      onClick={() => setActiveFaceMenu(null)}
-                                      className="rounded px-1 text-[#9CA3AF] hover:text-[#F3F4F6]"
-                                    >
-                                      ✕
-                                    </button>
-                                  </div>
-
-                                  {canSplit && (
-                                    <button
-                                      type="button"
-                                      disabled={mutating}
-                                      onClick={() => void handleSplitFace(f.content_fp, f.face_idx)}
-                                      className="mb-1 flex w-full items-center rounded px-2 py-1.5 text-left text-[#FCD34D] hover:bg-[#2C2F34]"
-                                    >
-                                      {t.peopleFaceSplitAction}
-                                    </button>
-                                  )}
-
-                                  {totalMergeableEntities > 1 && (
-                                    <div className="border-t border-[#33363B] pt-1.5">
-                                      <div className="px-1 pb-1 text-[10px] text-[#9CA3AF]">
-                                        {t.peopleFaceReassignTitle}
-                                      </div>
-                                      <div className="max-h-36 space-y-0.5 overflow-y-auto">
-                                        {(data?.people ?? [])
-                                          .filter((p) => p.person_id !== f.person_id)
-                                          .map((p) => (
-                                            <button
-                                              key={p.person_id}
-                                              type="button"
-                                              disabled={mutating}
-                                              onClick={() =>
-                                                void handleReassignFace(f.content_fp, f.face_idx, {
-                                                  kind: "person",
-                                                  id: p.person_id,
-                                                })
-                                              }
-                                              className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[#E5E7EB] hover:bg-[#2C2F34]"
-                                            >
-                                              {p.cover_photo_id && p.cover_face_idx !== null && (
-                                                <img
-                                                  src={photoFaceCropUrl(
-                                                    p.cover_photo_id,
-                                                    p.cover_face_idx,
-                                                    64,
-                                                  )}
-                                                  alt=""
-                                                  className="h-4 w-4 shrink-0 rounded-full object-cover"
-                                                />
-                                              )}
-                                              <span className="truncate">{p.name}</span>
-                                            </button>
-                                          ))}
-                                        {(data?.unnamed_clusters ?? [])
-                                          .filter((c) => c.cluster_id !== f.cluster_id)
-                                          .map((c) => {
-                                            const num = clusterIndexById.get(c.cluster_id) ?? 1;
-                                            return (
-                                              <button
-                                                key={c.cluster_id}
-                                                type="button"
-                                                disabled={mutating}
-                                                onClick={() =>
-                                                  void handleReassignFace(
-                                                    f.content_fp,
-                                                    f.face_idx,
-                                                    {
-                                                      kind: "cluster",
-                                                      id: c.cluster_id,
-                                                    },
-                                                  )
-                                                }
-                                                className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[#D1D5DB] hover:bg-[#2C2F34]"
-                                              >
-                                                <img
-                                                  src={photoFaceCropUrl(
-                                                    c.cover_photo_id,
-                                                    c.cover_face_idx,
-                                                    64,
-                                                  )}
-                                                  alt=""
-                                                  className="h-4 w-4 shrink-0 rounded-full object-cover"
-                                                />
-                                                <span className="truncate">
-                                                  {t.peopleClusterLabel(num)}
-                                                </span>
-                                              </button>
-                                            );
-                                          })}
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  <div className="mt-1 border-t border-[#33363B] pt-1">
-                                    <button
-                                      type="button"
-                                      disabled={mutating}
-                                      onClick={() =>
-                                        void handleIgnoreFace(f.content_fp, f.face_idx)
-                                      }
-                                      className="flex w-full items-center rounded px-2 py-1.5 text-left text-[#FCA5A5] hover:bg-[#DC4C46]/15"
-                                    >
-                                      {t.peopleIgnoreFace}
-                                    </button>
-                                  </div>
+                            <FaceChip
+                              key={f.face_idx}
+                              label={renderFaceLabel(f)}
+                              tone={
+                                f.status === "ignored" ? "ignored" : f.person_name ? "named" : "unnamed"
+                              }
+                              open={menuOpen}
+                              disabled={mutating || f.status === "ignored"}
+                              onToggle={() =>
+                                setActiveFaceMenu(
+                                  menuOpen ? null : { photoId: item.photo_id, faceIdx: f.face_idx },
+                                )
+                              }
+                              onClose={() => setActiveFaceMenu(null)}
+                              menuItems={menuItems}
+                              menuHeader={
+                                <div className="flex items-center gap-2">
+                                  <Avatar
+                                    size={32}
+                                    label={renderFaceLabel(f)}
+                                    src={photoFaceCropUrl(item.photo_id, f.face_idx, 64)}
+                                  />
+                                  <span className="truncate text-sm font-medium text-ink">
+                                    {renderFaceLabel(f)}
+                                  </span>
                                 </div>
-                              )}
-                            </div>
+                              }
+                            />
                           );
                         })}
                       </div>
                     )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
         </section>
       </div>
+
+      <NoticeDock>
+        {notice && (
+          <Notice onDismiss={() => setNotice(null)} dismissLabel={t.uiDismiss}>
+            {notice}
+          </Notice>
+        )}
+        {(error || peopleQ.error) && (
+          <Notice
+            tone="error"
+            onDismiss={error ? () => setError(null) : undefined}
+            dismissLabel={t.uiDismiss}
+          >
+            {t.errorPrefix}
+            {error ?? (peopleQ.error instanceof Error ? peopleQ.error.message : "")}
+          </Notice>
+        )}
+      </NoticeDock>
 
       {showExportModal && data && (
         <ExportPeopleModal

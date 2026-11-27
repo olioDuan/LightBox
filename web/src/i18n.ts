@@ -5,6 +5,10 @@ export type Lang = "zh-CN" | "en-US";
 const MESSAGES = {
   "zh-CN": {
     appName: "Lightbox",
+    uiMore: "更多操作",
+    uiDismiss: "关闭",
+    uiPrevPhoto: "上一张",
+    uiNextPhoto: "下一张",
     navSessions: "场次",
     navSearch: "搜索",
     navPeople: "人物",
@@ -470,6 +474,8 @@ const MESSAGES = {
     memorySaving: "保存中…",
     memorySavedToast: "preferences.md 已保存。",
     memoryUnsavedBadge: "未保存更改",
+    memoryUnsavedBeforeDecideConfirm:
+      "preferences.md 编辑器中有未保存的手工修改。点击「确定」将先保存当前编辑内容再应用该规则审批；点击「取消」返回继续编辑。",
     memoryHistoryTitle: "已处理规则记录",
     memoryStatusLabels: {
       proposed: "待审核",
@@ -479,6 +485,10 @@ const MESSAGES = {
   },
   "en-US": {
     appName: "Lightbox",
+    uiMore: "More actions",
+    uiDismiss: "Dismiss",
+    uiPrevPhoto: "Previous photo",
+    uiNextPhoto: "Next photo",
     navSessions: "Sessions",
     navSearch: "Search",
     navPeople: "People",
@@ -961,6 +971,8 @@ const MESSAGES = {
     memorySaving: "Saving…",
     memorySavedToast: "preferences.md saved.",
     memoryUnsavedBadge: "Unsaved changes",
+    memoryUnsavedBeforeDecideConfirm:
+      "You have unsaved edits in preferences.md. Click OK to save your current edits first and then apply this rule decision, or Cancel to keep editing.",
     memoryHistoryTitle: "Reviewed rule history",
     memoryStatusLabels: {
       proposed: "Proposed",

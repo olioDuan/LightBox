@@ -10,6 +10,8 @@ import {
 } from "../api";
 import { useI18n } from "../i18n";
 import { QuarantineModal } from "./QuarantineModal";
+import { Button, Icon, IconButton, Kbd, ProgressLine } from "./ui";
+import { Check, Lightning, Plus, Send, Sparkles, X } from "reicon-react";
 
 interface AgentDrawerProps {
   open: boolean;
@@ -277,49 +279,38 @@ export function AgentDrawer({
   const verifierSeverity = verifierReport ? renderVerifierSeverity(verifierReport) : null;
   const ctxK = ((agentSession?.context_tokens_est ?? 0) / 1000).toFixed(1);
 
+  const stageIdx = STAGES.indexOf(displayedStage as (typeof STAGES)[number]);
+
   return (
     <>
       <div
-        className="fixed inset-0 z-40 flex justify-end bg-black/45"
+        className="fade-enter fixed inset-0 z-40 flex justify-end bg-[#181818]/20"
         onClick={onClose}
         role="presentation"
       >
         <aside
-          className="flex h-full w-full max-w-[460px] flex-col border-l border-[#33363B] bg-[#1B1C1E] text-[#F3F4F6] shadow-2xl"
+          className="sheet-enter flex h-full w-full max-w-[480px] flex-col bg-paper sm:my-2 sm:mr-2 sm:h-[calc(100%-16px)] sm:rounded-dialog"
           onClick={(e) => e.stopPropagation()}
           aria-label={t.agentDrawerTitle}
         >
           {/* Header */}
-          <div className="shrink-0 space-y-2.5 border-b border-[#33363B] bg-[#242629] px-4 py-3">
+          <div className="shrink-0 space-y-6 px-6 pb-4 pt-6">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
-                <span className="inline-block h-2 w-2 rounded-full bg-[#5B8DEF]" />
-                <h2 className="text-sm font-semibold text-[#F3F4F6]">{t.agentDrawerTitle}</h2>
-                <kbd className="rounded border border-[#33363B] bg-[#1B1C1E] px-1.5 py-0.5 font-mono text-[10px] text-[#9CA3AF]">
-                  ⌘K
-                </kbd>
+                <Icon as={Sparkles} />
+                <h2 className="text-lg font-semibold text-ink">{t.agentDrawerTitle}</h2>
+                <Kbd>⌘K</Kbd>
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1">
                 {agentSession && (
-                  <button
-                    type="button"
-                    onClick={handleResetConversation}
-                    className="rounded border border-[#33363B] px-2 py-1 text-[11px] text-[#D1D5DB] hover:bg-[#2C2F34]"
-                  >
+                  <Button variant="ghost" size="sm" icon={Plus} onClick={handleResetConversation}>
                     {t.agentNewChatBtn}
-                  </button>
+                  </Button>
                 )}
-                <button
-                  type="button"
-                  onClick={onClose}
-                  className="rounded border border-[#33363B] px-2 py-1 text-[11px] text-[#9CA3AF] hover:bg-[#2C2F34] hover:text-[#F3F4F6]"
-                >
-                  {t.agentClose}
-                </button>
+                <IconButton icon={X} label={t.agentClose} onClick={onClose} />
               </div>
             </div>
 
-            {/* Session selector + Manual Supervisor Trigger */}
             <div className="flex items-center gap-2">
               <select
                 value={selectedSessionId}
@@ -328,7 +319,7 @@ export function AgentDrawer({
                   handleResetConversation();
                 }}
                 aria-label={t.agentSelectSession}
-                className="min-w-0 flex-1 rounded border border-[#33363B] bg-[#1B1C1E] px-2.5 py-1.5 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+                className="field min-w-0 flex-1"
               >
                 {sessions.length === 0 ? (
                   <option value="">{t.agentNoSessions}</option>
@@ -340,60 +331,57 @@ export function AgentDrawer({
                   ))
                 )}
               </select>
-              <button
-                type="button"
+              <Button
+                variant="secondary"
                 disabled={!selectedSessionId || running}
                 onClick={() => void handleRunSupervisor()}
-                className="shrink-0 rounded border border-[#5B8DEF]/50 bg-[#5B8DEF]/15 px-2.5 py-1.5 text-xs font-medium text-[#93C5FD] hover:bg-[#5B8DEF]/25 disabled:opacity-45"
               >
                 {t.agentSupervisorBtn}
-              </button>
+              </Button>
             </div>
 
-            {/* Technical Architecture Telemetry Bar: Stages + Context + Budget + Whitelist */}
-            <div className="space-y-1.5 rounded border border-[#33363B] bg-[#1B1C1E] px-2.5 py-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1">
-                  {STAGES.map((st, idx) => {
-                    const active = displayedStage === st;
-                    return (
-                      <span key={st} className="flex items-center gap-1">
-                        <span
-                          className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                            active
-                              ? "bg-[#5B8DEF]/25 text-[#93C5FD]"
-                              : "bg-[#242629] text-[#6B7280]"
-                          }`}
-                        >
-                          {t.agentStageLabels[st] ?? st}
-                        </span>
-                        {idx < STAGES.length - 1 && (
-                          <span className="text-[10px] text-[#4B5563]">→</span>
-                        )}
+            {/* Stages are a real sequence: explore → review → propose */}
+            <div className="flex flex-col gap-2">
+              <ol className="flex items-center gap-2 text-sm">
+                {STAGES.map((st, idx) => {
+                  const active = displayedStage === st;
+                  const passed = stageIdx > idx;
+                  return (
+                    <li key={st} className="flex flex-1 flex-col gap-2">
+                      <span
+                        className={`h-1 rounded-full transition-colors duration-300 ${
+                          active && running
+                            ? "progress-indeterminate bg-table-2"
+                            : active
+                              ? "bg-ink"
+                              : passed
+                                ? "bg-ink-3"
+                                : "bg-table-2"
+                        }`}
+                      />
+                      <span className={active ? "font-medium text-ink" : "text-ink-3"}>
+                        {t.agentStageLabels[st] ?? st}
                       </span>
-                    );
-                  })}
-                </div>
-                <span className="rounded bg-[#3D9A6B]/15 px-1.5 py-0.5 text-[10px] text-[#86EFAC]">
-                  {t.agentWhitelistBadge}
-                </span>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-[#9CA3AF] tabular-nums">
+                    </li>
+                  );
+                })}
+              </ol>
+              <div
+                className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-ink-3 tabular-nums"
+                title={`${t.agentWhitelistBadge}\n${t.agentZeroKeyNote}`}
+              >
                 <span>{t.agentContextTokens(ctxK)}</span>
                 {(agentSession?.stage_rebuilds ?? 0) > 0 && (
-                  <span className="text-[#FCD34D]">
-                    {t.agentStageRebuilds(agentSession?.stage_rebuilds ?? 0)}
-                  </span>
+                  <span className="text-ink-2">{t.agentStageRebuilds(agentSession?.stage_rebuilds ?? 0)}</span>
                 )}
                 <span>{t.agentViewedPhotos(agentSession?.viewed_photos ?? 0)}</span>
                 <span>${(agentSession?.spent_usd ?? 0).toFixed(4)}</span>
               </div>
             </div>
 
-            {/* Pinned Hard Constraints */}
-            <div className="space-y-1.5">
-              <div className="flex items-center gap-1.5">
+            {/* Pinned hard constraints */}
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2">
                 <input
                   type="text"
                   value={constraintInput}
@@ -405,35 +393,34 @@ export function AgentDrawer({
                     }
                   }}
                   placeholder={t.agentConstraintPlaceholder}
-                  className="min-w-0 flex-1 rounded border border-[#33363B] bg-[#1B1C1E] px-2 py-1 text-[11px] text-[#F3F4F6] placeholder-[#6B7280] focus:border-[#5B8DEF] focus:outline-none"
+                  aria-label={t.agentConstraintsLabel}
+                  className="field h-8 min-w-0 flex-1 rounded-chip px-3"
                 />
-                <button
-                  type="button"
-                  onClick={handleAddConstraint}
-                  className="rounded border border-[#33363B] bg-[#1B1C1E] px-2 py-1 text-[11px] text-[#D1D5DB] hover:bg-[#2C2F34]"
-                >
-                  {t.agentConstraintAdd}
-                </button>
+                {constraintInput.trim() && (
+                  <Button variant="secondary" size="sm" className="fade-enter" onClick={handleAddConstraint}>
+                    {t.agentConstraintAdd}
+                  </Button>
+                )}
               </div>
               {displayedConstraints.length > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] text-[#9CA3AF]">{t.agentConstraintsLabel}:</span>
+                <div className="flex flex-wrap items-center gap-1" aria-label={t.agentConstraintsLabel}>
                   {displayedConstraints.map((c) => (
                     <span
                       key={c}
-                      className="inline-flex items-center gap-1 rounded bg-[#D99B26]/15 px-1.5 py-0.5 text-[10px] text-[#FCD34D]"
+                      className="inline-flex h-8 items-center gap-1 rounded-chip bg-table pl-3 pr-1 text-sm text-ink"
                     >
                       <span>{c}</span>
-                      {!agentSession && (
+                      {!agentSession ? (
                         <button
                           type="button"
-                          onClick={() =>
-                            setConstraints((prev) => prev.filter((item) => item !== c))
-                          }
-                          className="text-[#F5D07A] hover:text-white"
+                          aria-label={`${t.uiDismiss} ${c}`}
+                          onClick={() => setConstraints((prev) => prev.filter((item) => item !== c))}
+                          className="flex h-6 w-6 items-center justify-center rounded-[6px] text-ink-3 hover:bg-table-2 hover:text-ink"
                         >
-                          ×
+                          <X size={14} strokeWidth={1.5} />
                         </button>
+                      ) : (
+                        <span className="w-2" />
                       )}
                     </span>
                   ))}
@@ -442,95 +429,79 @@ export function AgentDrawer({
             </div>
           </div>
 
-          {/* Scrollable Timeline Body */}
-          <div ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-3">
-            {/* Live `update_plan` Todos */}
+          {/* Timeline */}
+          <div ref={scrollRef} className="min-h-0 flex-1 space-y-6 overflow-y-auto px-6 py-4">
             {displayedTodos.length > 0 && (
-              <div className="rounded-md border border-[#33363B] bg-[#242629] p-3">
-                <div className="text-[11px] font-medium text-[#D1D5DB]">{t.agentTodosTitle}</div>
-                <ul className="mt-2 space-y-1.5">
-                  {displayedTodos.map((todo) => {
-                    const dot =
-                      todo.status === "done"
-                        ? "bg-[#3D9A6B]"
-                        : todo.status === "in_progress"
-                          ? "bg-[#5B8DEF] animate-pulse"
-                          : "bg-[#4B5563]";
-                    return (
-                      <li
-                        key={todo.id}
-                        className="flex items-center gap-2 text-xs text-[#E5E7EB]"
+              <section className="flex flex-col gap-2">
+                <h3 className="text-sm font-medium text-ink">{t.agentTodosTitle}</h3>
+                <ul className="flex flex-col gap-1">
+                  {displayedTodos.map((todo) => (
+                    <li key={todo.id} className="flex items-center gap-2 text-sm">
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center">
+                        {todo.status === "done" ? (
+                          <Check size={16} strokeWidth={1.5} className="text-ink-3" />
+                        ) : todo.status === "in_progress" ? (
+                          <span className="h-2 w-2 animate-pulse rounded-full bg-ink" />
+                        ) : (
+                          <span className="h-2 w-2 rounded-full shadow-[inset_0_0_0_1.5px_var(--color-ink-3)]" />
+                        )}
+                      </span>
+                      <span
+                        className={
+                          todo.status === "done"
+                            ? "text-ink-3 line-through"
+                            : todo.status === "in_progress"
+                              ? "font-medium text-ink"
+                              : "text-ink-2"
+                        }
                       >
-                        <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${dot}`} />
-                        <span
-                          className={
-                            todo.status === "done" ? "text-[#9CA3AF] line-through" : ""
-                          }
-                        >
-                          {todo.title}
-                        </span>
-                      </li>
-                    );
-                  })}
+                        {todo.title}
+                      </span>
+                    </li>
+                  ))}
                 </ul>
-              </div>
+              </section>
             )}
 
-            {/* Empty State + Recent Sessions */}
-            {displayedEvents.length === 0 && !running && (
-              <div className="space-y-3 py-4">
-                <p className="text-xs leading-relaxed text-[#9CA3AF]">{t.agentEmptyHint}</p>
-                <p className="rounded border border-[#33363B] bg-[#242629] px-3 py-2 text-[11px] text-[#9CA3AF]">
-                  {t.agentZeroKeyNote}
-                </p>
-                {recentRuns.length > 0 && (
-                  <div className="space-y-1.5 pt-2">
-                    <div className="text-[11px] font-medium text-[#9CA3AF]">{t.agentRecentRuns}</div>
-                    {recentRuns.slice(0, 4).map((run) => (
-                      <button
-                        key={run.agent_session_id}
-                        type="button"
-                        onClick={() => void handleSelectRecent(run.agent_session_id)}
-                        className="flex w-full items-center justify-between gap-2 rounded border border-[#33363B] bg-[#242629] px-2.5 py-2 text-left text-xs hover:bg-[#2C2F34]"
-                      >
-                        <span className="truncate text-[#E5E7EB]">
-                          {run.latest_user_message || run.mode}
-                        </span>
-                        <span className="shrink-0 font-mono text-[10px] text-[#9CA3AF]">
-                          {run.status}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
+            {displayedEvents.length === 0 && !running && recentRuns.length > 0 && (
+              <section className="flex flex-col gap-2" title={t.agentEmptyHint}>
+                <h3 className="text-sm font-medium text-ink">{t.agentRecentRuns}</h3>
+                <div className="-mx-2 flex flex-col">
+                  {recentRuns.slice(0, 4).map((run) => (
+                    <button
+                      key={run.agent_session_id}
+                      type="button"
+                      onClick={() => void handleSelectRecent(run.agent_session_id)}
+                      className="flex h-12 items-center justify-between gap-4 rounded-btn px-2 text-left text-sm hover:bg-table"
+                    >
+                      <span className="truncate text-ink">{run.latest_user_message || run.mode}</span>
+                      <span className="shrink-0 text-ink-3">{run.status}</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
             )}
 
-            {/* Event Timeline: User messages, Tool calls, Stage rebuilds, Assistant replies */}
             {displayedEvents.map((ev) => {
               const p = ev.payload;
               if (ev.event_type === "session_started" || ev.event_type === "user_message") {
                 const text = String(p.display_text ?? p.message ?? p.text ?? "").trim();
                 if (!text) return null;
                 return (
-                  <div
-                    key={`${ev.seq}-${ev.event_type}`}
-                    className="ml-6 rounded-lg border border-[#5B8DEF]/30 bg-[#5B8DEF]/10 px-3 py-2 text-xs text-[#E5E7EB]"
-                  >
-                    {text}
+                  <div key={`${ev.seq}-${ev.event_type}`} className="flex justify-end">
+                    <div className="max-w-[85%] rounded-[20px] rounded-br-[8px] bg-table px-4 py-2 text-sm leading-6 text-ink">
+                      {text}
+                    </div>
                   </div>
                 );
               }
 
               if (ev.event_type === "stage_rebuild") {
                 return (
-                  <div
-                    key={`${ev.seq}-${ev.event_type}`}
-                    className="rounded border border-[#D99B26]/35 bg-[#D99B26]/10 px-2.5 py-1.5 font-mono text-[10px] text-[#FCD34D]"
-                  >
-                    Stage rebuild: {String(p.from_stage ?? "")} → {String(p.to_stage ?? "")} (
-                    {String(p.prev_tokens_est ?? "")} tok → clean SQLite anchor)
-                  </div>
+                  <p key={`${ev.seq}-${ev.event_type}`} className="text-sm text-ink-3 tabular-nums">
+                    {String(p.from_stage ?? "")} → {String(p.to_stage ?? "")} ·{" "}
+                    {String(p.prev_tokens_est ?? "")} tok
+                  </p>
                 );
               }
 
@@ -540,24 +511,18 @@ export function AgentDrawer({
                   ? (p.tool_calls as Array<{ id: string; name: string; arguments?: unknown }>)
                   : [];
                 return (
-                  <div key={`${ev.seq}-${ev.event_type}`} className="space-y-1.5">
+                  <div key={`${ev.seq}-${ev.event_type}`} className="flex flex-col gap-2">
                     {calls.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5">
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-ink-3">
                         {calls.map((c) => (
-                          <span
-                            key={c.id}
-                            className="inline-flex items-center gap-1 rounded border border-[#33363B] bg-[#242629] px-2 py-0.5 font-mono text-[10px] text-[#93C5FD]"
-                          >
-                            <span>⚡ {c.name}</span>
+                          <span key={c.id} className="inline-flex items-center gap-1">
+                            <Lightning size={14} strokeWidth={1.5} />
+                            {c.name}
                           </span>
                         ))}
                       </div>
                     )}
-                    {text && (
-                      <div className="whitespace-pre-wrap rounded-lg border border-[#33363B] bg-[#242629] px-3 py-2.5 text-xs leading-relaxed text-[#F3F4F6]">
-                        {text}
-                      </div>
-                    )}
+                    {text && <div className="whitespace-pre-wrap text-sm leading-6 text-ink">{text}</div>}
                   </div>
                 );
               }
@@ -573,24 +538,16 @@ export function AgentDrawer({
                   : [];
                 if (results.length === 0) return null;
                 return (
-                  <div key={`${ev.seq}-${ev.event_type}`} className="flex flex-wrap gap-1.5">
-                    {results.map((r) => (
-                      <span
-                        key={r.tool_call_id}
-                        className={`rounded px-2 py-0.5 font-mono text-[10px] ${
-                          r.is_error
-                            ? "bg-[#DC4C46]/15 text-[#FCA5A5]"
-                            : "bg-[#3D9A6B]/15 text-[#86EFAC]"
-                        }`}
-                      >
-                        {r.name ?? "tool"}:{" "}
-                        {r.hook_decision === "DENY"
-                          ? "DENY"
-                          : r.is_error
-                            ? "ERR"
-                            : "OK"}
-                      </span>
-                    ))}
+                  <div key={`${ev.seq}-${ev.event_type}`} className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+                    {results.map((r) => {
+                      const bad = r.is_error || r.hook_decision === "DENY";
+                      return (
+                        <span key={r.tool_call_id} className={bad ? "text-mark" : "text-ink-3"}>
+                          {r.name ?? "tool"}{" "}
+                          {r.hook_decision === "DENY" ? "DENY" : r.is_error ? "ERR" : "OK"}
+                        </span>
+                      );
+                    })}
                   </div>
                 );
               }
@@ -598,129 +555,105 @@ export function AgentDrawer({
               return null;
             })}
 
-            {/* Interactive ASK Pause Card */}
             {agentSession?.status === "awaiting_user" && agentSession.pending_ask && (
-              <div className="space-y-2.5 rounded-md border border-[#D99B26]/50 bg-[#D99B26]/10 p-3">
-                <div className="text-xs font-semibold text-[#FCD34D]">{t.agentAskTitle}</div>
-                <div className="font-mono text-[11px] text-[#FDE68A]">
-                  {agentSession.pending_ask.tool_call.name}
+              <section className="fade-enter flex flex-col gap-2 rounded-panel bg-table p-4">
+                <div className="flex items-center gap-2 text-sm font-medium text-ink">
+                  <span className="h-2 w-2 rounded-full bg-unsure" />
+                  {t.agentAskTitle}
                 </div>
-                <p className="text-xs text-[#F5D07A]">{agentSession.pending_ask.reason}</p>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
+                <div className="text-sm text-ink-2">{agentSession.pending_ask.tool_call.name}</div>
+                <p className="text-sm leading-6 text-ink">{agentSession.pending_ask.reason}</p>
+                <div className="flex items-center gap-2 pt-2">
+                  <Button
+                    variant="primary"
+                    size="sm"
                     disabled={running}
-                    onClick={() =>
-                      void handleSendMessage({ message: "Approved", approveAsk: true })
-                    }
-                    className="rounded bg-[#D99B26] px-3 py-1.5 text-xs font-medium text-[#1B1C1E] hover:bg-[#E5A935] disabled:opacity-50"
+                    onClick={() => void handleSendMessage({ message: "Approved", approveAsk: true })}
                   >
                     {agentSession.pending_ask.suggested_budget_usd
                       ? `${t.agentAskApprove} ($${agentSession.pending_ask.suggested_budget_usd.toFixed(2)})`
                       : t.agentAskApprove}
-                  </button>
-                  <button
-                    type="button"
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     disabled={running}
-                    onClick={() =>
-                      void handleSendMessage({ message: "Declined", approveAsk: false })
-                    }
-                    className="rounded border border-[#33363B] bg-[#1B1C1E] px-3 py-1.5 text-xs text-[#D1D5DB] hover:bg-[#2C2F34] disabled:opacity-50"
+                    onClick={() => void handleSendMessage({ message: "Declined", approveAsk: false })}
                   >
                     {t.agentAskDecline}
-                  </button>
+                  </Button>
                 </div>
-              </div>
+              </section>
             )}
 
-            {/* Verifier Green / Yellow / Red Checklist Card + "去批准" Button */}
             {verifierReport && verifierSeverity && (
-              <div
-                className={`space-y-2 rounded-md border p-3 ${
-                  verifierSeverity === "red"
-                    ? "border-[#DC4C46]/50 bg-[#DC4C46]/10"
-                    : verifierSeverity === "yellow"
-                      ? "border-[#D99B26]/50 bg-[#D99B26]/10"
-                      : "border-[#3D9A6B]/50 bg-[#3D9A6B]/10"
-                }`}
-              >
+              <section className="fade-enter flex flex-col gap-2 rounded-panel bg-table p-4">
                 <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 text-sm font-medium text-ink">
                     <span
-                      className={`inline-block h-2 w-2 rounded-full ${
-                        verifierSeverity === "red"
-                          ? "bg-[#DC4C46]"
+                      className={`h-2 w-2 rounded-full ${
+                        verifierSeverity === "green"
+                          ? "bg-keep"
                           : verifierSeverity === "yellow"
-                            ? "bg-[#D99B26]"
-                            : "bg-[#3D9A6B]"
+                            ? "bg-unsure"
+                            : "bg-reject"
                       }`}
                     />
-                    <span className="text-xs font-medium text-[#F3F4F6]">
-                      {t.agentVerifierCardTitle}
-                    </span>
+                    {t.agentVerifierCardTitle}
                   </div>
                   {verifierReport.layer2?.model_id && (
-                    <span className="rounded border border-[#33363B] bg-[#1B1C1E] px-1.5 py-0.5 font-mono text-[10px] text-[#D1D5DB]">
-                      {verifierReport.layer2.model_id}
-                    </span>
+                    <span className="truncate text-sm text-ink-3">{verifierReport.layer2.model_id}</span>
                   )}
                 </div>
-
-                <div className="text-[11px] text-[#D1D5DB] tabular-nums">
+                <div className="text-sm text-ink-2 tabular-nums">
                   {t.verifierLayer1Checks(
                     Number(verifierReport.exempt_count ?? 0),
                     Number(verifierReport.unconfirmed_burst_non_pick_count ?? 0),
                     Number(verifierReport.incomplete_atomic_pair_count ?? 0),
                   )}
                 </div>
-
                 {(verifierReport.flagged_photos?.length ?? 0) > 0 && (
-                  <div className="text-[11px] text-[#FCD34D]">
+                  <div className="text-sm text-mark">
                     {t.verifierFlaggedHeader(verifierReport.flagged_photos?.length ?? 0)}
                   </div>
                 )}
-
                 {agentSession?.latest_plan?.plan_id && (
-                  <div className="flex items-center justify-between gap-2 pt-1">
-                    <span className="font-mono text-[11px] text-[#D1D5DB] tabular-nums">
+                  <div className="flex items-center justify-between gap-2 pt-2">
+                    <span className="text-sm font-medium text-ink tabular-nums">
                       {t.photoCount(agentSession.latest_plan.count)}
                     </span>
-                    <button
-                      type="button"
+                    <Button
+                      variant="mark"
+                      size="sm"
                       disabled={openingPlan}
-                      onClick={() =>
-                        void handleOpenApprovePlan(agentSession.latest_plan!.plan_id)
-                      }
-                      className="rounded bg-[#DC4C46] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#C63E38] disabled:opacity-50"
+                      onClick={() => void handleOpenApprovePlan(agentSession.latest_plan!.plan_id)}
                     >
                       {openingPlan ? t.agentOpeningPlan : t.agentGoApprove}
-                    </button>
+                    </Button>
                   </div>
                 )}
-              </div>
+              </section>
             )}
 
             {running && (
-              <div className="flex items-center gap-2 px-1 py-1 text-xs text-[#93C5FD]">
-                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-[#5B8DEF]" />
+              <div className="fade-enter flex items-center gap-4 text-sm text-ink-2">
+                <ProgressLine indeterminate className="w-16" />
                 <span>{t.agentThinking}</span>
               </div>
             )}
 
             {(error || agentSession?.error) && (
-              <div className="rounded border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-3 py-2 text-xs text-[#FCA5A5]">
-                {error || agentSession?.error}
-              </div>
+              <p className="text-sm text-mark">{error || agentSession?.error}</p>
             )}
           </div>
 
-          {/* Input Bar */}
+          {/* Composer */}
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void handleSendMessage();
             }}
-            className="flex shrink-0 items-center gap-2 border-t border-[#33363B] bg-[#242629] px-4 py-3"
+            className="relative shrink-0 p-4"
           >
             <input
               type="text"
@@ -728,15 +661,18 @@ export function AgentDrawer({
               disabled={!selectedSessionId || running}
               onChange={(e) => setInputText(e.target.value)}
               placeholder={t.agentInputPlaceholder}
-              className="min-w-0 flex-1 rounded-md border border-[#33363B] bg-[#1B1C1E] px-3 py-2 text-xs text-[#F3F4F6] placeholder-[#6B7280] focus:border-[#5B8DEF] focus:outline-none disabled:opacity-50"
+              aria-label={t.agentInputPlaceholder}
+              className="field h-12 w-full rounded-[24px] pl-5 pr-14"
             />
-            <button
+            <IconButton
               type="submit"
+              icon={Send}
+              label={t.agentSend}
+              variant="primary"
+              size="sm"
               disabled={!selectedSessionId || running || !inputText.trim()}
-              className="rounded-md bg-[#F3F4F6] px-3.5 py-2 text-xs font-medium text-[#1B1C1E] hover:bg-white disabled:opacity-45"
-            >
-              {t.agentSend}
-            </button>
+              className="absolute right-6 top-1/2 -translate-y-1/2 rounded-full"
+            />
           </form>
         </aside>
       </div>

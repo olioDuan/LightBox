@@ -1034,3 +1034,64 @@ def test_budget_ask_approval_raises_effective_budget_so_triage_runs(
         assert triage_data["paused_reason"] is None
         assert triage_data["reviewed_yellow"] == 1
 
+
+def test_path_aliasing_and_privacy_hook_handle_spaces_and_arbitrary_roots(
+    tmp_path: Path,
+) -> None:
+    """Regression: spaces in folder names and arbitrary roots (/data, /sessions, host-existing dirs) are masked & blocked."""
+    from lightbox.agent.context import alias_paths_in_text, resolve_path_aliases_in_args
+    from lightbox.models import ModelCallRequest, check_outbound_privacy
+
+    # 1. Existing folder with spaces (e.g. macOS ".../2026 Japan Trip") must NOT be truncated at the first space
+    spaced_dir = tmp_path / "2026 Japan Trip"
+    spaced_dir.mkdir()
+    prompt_zh = f"帮我把 {spaced_dir} 里糊的照片挑出来"
+    masked_zh, aliases_zh = alias_paths_in_text(prompt_zh)
+    assert masked_zh == "帮我把 <path_1> 里糊的照片挑出来"
+    assert aliases_zh["<path_1>"] == str(spaced_dir)
+    assert "Japan Trip" not in masked_zh
+    assert resolve_path_aliases_in_args({"path": "<path_1>"}, aliases_zh) == {"path": str(spaced_dir)}
+
+    prompt_en = f"Please scan {spaced_dir} for blurry frames"
+    masked_en, aliases_en = alias_paths_in_text(prompt_en)
+    assert masked_en == "Please scan <path_1> for blurry frames"
+    assert aliases_en["<path_1>"] == str(spaced_dir)
+
+    # 2. Arbitrary roots (/data/photos/wedding, /sessions/vm1/shoot) are masked AND blocked by privacy hook
+    dummy_spec = ModelSpec(
+        provider="anthropic",
+        protocol="anthropic",
+        family="anthropic",
+        model_id="claude-sonnet-5-5",
+    )
+    for raw_path in ("/data/photos/wedding", "/sessions/vm1/shoot"):
+        masked_custom, aliases_custom = alias_paths_in_text(f"Check {raw_path} please")
+        assert masked_custom == "Check <path_1> please"
+        assert aliases_custom["<path_1>"] == raw_path
+
+        decision, _reason = check_outbound_privacy(
+            ModelCallRequest(
+                role="agent",
+                spec=dummy_spec,
+                messages=(Message(role="user", text=f"Check {raw_path} please"),),
+            )
+        )
+        assert decision == "DENY"
+
+    # 3. Safe non-path slashes (URLs, shutter speeds, aperture, API paths) must NOT be falsely flagged
+    safe_text = (
+        "Approve at http://127.0.0.1:8765/review?session=sess_1 — "
+        "shot at 1/125s, f/2.8, route /api/sessions/123, resource lightbox://memory/preferences."
+    )
+    masked_safe, aliases_safe = alias_paths_in_text(safe_text)
+    assert masked_safe == safe_text
+    assert aliases_safe == {}
+    allow_dec, _ = check_outbound_privacy(
+        ModelCallRequest(
+            role="agent",
+            spec=dummy_spec,
+            messages=(Message(role="user", text=safe_text),),
+        )
+    )
+    assert allow_dec == "ALLOW"
+

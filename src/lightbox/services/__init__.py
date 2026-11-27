@@ -68,6 +68,7 @@ from lightbox.services.review import (
     PhotoListItem,
     ReviewService,
     SessionSummary,
+    extract_effective_preferences_for_prompt,
 )
 from lightbox.services.scan import JobStatusSummary, ScanResult, ScanService
 from lightbox.services.search import (
@@ -115,6 +116,7 @@ __all__ = [
     "DEFAULT_FACE_COSINE_THRESHOLD",
     "DEFAULT_MIN_SAMPLES",
     "DEFAULT_PREFERENCES_MD",
+    "extract_effective_preferences_for_prompt",
     "DIGEST_DIMENSIONS",
     "ConfirmBurstResult",
     "DestinationExistsError",

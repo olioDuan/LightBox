@@ -36,7 +36,12 @@ from lightbox.models.face_embedder import (
     find_face_embedder_model_path,
     get_shared_face_embedder,
 )
-from lightbox.models.images import check_outbound_privacy, strip_metadata_and_encode
+from lightbox.models.images import (
+    check_outbound_privacy,
+    find_absolute_path_spans,
+    redact_absolute_paths_in_text,
+    strip_metadata_and_encode,
+)
 from lightbox.models.openai_compat import OpenAICompatChatModel
 from lightbox.models.router import DEFAULT_MAX_CONCURRENCY, ModelRouter
 from lightbox.models.secrets import (
@@ -74,6 +79,8 @@ __all__ = [
     "BudgetExceededError",
     "ChatModel",
     "check_outbound_privacy",
+    "find_absolute_path_spans",
+    "redact_absolute_paths_in_text",
     "DEFAULT_MAX_CONCURRENCY",
     "EMBEDDING_DIM",
     "Embedder",

@@ -1,7 +1,70 @@
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, photoImageUrl, type DigestDimension, type PlanDetail } from "../api";
+import {
+  Button,
+  EmptyState,
+  Icon,
+  Loading,
+  Notice,
+  NoticeDock,
+  ProgressLine,
+  Tabs,
+  Thumb,
+} from "../components/ui";
 import { useI18n } from "../i18n";
+import { ChevronDown, Folder, Refresh, RotateLeft, Sparkles } from "reicon-react";
+
+/** Same verdict colors as the review screen; the two non-verdict buckets stay gray. */
+const SEG = {
+  kept: "var(--color-keep)",
+  burst: "#a3a3a3",
+  subjective: "#6a6a6a",
+  uncertain: "var(--color-unsure)",
+  tech: "var(--color-reject)",
+} as const;
+
+function Swatch({ color }: { color: string }) {
+  return (
+    <span
+      aria-hidden="true"
+      className="inline-block h-2 w-2 shrink-0 rounded-full"
+      style={{ background: color }}
+    />
+  );
+}
+
+function StackedBar({
+  parts,
+  height = "h-2",
+}: {
+  parts: Array<{ value: number; color: string; title?: string }>;
+  height?: string;
+}) {
+  return (
+    <div className={`flex w-full gap-[2px] overflow-hidden rounded-full bg-table ${height}`}>
+      {parts
+        .filter((p) => p.value > 0)
+        .map((p, i) => (
+          <div
+            key={i}
+            title={p.title}
+            className="h-full transition-[width] duration-500 ease-out first:rounded-l-full last:rounded-r-full"
+            style={{ width: clampBarPct(p.value), background: p.color }}
+          />
+        ))}
+    </div>
+  );
+}
+
+function SectionTitle({ children, aside }: { children: React.ReactNode; aside?: React.ReactNode }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-4">
+      <h2 className="text-lg font-semibold text-ink">{children}</h2>
+      {aside}
+    </div>
+  );
+}
 
 interface InsightsViewProps {
   activeTab: "digest" | "trash" | "traces" | "memory";
@@ -126,10 +189,17 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
   }
 
   async function handleDecideRule(ruleId: string, decision: "accept" | "reject", fallbackText: string) {
+    if (prefsDirty) {
+      const proceed = window.confirm(t.memoryUnsavedBeforeDecideConfirm);
+      if (!proceed) return;
+    }
     setMemoryBusy(`rule:${ruleId}`);
     setMemoryError(null);
     setMemoryNotice(null);
     try {
+      if (prefsDirty) {
+        await api.saveMemoryPreferences(prefsDraft);
+      }
       const editedText = ruleEdits[ruleId] ?? fallbackText;
       const res = await api.decideMemoryRule(ruleId, {
         decision,
@@ -206,357 +276,252 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
 
   const hasScopeFilters = Boolean(sessionId || dateFrom || dateTo);
 
-  return (
-    <div className="mx-auto max-w-5xl px-6 py-8">
-      {/* Section Tabs: Shooting Digest | Trash Folder */}
-      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#33363B] pb-4">
-        <div className="inline-flex rounded-lg border border-[#33363B] bg-[#242629] p-1">
-          <button
-            type="button"
-            onClick={() => onChangeTab("digest")}
-            className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition ${
-              activeTab === "digest"
-                ? "bg-[#33363B] text-[#F3F4F6]"
-                : "text-[#9CA3AF] hover:text-[#F3F4F6]"
-            }`}
-          >
-            {t.insightsTabDigest}
-          </button>
-          <button
-            type="button"
-            onClick={() => onChangeTab("trash")}
-            className={`flex items-center gap-2 rounded-md px-3.5 py-1.5 text-sm font-medium transition ${
-              activeTab === "trash"
-                ? "bg-[#33363B] text-[#F3F4F6]"
-                : "text-[#9CA3AF] hover:text-[#F3F4F6]"
-            }`}
-          >
-            <span>{t.insightsTabTrash}</span>
-            {activeTrashBatches > 0 && (
-              <span className="rounded bg-[#DC4C46]/25 px-1.5 py-0.5 text-[11px] text-[#FCA5A5] tabular-nums">
-                {activeTrashBatches}
-              </span>
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => onChangeTab("traces")}
-            className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition ${
-              activeTab === "traces"
-                ? "bg-[#33363B] text-[#F3F4F6]"
-                : "text-[#9CA3AF] hover:text-[#F3F4F6]"
-            }`}
-          >
-            {t.insightsTabTraces}
-          </button>
-          <button
-            type="button"
-            onClick={() => onChangeTab("memory")}
-            className={`flex items-center gap-2 rounded-md px-3.5 py-1.5 text-sm font-medium transition ${
-              activeTab === "memory"
-                ? "bg-[#33363B] text-[#F3F4F6]"
-                : "text-[#9CA3AF] hover:text-[#F3F4F6]"
-            }`}
-          >
-            <span>{t.insightsTabMemory}</span>
-            {((memoryQ.data?.proposed_count ?? 0) > 0 || memoryQ.data?.ready_to_consolidate) && (
-              <span className="rounded bg-[#D99B26]/25 px-1.5 py-0.5 text-[11px] text-[#FCD34D] tabular-nums">
-                {(memoryQ.data?.proposed_count ?? 0) > 0
-                  ? memoryQ.data?.proposed_count
-                  : `${memoryQ.data?.new_override_count ?? 0}+`}
-              </span>
-            )}
-          </button>
-        </div>
+  const memoryAttention =
+    (memoryQ.data?.proposed_count ?? 0) > 0 || Boolean(memoryQ.data?.ready_to_consolidate);
+  const memoryBadge =
+    (memoryQ.data?.proposed_count ?? 0) > 0
+      ? memoryQ.data?.proposed_count
+      : memoryQ.data?.ready_to_consolidate
+        ? memoryQ.data?.new_override_count
+        : undefined;
 
-        {activeTab === "digest" && digest && (
-          <div className="flex flex-wrap items-center gap-3 text-xs text-[#9CA3AF] tabular-nums">
-            <span>{t.digestTotalShots(digest.overview.total_shots)}</span>
-            <span>·</span>
-            <span>{t.digestScopeSessions(digest.scope.session_count)}</span>
-            <span>·</span>
-            <span>{t.digestMinSamplesHint(digest.scope.min_samples)}</span>
-          </div>
-        )}
-      </div>
+  const sessionSelect = (
+    <select
+      value={sessionId}
+      onChange={(e) => setSessionId(e.target.value)}
+      aria-label={t.digestAllSessions}
+      className={`field ${sessionId ? "font-medium" : "text-ink-2"}`}
+    >
+      <option value="">{t.digestAllSessions}</option>
+      {sessions.map((s) => (
+        <option key={s.id} value={s.id}>
+          {s.name}
+        </option>
+      ))}
+    </select>
+  );
+
+  return (
+    <div className="mx-auto max-w-5xl px-6 pb-32 pt-12 sm:px-12">
+      <Tabs
+        value={activeTab}
+        onChange={onChangeTab}
+        items={[
+          { id: "digest", label: t.insightsTabDigest },
+          {
+            id: "trash",
+            label: t.insightsTabTrash,
+            count: activeTrashBatches > 0 ? activeTrashBatches : undefined,
+            attention: activeTrashBatches > 0,
+          },
+          { id: "traces", label: t.insightsTabTraces },
+          {
+            id: "memory",
+            label: t.insightsTabMemory,
+            count: memoryAttention ? memoryBadge : undefined,
+            attention: memoryAttention,
+          },
+        ]}
+      />
 
       {activeTab === "digest" ? (
-        <div className="mt-6 space-y-6">
-          {/* Header & Scope Controls */}
-          <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-            <div className="space-y-1">
-              <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">
+        <div className="mt-12 flex flex-col gap-16">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-baseline gap-4">
+              <h1 className="text-lg font-semibold text-ink" title={t.digestSubtitle}>
                 {t.digestTitle}
               </h1>
-              <p className="text-sm text-[#9CA3AF]">{t.digestSubtitle}</p>
+              {digest && (
+                <span
+                  className="text-sm text-ink-3 tabular-nums"
+                  title={t.digestMinSamplesHint(digest.scope.min_samples)}
+                >
+                  {t.digestTotalShots(digest.overview.total_shots)}
+                  <span className="ml-4">{t.digestScopeSessions(digest.scope.session_count)}</span>
+                </span>
+              )}
             </div>
-
             <div className="flex flex-wrap items-center gap-2">
-              <select
-                value={sessionId}
-                onChange={(e) => setSessionId(e.target.value)}
-                className="rounded-md border border-[#33363B] bg-[#242629] px-3 py-1.5 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
-              >
-                <option value="">{t.digestAllSessions}</option>
-                {sessions.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-
+              {sessionSelect}
               <input
                 type="date"
                 value={dateFrom}
                 onChange={(e) => setDateFrom(e.target.value)}
                 aria-label={t.searchDateFrom}
-                className="rounded-md border border-[#33363B] bg-[#242629] px-2.5 py-1.5 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+                title={t.searchDateFrom}
+                className={`field ${dateFrom ? "" : "text-ink-2"}`}
               />
-              <span className="text-xs text-[#6B7280]">–</span>
+              <span className="text-ink-3" aria-hidden="true">
+                –
+              </span>
               <input
                 type="date"
                 value={dateTo}
                 onChange={(e) => setDateTo(e.target.value)}
                 aria-label={t.searchDateTo}
-                className="rounded-md border border-[#33363B] bg-[#242629] px-2.5 py-1.5 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+                title={t.searchDateTo}
+                className={`field ${dateTo ? "" : "text-ink-2"}`}
               />
-
               {hasScopeFilters && (
-                <button
-                  type="button"
+                <Button
+                  variant="ghost"
+                  icon={Refresh}
                   onClick={() => {
                     setSessionId("");
                     setDateFrom("");
                     setDateTo("");
                   }}
-                  className="rounded-md border border-[#33363B] bg-[#242629] px-2.5 py-1.5 text-xs text-[#D1D5DB] hover:bg-[#2C2F34]"
                 >
                   {t.digestResetScope}
-                </button>
+                </Button>
               )}
             </div>
           </div>
 
           {digestQ.isLoading ? (
-            <p className="py-12 text-sm text-[#9CA3AF]">{t.loading}</p>
+            <Loading label={t.loading} />
           ) : digestQ.isError ? (
-            <div className="rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-3 text-sm text-[#FCA5A5]">
+            <p className="text-sm text-mark">
               {t.errorPrefix}
               {digestQ.error instanceof Error ? digestQ.error.message : String(digestQ.error)}
-            </div>
+            </p>
           ) : !digest || digest.overview.total_shots === 0 ? (
-            <div className="rounded-lg border border-[#33363B] bg-[#242629] py-14 text-center">
-              <p className="text-base text-[#F3F4F6]">{t.digestEmpty}</p>
-              <p className="mt-1 text-sm text-[#9CA3AF]">{t.digestEmptyHint}</p>
-            </div>
+            <EmptyState title={t.digestEmpty}>
+              {hasScopeFilters && (
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setSessionId("");
+                    setDateFrom("");
+                    setDateTo("");
+                  }}
+                >
+                  {t.digestResetScope}
+                </Button>
+              )}
+            </EmptyState>
           ) : (
             <>
-              {/* 4-Way Mutually Exclusive Stacked Bar + Metric Cards */}
-              <div className="space-y-4 rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                <div className="flex h-3 w-full overflow-hidden rounded-full bg-[#1B1C1E]">
-                  {digest.overview.kept_count > 0 && (
-                    <div
-                      className="h-full bg-[#3D9A6B]"
-                      style={{ width: clampBarPct(digest.overview.kept_rate_total) }}
-                      title={`${t.digestCardKept}: ${digest.overview.kept_count}`}
-                    />
-                  )}
-                  {digest.overview.uncertain_count > 0 && (
-                    <div
-                      className="h-full bg-[#D97706]"
-                      style={{ width: clampBarPct(digest.overview.uncertain_rate) }}
-                      title={`${t.digestCardUncertain}: ${digest.overview.uncertain_count}`}
-                    />
-                  )}
-                  {digest.overview.burst_cull_count > 0 && (
-                    <div
-                      className="h-full bg-[#5B8DEF]"
-                      style={{ width: clampBarPct(digest.overview.burst_cull_rate) }}
-                      title={`${t.digestCardBurstCull}: ${digest.overview.burst_cull_count}`}
-                    />
-                  )}
-                  {digest.overview.subjective_reject_count > 0 && (
-                    <div
-                      className="h-full bg-[#8B5CF6]"
-                      style={{ width: clampBarPct(digest.overview.subjective_reject_rate) }}
-                      title={`${t.digestCardSubjectiveReject}: ${digest.overview.subjective_reject_count}`}
-                    />
-                  )}
-                  {digest.overview.tech_reject_count > 0 && (
-                    <div
-                      className="h-full bg-[#DC4C46]"
-                      style={{ width: clampBarPct(digest.overview.tech_reject_rate) }}
-                      title={`${t.digestCardTechReject}: ${digest.overview.tech_reject_count}`}
-                    />
-                  )}
-                </div>
+              {/* Overview: one bar, five numbers */}
+              <section className="flex flex-col gap-8">
+                <StackedBar
+                  height="h-3"
+                  parts={[
+                    { value: digest.overview.kept_rate_total, color: SEG.kept, title: `${t.digestCardKept}: ${digest.overview.kept_count}` },
+                    { value: digest.overview.uncertain_rate, color: SEG.uncertain, title: `${t.digestCardUncertain}: ${digest.overview.uncertain_count}` },
+                    { value: digest.overview.burst_cull_rate, color: SEG.burst, title: `${t.digestCardBurstCull}: ${digest.overview.burst_cull_count}` },
+                    { value: digest.overview.subjective_reject_rate, color: SEG.subjective, title: `${t.digestCardSubjectiveReject}: ${digest.overview.subjective_reject_count}` },
+                    { value: digest.overview.tech_reject_rate, color: SEG.tech, title: `${t.digestCardTechReject}: ${digest.overview.tech_reject_count}` },
+                  ]}
+                />
+                <dl className="grid grid-cols-2 gap-x-8 gap-y-8 sm:grid-cols-3 lg:grid-cols-5">
+                  {(
+                    [
+                      {
+                        color: SEG.kept,
+                        label: t.digestCardKept,
+                        value: fmtPct(digest.overview.kept_rate_excl_burst),
+                        sub: `${digest.overview.kept_count} / ${digest.overview.non_burst_total}`,
+                        hint: `${t.digestCardKeptExclBurst}；${t.digestCardKeptTotal} ${digest.overview.kept_count} / ${digest.overview.total_shots} (${fmtPct(digest.overview.kept_rate_total)})`,
+                        accent: false,
+                      },
+                      {
+                        color: SEG.tech,
+                        label: t.digestCardTechReject,
+                        value: fmtPct(digest.overview.tech_reject_rate),
+                        sub: `${digest.overview.tech_reject_count} / ${digest.overview.total_shots}`,
+                        hint: t.digestCardTechRejectHint,
+                        accent: true,
+                      },
+                      {
+                        color: SEG.burst,
+                        label: t.digestCardBurstCull,
+                        value: fmtPct(digest.overview.burst_cull_rate),
+                        sub: `${digest.overview.burst_cull_count} / ${digest.overview.total_shots}`,
+                        hint: t.digestCardBurstCullHint,
+                        accent: false,
+                      },
+                      {
+                        color: SEG.subjective,
+                        label: t.digestCardSubjectiveReject,
+                        value: fmtPct(digest.overview.subjective_reject_rate),
+                        sub: `${digest.overview.subjective_reject_count} / ${digest.overview.total_shots}`,
+                        hint: t.digestCardSubjectiveRejectHint,
+                        accent: false,
+                      },
+                      {
+                        color: SEG.uncertain,
+                        label: t.digestCardUncertain,
+                        value: fmtPct(digest.overview.uncertain_rate),
+                        sub: `${digest.overview.uncertain_count} / ${digest.overview.total_shots}`,
+                        hint: t.digestCardUncertainHint,
+                        accent: false,
+                      },
+                    ] as const
+                  ).map((m) => (
+                    <div key={m.label} title={m.hint} className="flex flex-col gap-1">
+                      <dt className="flex items-center gap-2 text-sm text-ink-2">
+                        <Swatch color={m.color} />
+                        {m.label}
+                      </dt>
+                      <dd
+                        className={`text-[32px] font-semibold leading-10 tabular-nums ${
+                          m.accent ? "text-reject" : m.color === SEG.kept ? "text-keep-ink" : "text-ink"
+                        }`}
+                      >
+                        {m.value}
+                      </dd>
+                      <dd className="text-sm text-ink-3 tabular-nums">{m.sub}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
 
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
-                  {/* Kept */}
-                  <div className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3.5">
-                    <div className="flex items-center gap-2 text-xs text-[#9CA3AF]">
-                      <span className="h-2 w-2 rounded-full bg-[#3D9A6B]" />
-                      <span>{t.digestCardKept}</span>
-                    </div>
-                    <div className="mt-2 flex items-baseline gap-2 tabular-nums">
-                      <span className="text-2xl font-semibold text-[#F3F4F6]">
-                        {fmtPct(digest.overview.kept_rate_excl_burst)}
-                      </span>
-                      <span className="text-xs text-[#86EFAC]">
-                        {digest.overview.kept_count} / {digest.overview.non_burst_total}
-                      </span>
-                    </div>
-                    <div className="mt-1 space-y-0.5 text-[11px] text-[#9CA3AF] tabular-nums">
-                      <div>{t.digestCardKeptExclBurst}</div>
-                      <div>
-                        {t.digestCardKeptTotal}：{digest.overview.kept_count} /{" "}
-                        {digest.overview.total_shots} ({fmtPct(digest.overview.kept_rate_total)})
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Tech Reject */}
-                  <div className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3.5">
-                    <div className="flex items-center gap-2 text-xs text-[#9CA3AF]">
-                      <span className="h-2 w-2 rounded-full bg-[#DC4C46]" />
-                      <span>{t.digestCardTechReject}</span>
-                    </div>
-                    <div className="mt-2 flex items-baseline gap-2 tabular-nums">
-                      <span className="text-2xl font-semibold text-[#FCA5A5]">
-                        {fmtPct(digest.overview.tech_reject_rate)}
-                      </span>
-                      <span className="text-xs text-[#9CA3AF]">
-                        {digest.overview.tech_reject_count} / {digest.overview.total_shots}
-                      </span>
-                    </div>
-                    <div className="mt-1 text-[11px] text-[#9CA3AF]">
-                      {t.digestCardTechRejectHint}
-                    </div>
-                  </div>
-
-                  {/* Burst Cull */}
-                  <div className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3.5">
-                    <div className="flex items-center gap-2 text-xs text-[#9CA3AF]">
-                      <span className="h-2 w-2 rounded-full bg-[#5B8DEF]" />
-                      <span>{t.digestCardBurstCull}</span>
-                    </div>
-                    <div className="mt-2 flex items-baseline gap-2 tabular-nums">
-                      <span className="text-2xl font-semibold text-[#93C5FD]">
-                        {fmtPct(digest.overview.burst_cull_rate)}
-                      </span>
-                      <span className="text-xs text-[#9CA3AF]">
-                        {digest.overview.burst_cull_count} / {digest.overview.total_shots}
-                      </span>
-                    </div>
-                    <div className="mt-1 text-[11px] text-[#9CA3AF]">
-                      {t.digestCardBurstCullHint}
-                    </div>
-                  </div>
-
-                  {/* Subjective Reject */}
-                  <div className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3.5">
-                    <div className="flex items-center gap-2 text-xs text-[#9CA3AF]">
-                      <span className="h-2 w-2 rounded-full bg-[#8B5CF6]" />
-                      <span>{t.digestCardSubjectiveReject}</span>
-                    </div>
-                    <div className="mt-2 flex items-baseline gap-2 tabular-nums">
-                      <span className="text-2xl font-semibold text-[#C4B5FD]">
-                        {fmtPct(digest.overview.subjective_reject_rate)}
-                      </span>
-                      <span className="text-xs text-[#9CA3AF]">
-                        {digest.overview.subjective_reject_count} / {digest.overview.total_shots}
-                      </span>
-                    </div>
-                    <div className="mt-1 text-[11px] text-[#9CA3AF]">
-                      {t.digestCardSubjectiveRejectHint}
-                    </div>
-                  </div>
-
-                  {/* Uncertain */}
-                  <div className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3.5">
-                    <div className="flex items-center gap-2 text-xs text-[#9CA3AF]">
-                      <span className="h-2 w-2 rounded-full bg-[#D97706]" />
-                      <span>{t.digestCardUncertain}</span>
-                    </div>
-                    <div className="mt-2 flex items-baseline gap-2 tabular-nums">
-                      <span className="text-2xl font-semibold text-[#FCD34D]">
-                        {fmtPct(digest.overview.uncertain_rate)}
-                      </span>
-                      <span className="text-xs text-[#9CA3AF]">
-                        {digest.overview.uncertain_count} / {digest.overview.total_shots}
-                      </span>
-                    </div>
-                    <div className="mt-1 text-[11px] text-[#9CA3AF]">
-                      {t.digestCardUncertainHint}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Top Technical Reject Reasons */}
               {digest.top_tech_reasons.length > 0 && (
-                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                  <h2 className="text-sm font-medium text-[#F3F4F6]">{t.digestTopReasonsTitle}</h2>
-                  <div className="mt-3 space-y-2.5">
+                <section className="flex flex-col gap-6">
+                  <SectionTitle>{t.digestTopReasonsTitle}</SectionTitle>
+                  <ul className="flex flex-col gap-4">
                     {digest.top_tech_reasons.map((r) => (
-                      <div key={r.code} className="space-y-1">
-                        <div className="flex items-center justify-between gap-2 text-xs">
-                          <span className="truncate text-[#E5E7EB]">{r.label}</span>
-                          <span className="shrink-0 text-[#9CA3AF] tabular-nums">
-                            {r.count} / {digest.overview.tech_reject_count} (
-                            {fmtPct(r.rate_of_tech_rejects)})
+                      <li key={r.code} className="flex flex-col gap-2">
+                        <div className="flex items-baseline justify-between gap-4 text-sm">
+                          <span className="truncate text-ink">{r.label}</span>
+                          <span className="shrink-0 text-ink-2 tabular-nums">
+                            {r.count} / {digest.overview.tech_reject_count}
+                            <span className="ml-2 text-ink-3">{fmtPct(r.rate_of_tech_rejects)}</span>
                           </span>
                         </div>
-                        <div className="h-2 w-full overflow-hidden rounded-full bg-[#1B1C1E]">
-                          <div
-                            className="h-full rounded-full bg-[#DC4C46]/85"
-                            style={{ width: clampBarPct(r.rate_of_tech_rejects) }}
-                          />
-                        </div>
-                      </div>
+                        <ProgressLine value={r.rate_of_tech_rejects * 100} tone="mark" />
+                      </li>
                     ))}
-                  </div>
-                </div>
+                  </ul>
+                </section>
               )}
 
-              {/* High Tech-Reject Conditions vs High Kept-Rate Conditions */}
-              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                  <h2 className="text-sm font-medium text-[#F3F4F6]">{t.digestHighRejectTitle}</h2>
+              <div className="grid grid-cols-1 gap-16 lg:grid-cols-2 lg:gap-12">
+                <section className="flex flex-col gap-6">
+                  <SectionTitle>{t.digestHighRejectTitle}</SectionTitle>
                   {digest.high_tech_reject_conditions.length === 0 ? (
-                    <p className="mt-3 text-xs text-[#9CA3AF]">
-                      {t.digestHighRejectEmpty(digest.scope.min_samples)}
-                    </p>
+                    <p className="text-sm text-ink-3">{t.digestHighRejectEmpty(digest.scope.min_samples)}</p>
                   ) : (
-                    <div className="mt-3 space-y-3">
+                    <ul className="flex flex-col gap-6">
                       {digest.high_tech_reject_conditions.map((c) => (
-                        <div
-                          key={`${c.dimension_key}:${c.bucket_key}`}
-                          className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3"
-                        >
-                          <div className="flex items-baseline justify-between gap-2">
-                            <div className="min-w-0">
-                              <span className="text-[11px] text-[#9CA3AF]">
-                                {c.dimension_label}
-                              </span>
-                              <span className="mx-1.5 text-[#4B5563]">·</span>
-                              <span className="text-xs font-medium text-[#F3F4F6]">
-                                {c.bucket_label}
-                              </span>
-                            </div>
-                            <span className="shrink-0 text-xs font-medium text-[#FCA5A5] tabular-nums">
-                              {c.tech_reject} / {c.total} ({fmtPct(c.tech_reject_rate)})
+                        <li key={`${c.dimension_key}:${c.bucket_key}`} className="flex flex-col gap-2 text-sm">
+                          <div className="flex items-baseline justify-between gap-4">
+                            <span className="min-w-0 truncate">
+                              <span className="text-ink-3">{c.dimension_label}</span>
+                              <span className="ml-2 font-medium text-ink">{c.bucket_label}</span>
+                            </span>
+                            <span className="shrink-0 font-medium text-mark tabular-nums">
+                              {fmtPct(c.tech_reject_rate)}
                             </span>
                           </div>
-                          <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#242629]">
-                            <div
-                              className="h-full rounded-full bg-[#DC4C46]"
-                              style={{ width: clampBarPct(c.tech_reject_rate) }}
-                            />
-                          </div>
-                          <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#9CA3AF] tabular-nums">
-                            <span className="text-[#FCA5A5]">
-                              {t.digestDeltaAboveOverall((c.tech_reject_delta * 100).toFixed(1))}
+                          <ProgressLine value={c.tech_reject_rate * 100} tone="mark" />
+                          <div className="flex flex-wrap items-center justify-between gap-x-4 text-ink-3 tabular-nums">
+                            <span>
+                              {c.tech_reject} / {c.total}
+                              <span className="ml-2">
+                                {t.digestDeltaAboveOverall((c.tech_reject_delta * 100).toFixed(1))}
+                              </span>
                             </span>
                             {c.top_reason_label && (
                               <span className="truncate">
@@ -565,597 +530,421 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
                               </span>
                             )}
                           </div>
-                        </div>
+                        </li>
                       ))}
-                    </div>
+                    </ul>
                   )}
-                </div>
+                </section>
 
-                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                  <h2 className="text-sm font-medium text-[#F3F4F6]">{t.digestHighKeptTitle}</h2>
+                <section className="flex flex-col gap-6">
+                  <SectionTitle>{t.digestHighKeptTitle}</SectionTitle>
                   {digest.high_kept_conditions.length === 0 ? (
-                    <p className="mt-3 text-xs text-[#9CA3AF]">
-                      {t.digestHighKeptEmpty(digest.scope.min_samples)}
-                    </p>
+                    <p className="text-sm text-ink-3">{t.digestHighKeptEmpty(digest.scope.min_samples)}</p>
                   ) : (
-                    <div className="mt-3 space-y-3">
+                    <ul className="flex flex-col gap-6">
                       {digest.high_kept_conditions.map((c) => (
-                        <div
-                          key={`${c.dimension_key}:${c.bucket_key}`}
-                          className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3"
-                        >
-                          <div className="flex items-baseline justify-between gap-2">
-                            <div className="min-w-0">
-                              <span className="text-[11px] text-[#9CA3AF]">
-                                {c.dimension_label}
-                              </span>
-                              <span className="mx-1.5 text-[#4B5563]">·</span>
-                              <span className="text-xs font-medium text-[#F3F4F6]">
-                                {c.bucket_label}
-                              </span>
-                            </div>
-                            <span className="shrink-0 text-xs font-medium text-[#86EFAC] tabular-nums">
-                              {c.kept} / {c.non_burst_total} ({fmtPct(c.kept_rate_excl_burst)})
+                        <li key={`${c.dimension_key}:${c.bucket_key}`} className="flex flex-col gap-2 text-sm">
+                          <div className="flex items-baseline justify-between gap-4">
+                            <span className="min-w-0 truncate">
+                              <span className="text-ink-3">{c.dimension_label}</span>
+                              <span className="ml-2 font-medium text-ink">{c.bucket_label}</span>
+                            </span>
+                            <span className="shrink-0 font-medium text-keep-ink tabular-nums">
+                              {fmtPct(c.kept_rate_excl_burst)}
                             </span>
                           </div>
-                          <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#242629]">
-                            <div
-                              className="h-full rounded-full bg-[#3D9A6B]"
-                              style={{ width: clampBarPct(c.kept_rate_excl_burst) }}
-                            />
-                          </div>
-                          <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#9CA3AF] tabular-nums">
-                            <span className="text-[#86EFAC]">
-                              {t.digestDeltaAboveOverall((c.kept_rate_delta * 100).toFixed(1))}
+                          <ProgressLine value={c.kept_rate_excl_burst * 100} tone="keep" />
+                          <div className="flex flex-wrap items-center justify-between gap-x-4 text-ink-3 tabular-nums">
+                            <span>
+                              {c.kept} / {c.non_burst_total}
+                              <span className="ml-2">
+                                {t.digestDeltaAboveOverall((c.kept_rate_delta * 100).toFixed(1))}
+                              </span>
                             </span>
                             <span>
-                              {t.digestTotalShots(c.total)} · {t.digestColTechRate}{" "}
-                              {c.tech_reject} / {c.total} ({fmtPct(c.tech_reject_rate)})
+                              {t.digestColTechRate} {c.tech_reject} / {c.total} ({fmtPct(c.tech_reject_rate)})
                             </span>
                           </div>
-                        </div>
+                        </li>
                       ))}
-                    </div>
+                    </ul>
                   )}
-                </div>
+                </section>
               </div>
 
-              {/* Fixed 2D Stable Setups: Focal Bucket x Shutter Bucket */}
-              <div className="rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                <h2 className="text-sm font-medium text-[#F3F4F6]">{t.digestStableSetupsTitle}</h2>
+              <section className="flex flex-col gap-6">
+                <SectionTitle>{t.digestStableSetupsTitle}</SectionTitle>
                 {digest.stable_setups.length === 0 ? (
-                  <p className="mt-3 text-xs text-[#9CA3AF]">
-                    {t.digestStableSetupsEmpty(digest.scope.min_samples)}
-                  </p>
+                  <p className="text-sm text-ink-3">{t.digestStableSetupsEmpty(digest.scope.min_samples)}</p>
                 ) : (
-                  <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                    {digest.stable_setups.map((s) => (
-                      <div
-                        key={`${s.focal_bucket}:${s.shutter_bucket}`}
-                        className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3"
-                      >
-                        <div className="flex items-baseline justify-between gap-2">
-                          <span className="text-xs font-medium text-[#F3F4F6]">
-                            {s.focal_label} × {s.shutter_label}
+                  <ul className="grid grid-cols-1 gap-x-12 gap-y-6 md:grid-cols-2">
+                    {digest.stable_setups.map((st) => (
+                      <li key={`${st.focal_bucket}:${st.shutter_bucket}`} className="flex flex-col gap-2 text-sm">
+                        <div className="flex items-baseline justify-between gap-4">
+                          <span className="truncate font-medium text-ink">
+                            {st.focal_label} × {st.shutter_label}
                           </span>
-                          <span className="shrink-0 text-xs font-medium text-[#86EFAC] tabular-nums">
-                            {s.kept} / {s.non_burst_total} ({fmtPct(s.kept_rate_excl_burst)})
+                          <span className="shrink-0 font-medium text-ink tabular-nums">
+                            {fmtPct(st.kept_rate_excl_burst)}
                           </span>
                         </div>
-                        <div className="mt-2 flex h-1.5 w-full overflow-hidden rounded-full bg-[#242629]">
-                          <div
-                            className="h-full bg-[#3D9A6B]"
-                            style={{ width: clampBarPct(s.kept_rate_total) }}
-                          />
-                          <div
-                            className="h-full bg-[#5B8DEF]"
-                            style={{
-                              width: clampBarPct(s.total > 0 ? s.burst_cull / s.total : 0),
-                            }}
-                          />
-                          <div
-                            className="h-full bg-[#DC4C46]"
-                            style={{ width: clampBarPct(s.tech_reject_rate) }}
-                          />
-                        </div>
-                        <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#9CA3AF] tabular-nums">
-                          <span>{t.digestTotalShots(s.total)}</span>
+                        <StackedBar
+                          parts={[
+                            { value: st.kept_rate_total, color: SEG.kept },
+                            { value: st.total > 0 ? st.burst_cull / st.total : 0, color: SEG.burst },
+                            { value: st.tech_reject_rate, color: SEG.tech },
+                          ]}
+                        />
+                        <div className="flex flex-wrap items-center justify-between gap-x-4 text-ink-3 tabular-nums">
                           <span>
-                            {t.digestColTechRate} {s.tech_reject} / {s.total} (
-                            {fmtPct(s.tech_reject_rate)})
+                            {st.kept} / {st.non_burst_total}
+                            <span className="ml-2">{t.digestTotalShots(st.total)}</span>
+                          </span>
+                          <span>
+                            {t.digestColTechRate} {st.tech_reject} / {st.total} ({fmtPct(st.tech_reject_rate)})
                           </span>
                         </div>
-                      </div>
+                      </li>
                     ))}
-                  </div>
+                  </ul>
                 )}
-              </div>
+              </section>
 
-              {/* Single-Dimension Breakdown Explorer (9 Dimensions) */}
-              <div className="rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <h2 className="text-sm font-medium text-[#F3F4F6]">{t.digestDimensionsTitle}</h2>
-                  <div className="flex flex-wrap gap-1.5">
-                    {digest.dimensions.map((dim) => (
-                      <button
-                        key={dim.key}
-                        type="button"
-                        onClick={() => setSelectedDim(dim.key)}
-                        className={`rounded-md px-2.5 py-1 text-xs transition ${
-                          activeDim?.key === dim.key
-                            ? "bg-[#5B8DEF] font-medium text-white"
-                            : "border border-[#33363B] bg-[#1B1C1E] text-[#9CA3AF] hover:text-[#F3F4F6]"
-                        }`}
-                      >
-                        {dim.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
+              <section className="flex flex-col gap-6">
+                <SectionTitle>{t.digestDimensionsTitle}</SectionTitle>
+                <Tabs
+                  size="sm"
+                  value={activeDim?.key ?? ""}
+                  onChange={setSelectedDim}
+                  items={digest.dimensions.map((dim) => ({ id: dim.key, label: dim.label }))}
+                />
                 {activeDim && (
-                  <div className="mt-4 space-y-2.5">
+                  <ul className="flex flex-col gap-8 pt-2">
                     {activeDim.buckets.map((b) => (
-                      <div
-                        key={b.key}
-                        className="rounded-md border border-[#33363B] bg-[#1B1C1E] p-3"
-                      >
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-medium text-[#F3F4F6]">{b.label}</span>
-                            <span className="text-[11px] text-[#9CA3AF] tabular-nums">
-                              {t.photoCount(b.total)}
-                            </span>
+                      <li key={b.key} className="flex flex-col gap-2 text-sm">
+                        <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+                          <span className="flex items-baseline gap-2">
+                            <span className="font-medium text-ink">{b.label}</span>
+                            <span className="text-ink-3 tabular-nums">{t.photoCount(b.total)}</span>
                             {!b.meets_min_samples && (
-                              <span className="rounded bg-[#2C2F34] px-1.5 py-0.5 text-[10px] text-[#9CA3AF]">
-                                {t.digestLowSampleBadge(digest.scope.min_samples)}
-                              </span>
+                              <span className="text-ink-3">{t.digestLowSampleBadge(digest.scope.min_samples)}</span>
                             )}
-                          </div>
-
-                          <div className="flex flex-wrap items-center gap-3 text-[11px] tabular-nums">
-                            <span className="text-[#86EFAC]">
-                              {t.digestColKeptRate}: {b.kept}/{b.non_burst_total} (
-                              {fmtPct(b.kept_rate_excl_burst)})
+                          </span>
+                          <span className="flex flex-wrap items-center gap-x-4 gap-y-1 text-ink-2 tabular-nums">
+                            <span className="inline-flex items-center gap-2">
+                              <Swatch color={SEG.kept} />
+                              {t.digestColKeptRate} {b.kept}/{b.non_burst_total} ({fmtPct(b.kept_rate_excl_burst)})
                             </span>
-                            <span className="text-[#FCA5A5]">
-                              {t.digestColTechRate}: {b.tech_reject}/{b.total} (
-                              {fmtPct(b.tech_reject_rate)})
+                            <span className="inline-flex items-center gap-2">
+                              <Swatch color={SEG.tech} />
+                              {t.digestColTechRate} {b.tech_reject}/{b.total} ({fmtPct(b.tech_reject_rate)})
                             </span>
                             {b.burst_cull > 0 && (
-                              <span className="text-[#93C5FD]">
-                                {t.digestColBurstRate}: {b.burst_cull}/{b.total} (
-                                {fmtPct(b.burst_cull_rate)})
+                              <span className="inline-flex items-center gap-2">
+                                <Swatch color={SEG.burst} />
+                                {t.digestColBurstRate} {b.burst_cull}/{b.total} ({fmtPct(b.burst_cull_rate)})
                               </span>
                             )}
                             {b.subjective_reject > 0 && (
-                              <span className="text-[#C4B5FD]">
-                                {t.digestColSubjectiveRate}: {b.subjective_reject}/{b.total} (
+                              <span className="inline-flex items-center gap-2">
+                                <Swatch color={SEG.subjective} />
+                                {t.digestColSubjectiveRate} {b.subjective_reject}/{b.total} (
                                 {fmtPct(b.subjective_reject_rate)})
                               </span>
                             )}
                             {b.uncertain > 0 && (
-                              <span className="text-[#FCD34D]">
-                                {t.digestColUncertain}: {b.uncertain}/{b.total} (
-                                {fmtPct(b.uncertain_rate)})
+                              <span className="inline-flex items-center gap-2">
+                                <Swatch color={SEG.uncertain} />
+                                {t.digestColUncertain} {b.uncertain}/{b.total} ({fmtPct(b.uncertain_rate)})
                               </span>
                             )}
-                          </div>
+                          </span>
                         </div>
-
-                        <div className="mt-2 flex h-2 w-full overflow-hidden rounded-full bg-[#242629]">
-                          {b.kept > 0 && (
-                            <div
-                              className="h-full bg-[#3D9A6B]"
-                              style={{ width: clampBarPct(b.kept_rate_total) }}
-                            />
-                          )}
-                          {b.uncertain > 0 && (
-                            <div
-                              className="h-full bg-[#D97706]"
-                              style={{ width: clampBarPct(b.uncertain_rate) }}
-                            />
-                          )}
-                          {b.burst_cull > 0 && (
-                            <div
-                              className="h-full bg-[#5B8DEF]"
-                              style={{ width: clampBarPct(b.burst_cull_rate) }}
-                            />
-                          )}
-                          {b.subjective_reject > 0 && (
-                            <div
-                              className="h-full bg-[#8B5CF6]"
-                              style={{ width: clampBarPct(b.subjective_reject_rate) }}
-                            />
-                          )}
-                          {b.tech_reject > 0 && (
-                            <div
-                              className="h-full bg-[#DC4C46]"
-                              style={{ width: clampBarPct(b.tech_reject_rate) }}
-                            />
-                          )}
-                        </div>
-
+                        <StackedBar
+                          parts={[
+                            { value: b.kept_rate_total, color: SEG.kept },
+                            { value: b.uncertain_rate, color: SEG.uncertain },
+                            { value: b.burst_cull_rate, color: SEG.burst },
+                            { value: b.subjective_reject_rate, color: SEG.subjective },
+                            { value: b.tech_reject_rate, color: SEG.tech },
+                          ]}
+                        />
                         {b.top_reason_label && (
-                          <div className="mt-1.5 text-[11px] text-[#9CA3AF]">
+                          <span className="text-ink-3">
                             {t.digestMainReasonPrefix}
                             {b.top_reason_label} ({b.top_reason_count})
-                          </div>
+                          </span>
                         )}
-                      </div>
+                      </li>
                     ))}
-                  </div>
+                  </ul>
                 )}
-              </div>
+              </section>
             </>
           )}
         </div>
       ) : activeTab === "memory" ? (
-        <div className="mt-6 space-y-6">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-            <div className="space-y-1">
-              <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">
+        <div className="mt-12 flex flex-col gap-16">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex flex-col gap-1">
+              <h1
+                className="text-lg font-semibold text-ink"
+                title={`${t.memorySubtitle}\n${t.memoryScopeInjected}\n${t.memoryScopeZeroLlm}`}
+              >
                 {t.memoryTitle}
               </h1>
-              <p className="text-sm text-[#9CA3AF]">{t.memorySubtitle}</p>
+              <p className="flex flex-wrap items-center gap-x-4 text-sm text-ink-3">
+                {memoryQ.data && (
+                  <span
+                    className={`tabular-nums ${memoryQ.data.ready_to_consolidate ? "font-medium text-mark" : ""}`}
+                    title={memoryQ.data.ready_to_consolidate ? t.memoryReadyHint(memoryQ.data.new_override_count) : undefined}
+                  >
+                    {t.memoryNewOverridesRatio(
+                      memoryQ.data.new_override_count,
+                      memoryQ.data.min_overrides_threshold,
+                    )}
+                  </span>
+                )}
+              </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                disabled={memoryBusy !== null}
-                onClick={() => void handleConsolidate(false)}
-                className={`rounded-md px-3.5 py-2 text-xs font-medium transition disabled:opacity-50 ${
-                  memoryQ.data?.ready_to_consolidate
-                    ? "bg-[#D99B26] text-[#1B1C1E] hover:bg-[#E5A935]"
-                    : "border border-[#5B8DEF]/50 bg-[#5B8DEF]/15 text-[#93C5FD] hover:bg-[#5B8DEF]/25"
-                }`}
-              >
-                {memoryBusy === "consolidate" ? t.memoryConsolidating : t.memoryConsolidateBtn}
-              </button>
               {memoryQ.data &&
                 !memoryQ.data.ready_to_consolidate &&
                 memoryQ.data.total_override_count > 0 && (
-                  <button
-                    type="button"
+                  <Button
+                    variant="ghost"
                     disabled={memoryBusy !== null}
                     onClick={() => void handleConsolidate(true)}
-                    className="rounded-md border border-[#33363B] bg-[#242629] px-3 py-2 text-xs text-[#D1D5DB] hover:bg-[#2C2F34] disabled:opacity-50"
                   >
                     {t.memoryConsolidateForceBtn}
-                  </button>
+                  </Button>
                 )}
-            </div>
-          </div>
-
-          {/* Scope & Override Counter Bar */}
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#33363B] bg-[#242629] px-4 py-3 text-xs">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="rounded bg-[#3D9A6B]/15 px-2 py-0.5 text-[11px] text-[#86EFAC]">
-                {t.memoryScopeInjected}
-              </span>
-              <span className="rounded bg-[#1B1C1E] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
-                {t.memoryScopeZeroLlm}
-              </span>
-            </div>
-            {memoryQ.data && (
-              <span
-                className={`font-mono text-[11px] tabular-nums ${
-                  memoryQ.data.ready_to_consolidate ? "text-[#FCD34D]" : "text-[#9CA3AF]"
-                }`}
+              <Button
+                variant={memoryQ.data?.ready_to_consolidate ? "primary" : "secondary"}
+                icon={Sparkles}
+                disabled={memoryBusy !== null}
+                onClick={() => void handleConsolidate(false)}
               >
-                {t.memoryNewOverridesRatio(
-                  memoryQ.data.new_override_count,
-                  memoryQ.data.min_overrides_threshold,
-                )}
-              </span>
-            )}
+                {memoryBusy === "consolidate" ? t.memoryConsolidating : t.memoryConsolidateBtn}
+              </Button>
+            </div>
           </div>
 
-          {memoryQ.data?.ready_to_consolidate && (
-            <div className="rounded-md border border-[#D99B26]/50 bg-[#D99B26]/10 px-4 py-2.5 text-xs text-[#FCD34D]">
-              {t.memoryReadyHint(memoryQ.data.new_override_count)}
-            </div>
-          )}
-
-          {memoryNotice && (
-            <div className="rounded-md border border-[#3D9A6B]/50 bg-[#3D9A6B]/10 px-4 py-2.5 text-sm text-[#A7F3D0]">
-              {memoryNotice}
-            </div>
-          )}
-
-          {memoryError && (
-            <div className="rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-2.5 text-sm text-[#FCA5A5]">
-              {t.errorPrefix}
-              {memoryError}
-            </div>
-          )}
-
-          {/* Proposed Rules Approval Cards */}
           {(() => {
             const allRules = memoryQ.data?.rules ?? [];
             const proposed = allRules.filter((r) => r.status === "proposed");
             const decided = allRules.filter((r) => r.status !== "proposed");
             return (
               <>
-                <div className="space-y-3 rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                  <h2 className="text-sm font-medium text-[#F3F4F6]">
-                    {t.memoryProposedTitle(proposed.length)}
-                  </h2>
+                <section className="flex flex-col gap-6">
+                  <SectionTitle>{t.memoryProposedTitle(proposed.length)}</SectionTitle>
                   {proposed.length === 0 ? (
-                    <p className="text-xs text-[#9CA3AF]">{t.memoryProposedEmpty}</p>
+                    <p className="text-sm text-ink-3">{t.memoryProposedEmpty}</p>
                   ) : (
-                    <div className="space-y-3">
+                    <ul className="flex flex-col gap-8">
                       {proposed.map((rule) => {
                         const edited = ruleEdits[rule.rule_id] ?? rule.rule_text;
                         const isBusy = memoryBusy === `rule:${rule.rule_id}`;
                         return (
-                          <div
-                            key={rule.rule_id}
-                            className="space-y-2.5 rounded-md border border-[#D99B26]/35 bg-[#1B1C1E] p-3.5"
-                          >
-                            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-                              <div className="flex items-center gap-2">
-                                <span className="rounded bg-[#D99B26]/20 px-1.5 py-0.5 font-mono text-[#FCD34D]">
-                                  {rule.rule_id}
-                                </span>
-                                <span className="text-[#9CA3AF] tabular-nums">
-                                  {t.memoryEvidenceCount(rule.evidence_ids.length)}
-                                </span>
-                              </div>
+                          <li key={rule.rule_id} className="flex flex-col gap-2">
+                            <div className="flex items-center gap-4 text-sm text-ink-3 tabular-nums">
+                              <span>{rule.rule_id}</span>
+                              <span>{t.memoryEvidenceCount(rule.evidence_ids.length)}</span>
                             </div>
                             <input
                               type="text"
                               value={edited}
                               onChange={(e) =>
-                                setRuleEdits((prev) => ({
-                                  ...prev,
-                                  [rule.rule_id]: e.target.value,
-                                }))
+                                setRuleEdits((prev) => ({ ...prev, [rule.rule_id]: e.target.value }))
                               }
-                              className="w-full rounded border border-[#33363B] bg-[#242629] px-3 py-2 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+                              aria-label={rule.rule_id}
+                              className="field h-12 w-full text-base"
                             />
-                            {rule.rationale && (
-                              <p className="text-[11px] text-[#9CA3AF]">{rule.rationale}</p>
-                            )}
-                            <div className="flex items-center justify-end gap-2">
-                              <button
-                                type="button"
+                            {rule.rationale && <p className="text-sm text-ink-2">{rule.rationale}</p>}
+                            <div className="flex items-center justify-end gap-2 pt-2">
+                              <Button
+                                variant="ghost"
                                 disabled={isBusy}
-                                onClick={() =>
-                                  void handleDecideRule(rule.rule_id, "reject", rule.rule_text)
-                                }
-                                className="rounded border border-[#33363B] px-3 py-1.5 text-xs text-[#D1D5DB] hover:bg-[#2C2F34] disabled:opacity-50"
+                                onClick={() => void handleDecideRule(rule.rule_id, "reject", rule.rule_text)}
                               >
                                 {t.memoryRejectBtn}
-                              </button>
-                              <button
-                                type="button"
+                              </Button>
+                              <Button
+                                variant="primary"
                                 disabled={isBusy || !edited.trim()}
-                                onClick={() =>
-                                  void handleDecideRule(rule.rule_id, "accept", rule.rule_text)
-                                }
-                                className="rounded bg-[#3D9A6B] px-3.5 py-1.5 text-xs font-medium text-white hover:bg-[#32825A] disabled:opacity-50"
+                                onClick={() => void handleDecideRule(rule.rule_id, "accept", rule.rule_text)}
                               >
                                 {t.memoryAcceptBtn}
-                              </button>
+                              </Button>
                             </div>
-                          </div>
+                          </li>
                         );
                       })}
-                    </div>
+                    </ul>
                   )}
-                </div>
+                </section>
 
-                {/* preferences.md Direct Markdown Editor */}
-                <div className="space-y-3 rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <h2 className="text-sm font-medium text-[#F3F4F6]">
-                        {t.memoryEditorTitle}
-                      </h2>
-                      <p className="mt-0.5 text-xs text-[#9CA3AF]">{t.memoryEditorHint}</p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {prefsDirty && (
-                        <span className="rounded bg-[#D99B26]/20 px-2 py-0.5 text-[11px] text-[#FCD34D]">
-                          {t.memoryUnsavedBadge}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        disabled={memoryBusy === "save" || !prefsDirty}
-                        onClick={() => void handleSavePreferences()}
-                        className="rounded-md bg-[#F3F4F6] px-3.5 py-1.5 text-xs font-medium text-[#1B1C1E] hover:bg-white disabled:opacity-45"
-                      >
-                        {memoryBusy === "save" ? t.memorySaving : t.memorySaveBtn}
-                      </button>
-                    </div>
-                  </div>
-
+                <section className="flex flex-col gap-6">
+                  <SectionTitle
+                    aside={
+                      <div className="flex items-center gap-4">
+                        {prefsDirty && (
+                          <span className="fade-enter flex items-center gap-2 text-sm text-ink-2">
+                            <span className="h-2 w-2 rounded-full bg-mark" />
+                            {t.memoryUnsavedBadge}
+                          </span>
+                        )}
+                        <Button
+                          variant="primary"
+                          disabled={memoryBusy === "save" || !prefsDirty}
+                          onClick={() => void handleSavePreferences()}
+                        >
+                          {memoryBusy === "save" ? t.memorySaving : t.memorySaveBtn}
+                        </Button>
+                      </div>
+                    }
+                  >
+                    <span title={t.memoryEditorHint}>{t.memoryEditorTitle}</span>
+                  </SectionTitle>
                   <textarea
                     value={prefsDraft}
                     onChange={(e) => {
                       setPrefsDraft(e.target.value);
                       setPrefsDirty(true);
                     }}
-                    rows={10}
-                    className="w-full rounded-md border border-[#33363B] bg-[#1B1C1E] p-3 font-mono text-xs leading-relaxed text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
+                    rows={12}
+                    aria-label={t.memoryEditorTitle}
+                    className="field w-full rounded-panel p-6 text-sm leading-6"
                   />
-                </div>
+                </section>
 
-                {/* Reviewed Rule History */}
                 {decided.length > 0 && (
-                  <div className="space-y-2.5 rounded-lg border border-[#33363B] bg-[#242629] p-5">
-                    <h2 className="text-sm font-medium text-[#F3F4F6]">{t.memoryHistoryTitle}</h2>
-                    <ul className="divide-y divide-[#33363B] text-xs">
+                  <section className="flex flex-col gap-6">
+                    <SectionTitle>{t.memoryHistoryTitle}</SectionTitle>
+                    <ul className="flex flex-col gap-1 text-sm">
                       {decided.map((r) => (
-                        <li
-                          key={r.rule_id}
-                          className="flex flex-wrap items-center justify-between gap-2 py-2"
-                        >
-                          <div className="flex min-w-0 items-center gap-2">
-                            <span className="font-mono text-[11px] text-[#9CA3AF]">
-                              {r.rule_id}
+                        <li key={r.rule_id} className="flex items-center justify-between gap-4 py-2">
+                          <span className="flex min-w-0 items-center gap-4">
+                            <span className="shrink-0 text-ink-3 tabular-nums">{r.rule_id}</span>
+                            <span className={`truncate ${r.status === "accepted" ? "text-ink" : "text-ink-3 line-through"}`}>
+                              {r.rule_text}
                             </span>
-                            <span className="truncate text-[#E5E7EB]">{r.rule_text}</span>
-                          </div>
-                          <span
-                            className={`shrink-0 rounded px-2 py-0.5 text-[10px] ${
-                              r.status === "accepted"
-                                ? "bg-[#3D9A6B]/20 text-[#86EFAC]"
-                                : "bg-[#2C2F34] text-[#9CA3AF]"
-                            }`}
-                          >
-                            {t.memoryStatusLabels[r.status] ?? r.status}
                           </span>
+                          <span className="shrink-0 text-ink-2">{t.memoryStatusLabels[r.status] ?? r.status}</span>
                         </li>
                       ))}
                     </ul>
-                  </div>
+                  </section>
                 )}
               </>
             );
           })()}
         </div>
       ) : activeTab === "traces" ? (
-        <div className="mt-6 space-y-6">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-            <div className="space-y-1">
-              <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">
-                {t.tracesTitle}
-              </h1>
-              <p className="text-sm text-[#9CA3AF]">{t.tracesSubtitle}</p>
-            </div>
-            <select
-              value={sessionId}
-              onChange={(e) => setSessionId(e.target.value)}
-              className="rounded-md border border-[#33363B] bg-[#242629] px-3 py-1.5 text-xs text-[#F3F4F6] focus:border-[#5B8DEF] focus:outline-none"
-            >
-              <option value="">{t.digestAllSessions}</option>
-              {sessions.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </select>
+        <div className="mt-12 flex flex-col gap-16">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <h1 className="text-lg font-semibold text-ink" title={t.tracesSubtitle}>
+              {t.tracesTitle}
+            </h1>
+            {sessionSelect}
           </div>
 
           {tracesQ.isLoading ? (
-            <p className="py-10 text-sm text-[#9CA3AF]">{t.loading}</p>
+            <Loading label={t.loading} />
           ) : tracesQ.isError ? (
-            <div className="rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-3 text-sm text-[#FCA5A5]">
+            <p className="text-sm text-mark">
               {t.errorPrefix}
               {tracesQ.error instanceof Error ? tracesQ.error.message : String(tracesQ.error)}
-            </div>
+            </p>
           ) : tracesQ.data ? (
             <>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-4">
-                  <div className="text-xs text-[#9CA3AF]">{t.tracesMonthlySpend}</div>
-                  <div className="mt-1.5 text-2xl font-semibold text-[#F3F4F6] tabular-nums">
+              <dl className="grid grid-cols-2 gap-x-8 gap-y-8 lg:grid-cols-4">
+                <div className="flex flex-col gap-1">
+                  <dt className="text-sm text-ink-2">{t.tracesMonthlySpend}</dt>
+                  <dd className="text-[32px] font-semibold leading-10 text-ink tabular-nums">
                     ${tracesQ.data.monthly_spent_usd.toFixed(4)}
-                  </div>
-                  <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#1B1C1E]">
-                    <div
-                      className="h-full bg-[#5B8DEF]"
-                      style={{
-                        width: `${Math.min(
-                          100,
-                          tracesQ.data.monthly_budget_usd > 0
-                            ? (tracesQ.data.monthly_spent_usd / tracesQ.data.monthly_budget_usd) * 100
-                            : 0,
-                        ).toFixed(1)}%`,
-                      }}
+                  </dd>
+                  <dd className="flex flex-col gap-2 pt-1">
+                    <ProgressLine
+                      tone={
+                        tracesQ.data.monthly_budget_usd > 0 &&
+                        tracesQ.data.monthly_spent_usd / tracesQ.data.monthly_budget_usd > 0.8
+                          ? "mark"
+                          : "ink"
+                      }
+                      value={
+                        tracesQ.data.monthly_budget_usd > 0
+                          ? (tracesQ.data.monthly_spent_usd / tracesQ.data.monthly_budget_usd) * 100
+                          : 0
+                      }
                     />
-                  </div>
-                  <div className="mt-1 text-[11px] text-[#9CA3AF] tabular-nums">
-                    {t.tracesBudgetOf(tracesQ.data.monthly_budget_usd.toFixed(2))} ·{" "}
-                    {tracesQ.data.model_profile}
-                  </div>
+                    <span className="text-sm text-ink-3 tabular-nums">
+                      {t.tracesBudgetOf(tracesQ.data.monthly_budget_usd.toFixed(2))}
+                      <span className="ml-2">{tracesQ.data.model_profile}</span>
+                    </span>
+                  </dd>
                 </div>
-
-                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-4">
-                  <div className="text-xs text-[#9CA3AF]">{t.tracesTotalCalls}</div>
-                  <div className="mt-1.5 text-2xl font-semibold text-[#F3F4F6] tabular-nums">
+                <div className="flex flex-col gap-1">
+                  <dt className="text-sm text-ink-2">{t.tracesTotalCalls}</dt>
+                  <dd className="text-[32px] font-semibold leading-10 text-ink tabular-nums">
                     {tracesQ.data.total_calls}
-                  </div>
-                  <div className="mt-1 text-[11px] text-[#9CA3AF] tabular-nums">
-                    ${tracesQ.data.total_cost_usd.toFixed(4)}
-                  </div>
+                  </dd>
+                  <dd className="text-sm text-ink-3 tabular-nums">${tracesQ.data.total_cost_usd.toFixed(4)}</dd>
                 </div>
-
-                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-4">
-                  <div className="text-xs text-[#9CA3AF]">{t.tracesCacheHitRate}</div>
-                  <div className="mt-1.5 text-2xl font-semibold text-[#86EFAC] tabular-nums">
+                <div className="flex flex-col gap-1">
+                  <dt className="text-sm text-ink-2">{t.tracesCacheHitRate}</dt>
+                  <dd className="text-[32px] font-semibold leading-10 text-ink tabular-nums">
                     {fmtPct(tracesQ.data.cache_hit_rate)}
-                  </div>
-                  <div className="mt-1 text-[11px] text-[#9CA3AF] tabular-nums">
-                    {t.tracesCacheHitHint(tracesQ.data.cache_hits)}
-                  </div>
+                  </dd>
+                  <dd className="text-sm text-ink-3 tabular-nums">{t.tracesCacheHitHint(tracesQ.data.cache_hits)}</dd>
                 </div>
-
-                <div className="rounded-lg border border-[#33363B] bg-[#242629] p-4">
-                  <div className="text-xs text-[#9CA3AF]">{t.tracesTokensSummary}</div>
-                  <div className="mt-1.5 text-2xl font-semibold text-[#F3F4F6] tabular-nums">
+                <div className="flex flex-col gap-1">
+                  <dt className="text-sm text-ink-2">{t.tracesTokensSummary}</dt>
+                  <dd className="text-[32px] font-semibold leading-10 text-ink tabular-nums">
                     {(tracesQ.data.total_in_tokens + tracesQ.data.total_out_tokens).toLocaleString()}
-                  </div>
-                  <div className="mt-1 text-[11px] text-[#9CA3AF] tabular-nums">
+                  </dd>
+                  <dd className="text-sm text-ink-3 tabular-nums">
                     {t.tracesCachedTokensHint(tracesQ.data.total_cached_tokens)}
-                  </div>
+                  </dd>
                 </div>
-              </div>
+              </dl>
 
               {tracesQ.data.items.length === 0 ? (
-                <div className="rounded-lg border border-[#33363B] bg-[#242629] py-12 text-center">
-                  <p className="text-base text-[#F3F4F6]">{t.tracesEmpty}</p>
-                  <p className="mt-1 text-sm text-[#9CA3AF]">{t.tracesEmptyHint}</p>
-                </div>
+                <EmptyState title={t.tracesEmpty} className="py-16" />
               ) : (
-                <div className="overflow-x-auto rounded-lg border border-[#33363B] bg-[#242629]">
-                  <table className="w-full text-left text-xs">
-                    <thead className="border-b border-[#33363B] bg-[#1B1C1E] text-[11px] text-[#9CA3AF]">
+                <div className="-mx-4 overflow-x-auto px-4">
+                  <table className="w-full text-left text-sm tabular-nums">
+                    <thead className="text-ink-3">
                       <tr>
-                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColTime}</th>
-                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColRole}</th>
-                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColModel}</th>
-                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColTokens}</th>
-                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColLatency}</th>
-                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColCost}</th>
-                        <th className="px-3.5 py-2.5 font-medium">{t.tracesColCache}</th>
+                        <th className="h-10 pr-6 font-normal">{t.tracesColTime}</th>
+                        <th className="h-10 pr-6 font-normal">{t.tracesColRole}</th>
+                        <th className="h-10 pr-6 font-normal">{t.tracesColModel}</th>
+                        <th className="h-10 pr-6 text-right font-normal">{t.tracesColTokens}</th>
+                        <th className="h-10 pr-6 text-right font-normal">{t.tracesColLatency}</th>
+                        <th className="h-10 pr-6 text-right font-normal">{t.tracesColCost}</th>
+                        <th className="h-10 font-normal">{t.tracesColCache}</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-[#33363B] tabular-nums">
+                    <tbody>
                       {tracesQ.data.items.map((row) => (
-                        <tr key={row.id} className="hover:bg-[#1B1C1E]/60">
-                          <td className="whitespace-nowrap px-3.5 py-2.5 text-[#9CA3AF]">
+                        <tr key={row.id} className="hover:bg-table">
+                          <td className="h-12 whitespace-nowrap pr-6 text-ink-2">
                             {new Date(row.created_at * 1000).toLocaleString()}
                           </td>
-                          <td className="whitespace-nowrap px-3.5 py-2.5 text-[#F3F4F6]">
+                          <td className="h-12 whitespace-nowrap pr-6 font-medium text-ink">
                             {t.tracesRoleLabels[row.role] ?? row.role}
                           </td>
-                          <td className="whitespace-nowrap px-3.5 py-2.5 font-mono text-[11px] text-[#D1D5DB]">
-                            {row.model}
-                          </td>
-                          <td className="whitespace-nowrap px-3.5 py-2.5 font-mono text-[11px] text-[#D1D5DB]">
+                          <td className="h-12 whitespace-nowrap pr-6 text-ink-2">{row.model}</td>
+                          <td className="h-12 whitespace-nowrap pr-6 text-right text-ink-2">
                             {row.in_tokens.toLocaleString()} / {row.cached_tokens.toLocaleString()} /{" "}
                             {row.out_tokens.toLocaleString()}
                           </td>
-                          <td className="whitespace-nowrap px-3.5 py-2.5 text-[#9CA3AF]">
-                            {row.latency_ms} ms
-                          </td>
-                          <td className="whitespace-nowrap px-3.5 py-2.5 font-mono text-[#F3F4F6]">
-                            ${row.cost_usd.toFixed(5)}
-                          </td>
-                          <td className="whitespace-nowrap px-3.5 py-2.5">
-                            {row.cache_hit ? (
-                              <span className="rounded bg-[#3D9A6B]/20 px-2 py-0.5 text-[10px] text-[#86EFAC]">
-                                {t.tracesCacheHitBadge}
-                              </span>
-                            ) : (
-                              <span className="rounded bg-[#2C2F34] px-2 py-0.5 text-[10px] text-[#9CA3AF]">
-                                {t.tracesCacheMissBadge}
-                              </span>
-                            )}
+                          <td className="h-12 whitespace-nowrap pr-6 text-right text-ink-2">{row.latency_ms} ms</td>
+                          <td className="h-12 whitespace-nowrap pr-6 text-right text-ink">${row.cost_usd.toFixed(5)}</td>
+                          <td className="h-12 whitespace-nowrap">
+                            <span className={row.cache_hit ? "font-medium text-ink" : "text-ink-3"}>
+                              {row.cache_hit ? t.tracesCacheHitBadge : t.tracesCacheMissBadge}
+                            </span>
                           </td>
                         </tr>
                       ))}
@@ -1167,178 +956,176 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
           ) : null}
         </div>
       ) : (
-        <div className="mt-6">
-          <div className="space-y-1">
-            <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">
-              {t.insightsTitle}
-            </h1>
-            <p className="text-sm text-[#9CA3AF]">{t.insightsSubtitle}</p>
-          </div>
+        <div className="mt-12 flex flex-col gap-12">
+          <h1 className="text-lg font-semibold text-ink" title={t.insightsSubtitle}>
+            {t.insightsTitle}
+          </h1>
 
-          {notice && (
-            <div className="mt-4 rounded-md border border-[#3D9A6B]/50 bg-[#3D9A6B]/10 px-4 py-2.5 text-sm text-[#A7F3D0]">
-              {notice}
-            </div>
-          )}
-
-          {error && (
-            <div className="mt-4 rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-2.5 text-sm text-[#FCA5A5]">
-              {t.errorPrefix}
-              {error}
-            </div>
-          )}
-
-          <div className="mt-6 border-t border-[#33363B]">
+          <div className="flex flex-col gap-12">
             {plansQ.isLoading ? (
-              <p className="py-10 text-sm text-[#9CA3AF]">{t.loading}</p>
+              <Loading label={t.loading} />
             ) : plans.length === 0 ? (
-              <div className="py-12 text-center">
-                <p className="text-base text-[#F3F4F6]">{t.insightsEmpty}</p>
-                <p className="mt-1 text-sm text-[#9CA3AF]">{t.insightsEmptyHint}</p>
-              </div>
+              <EmptyState title={t.insightsEmpty} />
             ) : (
               plans.map((plan) => {
                 const expanded = expandedId === plan.id;
                 const canRestore = plan.status === "applied" || plan.status === "applying";
                 const activeInBatch = plan.items.filter((it) => it.status !== "reverted").length;
+                const verifierLabel = (() => {
+                  if (!plan.verifier_report) return null;
+                  const l2 = plan.verifier_report.layer2;
+                  const flaggedLen = plan.verifier_report.flagged_photos?.length ?? 0;
+                  if (flaggedLen > 0) return { text: t.verifierTrashBadgeFlagged(flaggedLen), title: l2?.model_id ?? undefined, accent: true };
+                  if (l2?.status === "passed") return { text: t.verifierTrashBadgeTwoLayer, title: l2.model_id ?? undefined, accent: false };
+                  return { text: t.verifierTrashBadgeRules, title: undefined, accent: false };
+                })();
                 return (
-                  <div key={plan.id} className="border-b border-[#33363B] py-4">
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                      <div className="min-w-0 space-y-1">
-                        <div className="flex flex-wrap items-center gap-2.5">
-                          <span className="text-sm font-medium text-[#F3F4F6]">
-                            {plan.session_name ?? plan.id}
-                          </span>
-                          <span
-                            className={`rounded px-2 py-0.5 text-xs ${
-                              canRestore
-                                ? "bg-[#DC4C46]/20 text-[#FCA5A5]"
-                                : "bg-[#3D9A6B]/20 text-[#86EFAC]"
-                            }`}
-                          >
-                            {t.planStatus[plan.status] ?? plan.status}
-                          </span>
-                          {plan.verifier_report && (() => {
-                            const l2 = plan.verifier_report.layer2;
-                            const flaggedLen = plan.verifier_report.flagged_photos?.length ?? 0;
-                            if (flaggedLen > 0) {
-                              return (
-                                <span
-                                  title={l2?.model_id ?? undefined}
-                                  className="rounded bg-[#D99B26]/15 px-2 py-0.5 text-[11px] text-[#FCD34D] tabular-nums"
-                                >
-                                  {t.verifierTrashBadgeFlagged(flaggedLen)}
-                                </span>
-                              );
-                            }
-                            if (l2?.status === "passed") {
-                              return (
-                                <span
-                                  title={l2.model_id ?? undefined}
-                                  className="rounded bg-[#5B8DEF]/15 px-2 py-0.5 text-[11px] text-[#93C5FD]"
-                                >
-                                  {t.verifierTrashBadgeTwoLayer}
-                                </span>
-                              );
-                            }
-                            return (
-                              <span className="rounded bg-[#2C2F34] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
-                                {t.verifierTrashBadgeRules}
-                              </span>
-                            );
-                          })()}
-                          <span className="text-xs text-[#9CA3AF] tabular-nums">
+                  <article key={plan.id} className="intent flex flex-col gap-6">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+                          <h2 className="text-lg font-semibold text-ink">{plan.session_name ?? plan.id}</h2>
+                          <span className="text-sm text-ink-2 tabular-nums">
                             {t.photoCount(canRestore ? activeInBatch : plan.item_count)}
                           </span>
+                          <span className={`text-sm ${canRestore ? "font-medium text-ink" : "text-ink-3"}`}>
+                            {t.planStatus[plan.status] ?? plan.status}
+                          </span>
+                          {verifierLabel && (
+                            <span
+                              title={verifierLabel.title}
+                              className={`inline-flex items-center gap-1 text-sm ${verifierLabel.accent ? "text-mark" : "text-ink-3"}`}
+                            >
+                              <Icon as={Sparkles} />
+                              {verifierLabel.text}
+                            </span>
+                          )}
                         </div>
                         {plan.quarantine_dir && (
-                          <div className="truncate font-mono text-xs text-[#9CA3AF]">
+                          <p className="mt-1 truncate text-sm text-ink-3" title={plan.quarantine_dir}>
                             {plan.quarantine_dir}
-                          </div>
+                          </p>
                         )}
                       </div>
 
                       <div className="flex shrink-0 flex-wrap items-center gap-2">
                         {plan.quarantine_dir && canRestore && (
-                          <button
-                            type="button"
-                            onClick={() => void handleOpenFolder(plan.id)}
-                            className="rounded-md border border-[#33363B] bg-[#242629] px-3 py-1.5 text-xs text-[#F3F4F6] hover:bg-[#2C2F34]"
-                          >
+                          <Button variant="ghost" icon={Folder} className="reveal" onClick={() => void handleOpenFolder(plan.id)}>
                             {t.openTrashFolder}
-                          </button>
+                          </Button>
                         )}
-                        <button
-                          type="button"
+                        <Button
+                          variant="ghost"
+                          iconRight={ChevronDown}
+                          aria-expanded={expanded}
+                          className={expanded ? "[&_svg]:rotate-180" : ""}
                           onClick={() => setExpandedId(expanded ? null : plan.id)}
-                          className="rounded-md border border-[#33363B] bg-[#242629] px-3 py-1.5 text-xs text-[#D1D5DB] hover:bg-[#2C2F34]"
                         >
                           {expanded ? t.hideDetails : t.showDetails}
-                        </button>
+                        </Button>
                         {canRestore && (
-                          <button
-                            type="button"
+                          <Button
+                            variant="primary"
+                            icon={RotateLeft}
                             disabled={busyKey === plan.id}
                             onClick={() => void handleRestoreBatch(plan)}
-                            className="rounded-md bg-[#3D9A6B] px-3.5 py-1.5 text-xs font-medium text-white hover:bg-[#32825A] disabled:opacity-50"
                           >
                             {t.restoreAll}
-                          </button>
+                          </Button>
                         )}
                       </div>
                     </div>
 
+                    {/* Contact strip of what's in the batch */}
+                    {!expanded && plan.items.length > 0 && (
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        aria-hidden="true"
+                        onClick={() => setExpandedId(plan.id)}
+                        className="grid w-full grid-cols-[repeat(auto-fill,minmax(88px,1fr))] grid-rows-[64px] auto-rows-[0px] gap-x-2 gap-y-0 overflow-hidden"
+                      >
+                        {plan.items.map((item) => (
+                          <Thumb
+                            key={item.photo_id}
+                            src={photoImageUrl(item.photo_id, "grid")}
+                            verdict={item.status === "reverted" ? "keep" : "reject"}
+                            veiled={item.status !== "reverted"}
+                            className="h-16"
+                          />
+                        ))}
+                      </button>
+                    )}
+
                     {expanded && (
-                      <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <ul className="fade-enter grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2">
                         {plan.items.map((item) => {
                           const isReverted = item.status === "reverted";
                           return (
-                            <div
-                              key={item.photo_id}
-                              className="flex items-center justify-between gap-3 rounded-md border border-[#33363B] bg-[#242629] p-2"
-                            >
-                              <div className="flex min-w-0 items-center gap-3">
-                                <img
+                            <li key={item.photo_id} className="flex items-center justify-between gap-4">
+                              <div className="flex min-w-0 items-center gap-4">
+                                <Thumb
                                   src={photoImageUrl(item.photo_id, "grid")}
-                                  alt=""
-                                  className="h-12 w-16 shrink-0 rounded bg-[#1B1C1E] object-cover"
+                                  verdict={isReverted ? "keep" : "reject"}
+                                  veiled={!isReverted}
+                                  className="h-12 w-16 shrink-0"
                                 />
-                                <div className="min-w-0">
-                                  <div className="truncate text-xs text-[#F3F4F6]">
+                                <div className="min-w-0 text-sm">
+                                  <div className="truncate font-medium text-ink">
                                     {item.src_paths[0]?.split("/").pop() ?? item.photo_id}
                                   </div>
-                                  <div className="text-[11px] text-[#9CA3AF] tabular-nums">
-                                    {t.fileCount(item.src_paths.length)}
-                                  </div>
+                                  <div className="text-ink-3 tabular-nums">{t.fileCount(item.src_paths.length)}</div>
                                 </div>
                               </div>
-
                               {isReverted ? (
-                                <span className="shrink-0 text-xs text-[#3D9A6B]">
-                                  {t.restoredBadge}
-                                </span>
+                                <span className="shrink-0 text-sm text-ink-2">{t.restoredBadge}</span>
                               ) : (
-                                <button
-                                  type="button"
+                                <Button
+                                  variant="secondary"
+                                  size="sm"
                                   disabled={busyKey === `${plan.id}:${item.photo_id}`}
                                   onClick={() => void handleRestorePhoto(plan.id, item.photo_id)}
-                                  className="shrink-0 rounded border border-[#33363B] px-2.5 py-1 text-xs text-[#F3F4F6] hover:bg-[#2C2F34] disabled:opacity-50"
                                 >
                                   {t.restoreSingle}
-                                </button>
+                                </Button>
                               )}
-                            </div>
+                            </li>
                           );
                         })}
-                      </div>
+                      </ul>
                     )}
-                  </div>
+                  </article>
                 );
               })
             )}
           </div>
         </div>
       )}
+
+      <NoticeDock>
+        {activeTab === "trash" && notice && (
+          <Notice onDismiss={() => setNotice(null)} dismissLabel={t.uiDismiss}>
+            {notice}
+          </Notice>
+        )}
+        {activeTab === "trash" && error && (
+          <Notice tone="error" onDismiss={() => setError(null)} dismissLabel={t.uiDismiss}>
+            {t.errorPrefix}
+            {error}
+          </Notice>
+        )}
+        {activeTab === "memory" && memoryNotice && (
+          <Notice onDismiss={() => setMemoryNotice(null)} dismissLabel={t.uiDismiss}>
+            {memoryNotice}
+          </Notice>
+        )}
+        {activeTab === "memory" && memoryError && (
+          <Notice tone="error" onDismiss={() => setMemoryError(null)} dismissLabel={t.uiDismiss}>
+            {t.errorPrefix}
+            {memoryError}
+          </Notice>
+        )}
+      </NoticeDock>
     </div>
   );
 }

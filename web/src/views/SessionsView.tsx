@@ -7,7 +7,22 @@ import {
   type SessionSummary,
 } from "../api";
 import { QuarantineModal } from "../components/QuarantineModal";
+import { verdictForPhoto, isPhotoFinalized } from "../components/photoMarks";
+import {
+  Button,
+  EmptyState,
+  Icon,
+  IconButton,
+  Loading,
+  Notice,
+  NoticeDock,
+  ProgressLine,
+  StatusDot,
+  Thumb,
+} from "../components/ui";
+import { photoImageUrl } from "../api";
 import { useI18n } from "../i18n";
+import { Folder, Layers, Lock, Play, Refresh, Search, Trash } from "reicon-react";
 
 interface SessionsViewProps {
   onOpenReview: (sessionId: string) => void;
@@ -60,147 +75,156 @@ function SessionRow({
   const progressPct =
     reviewTotal > 0 ? Math.min(100, Math.round((reviewed / reviewTotal) * 100)) : 100;
 
+  const previewQ = useQuery({
+    queryKey: ["session-photos", session.id, "preview", lang],
+    queryFn: () =>
+      api.listSessionPhotos(session.id, {
+        sort: "name",
+        limit: 12,
+        lang,
+        includeQuarantined: false,
+      }),
+  });
+  const preview = previewQ.data?.items ?? [];
+
+  const statusText = !s
+    ? null
+    : isAllDone
+      ? t.sessionStatusDone
+      : isReadyTrash
+        ? t.sessionStatusReadyTrash(actionableRed)
+        : isOnlyUnsure
+          ? t.sessionStatusUnsure(yellowCount)
+          : t.sessionStatusInProgress(unreviewed);
+
   return (
-    <div className="flex flex-col gap-3 border-b border-[#33363B] py-4 sm:flex-row sm:items-center sm:justify-between">
-      <div className="min-w-0 flex-1 space-y-1.5">
-        <div className="flex flex-wrap items-center gap-2.5">
+    <article>
+      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-4">
+        <div className="min-w-0 flex-1">
           <button
             type="button"
             onClick={() => onOpenReview(session.id)}
-            className="truncate text-left text-base font-medium text-[#F3F4F6] hover:underline"
+            className="block max-w-full truncate text-left text-lg font-semibold text-ink hover:underline hover:decoration-1 hover:underline-offset-4"
           >
             {session.name}
           </button>
-          {s && (
-            <span
-              className={`rounded px-2 py-0.5 text-xs font-medium tabular-nums ${
-                isAllDone
-                  ? "bg-[#3D9A6B]/20 text-[#86EFAC]"
-                  : isReadyTrash
-                    ? "bg-[#DC4C46]/20 text-[#FCA5A5]"
-                    : isOnlyUnsure
-                      ? "bg-[#D99B26]/20 text-[#FCD34D]"
-                      : "bg-[#2C2F34] text-[#D1D5DB]"
-              }`}
-            >
-              {isAllDone
-                ? t.sessionStatusDone
-                : isReadyTrash
-                  ? t.sessionStatusReadyTrash(actionableRed)
-                  : isOnlyUnsure
-                    ? t.sessionStatusUnsure(yellowCount)
-                    : t.sessionStatusInProgress(unreviewed)}
+          <p className="mt-1 truncate text-sm text-ink-2" title={session.root_path}>
+            {session.root_path}
+          </p>
+        </div>
+
+        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
+          <IconButton
+            icon={Folder}
+            label={t.openShootFolder}
+            variant="secondary"
+            onClick={() => onOpenFolder(session.id)}
+          />
+          {s && (reviewed > 0 || yellowCount > 0 || actionableRed > 0) && (
+            <Button variant="ghost" icon={Refresh} onClick={() => onResetReview(session)}>
+              {t.resetReview}
+            </Button>
+          )}
+          <Button
+            variant="secondary"
+            icon={Search}
+            disabled={screening}
+            onClick={() => onAutoScreen(session)}
+          >
+            {screening ? t.autoScreening : t.autoScreen}
+          </Button>
+          {actionableRed > 0 && (
+            <Button variant="mark" icon={Trash} onClick={() => onQuickQuarantine(session.id)}>
+              {t.oneClickWithCount(actionableRed)}
+            </Button>
+          )}
+          <Button variant="primary" onClick={() => onOpenReview(session.id)}>
+            {t.openReview}
+          </Button>
+        </div>
+      </div>
+
+      {/* Contact sheet: the first frames of the shoot with the marks already made */}
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-hidden="true"
+        onClick={() => onOpenReview(session.id)}
+        className="mt-6 grid w-full grid-cols-[repeat(auto-fill,minmax(104px,1fr))] grid-rows-[80px] auto-rows-[0px] gap-x-2 gap-y-0 overflow-hidden"
+      >
+        {previewQ.isLoading
+          ? Array.from({ length: 8 }).map((_, i) => (
+              <span key={i} className="h-20 rounded-chip bg-table" />
+            ))
+          : preview.map((item) => (
+              <Thumb
+                key={item.photo_id}
+                src={photoImageUrl(item.photo_id, "grid")}
+                verdict={verdictForPhoto(item)}
+                veiled={isPhotoFinalized(item)}
+                className="h-20"
+              />
+            ))}
+      </button>
+
+      {s && (
+        <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm tabular-nums">
+          <span className={isReadyTrash ? "font-medium text-reject-ink" : "font-medium text-ink"}>
+            {statusText}
+          </span>
+          {screening && (
+            <span className="fade-enter flex items-center gap-2 text-ink-2">
+              <ProgressLine indeterminate className="w-16" />
+              {t.autoScreening}
             </span>
           )}
-        </div>
-        <div className="truncate text-xs text-[#9CA3AF]">{session.root_path}</div>
-
-        {s && unreviewed > 0 && reviewTotal > 0 && (
-          <div className="flex items-center gap-2.5 pt-0.5">
-            <div className="h-1.5 w-36 overflow-hidden rounded-full bg-[#242629]">
-              <div
-                className="h-full bg-[#3D9A6B] transition-all"
-                style={{ width: `${progressPct}%` }}
-              />
-            </div>
-            <span className="text-xs text-[#9CA3AF] tabular-nums">
-              {t.sessionProgressRatio(reviewed, reviewTotal)}
+          {unreviewed > 0 && reviewTotal > 0 && (
+            <span className="flex items-center gap-2 text-ink-2">
+              <ProgressLine value={progressPct} className="w-24" />
+              <span>{t.sessionProgressRatio(reviewed, reviewTotal)}</span>
             </span>
-          </div>
-        )}
-
-        {s && (
-          <div className="flex flex-wrap items-center gap-4 pt-0.5 text-xs tabular-nums">
+          )}
+          <span className="flex flex-wrap items-center gap-x-4 gap-y-1 text-ink-2">
             {(keptCount > 0 || isAllDone) && (
-              <span className="text-[#3D9A6B]">{t.sessionKeptCount(keptCount)}</span>
-            )}
-            {exemptCount > 0 && (
-              <span className="text-[#93C5FD]">
-                {t.bucketExempt} {exemptCount}
-              </span>
-            )}
-            {yellowCount > 0 && (
-              <span className="text-[#D99B26]">
-                {t.bucketYellow} {yellowCount}
+              <span className="inline-flex items-center gap-1" title={t.sessionKeptCount(keptCount)}>
+                <StatusDot verdict="keep" />
+                {keptCount}
               </span>
             )}
             {actionableRed > 0 && (
-              <span className="text-[#DC4C46]">
-                {t.bucketRed} {actionableRed}
+              <span className="inline-flex items-center gap-1" title={t.bucketRed}>
+                <StatusDot verdict="reject" />
+                {actionableRed}
+              </span>
+            )}
+            {yellowCount > 0 && (
+              <span className="inline-flex items-center gap-1" title={t.bucketYellow}>
+                <StatusDot verdict="unsure" />
+                {yellowCount}
+              </span>
+            )}
+            {exemptCount > 0 && (
+              <span className="inline-flex items-center gap-1" title={t.bucketExempt}>
+                <Icon as={Lock} />
+                {exemptCount}
               </span>
             )}
             {s.burst_count > 0 && (
-              <span className="text-[#9CA3AF]">
-                {t.bucketBursts} {s.burst_count}
+              <span className="inline-flex items-center gap-1" title={t.bucketBursts}>
+                <Icon as={Layers} />
+                {s.burst_count}
               </span>
             )}
             {quarantined > 0 && (
-              <span className="text-[#9CA3AF]">
-                {t.quarantinedBadge} {quarantined}
+              <span className="inline-flex items-center gap-1" title={t.quarantinedBadge}>
+                <Icon as={Trash} />
+                {quarantined}
               </span>
             )}
-          </div>
-        )}
-      </div>
-
-      <div className="flex shrink-0 flex-wrap items-center gap-2">
-        {actionableRed > 0 && (
-          <button
-            type="button"
-            onClick={() => onQuickQuarantine(session.id)}
-            className="rounded-md bg-[#DC4C46] px-3.5 py-2 text-sm font-medium text-white hover:bg-[#C63E38] tabular-nums"
-          >
-            {t.oneClickWithCount(actionableRed)}
-          </button>
-        )}
-        <button
-          type="button"
-          disabled={screening}
-          onClick={() => onAutoScreen(session)}
-          className="rounded-md border border-[#5B8DEF]/50 bg-[#5B8DEF]/15 px-3 py-2 text-sm font-medium text-[#93C5FD] hover:bg-[#5B8DEF]/25 disabled:opacity-50"
-        >
-          {screening ? t.autoScreening : t.autoScreen}
-        </button>
-        {s && (reviewed > 0 || yellowCount > 0 || actionableRed > 0) && (
-          <button
-            type="button"
-            onClick={() => onResetReview(session)}
-            className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-3 py-2 text-sm text-[#9CA3AF] hover:bg-[#2C2F34] hover:text-[#F3F4F6]"
-          >
-            {t.resetReview}
-          </button>
-        )}
-        <button
-          type="button"
-          title={t.openShootFolder}
-          onClick={() => onOpenFolder(session.id)}
-          className="inline-flex items-center gap-1.5 rounded-md border border-[#33363B] bg-[#242629] px-3 py-2 text-sm text-[#D1D5DB] hover:bg-[#2C2F34] hover:text-[#F3F4F6]"
-        >
-          <svg
-            aria-hidden="true"
-            viewBox="0 0 20 20"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.6"
-            className="h-4 w-4 shrink-0"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.5l1.75 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5v-9Z"
-            />
-          </svg>
-          <span>{t.openShootFolder}</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => onOpenReview(session.id)}
-          className="rounded-md border border-[#33363B] bg-[#242629] px-3.5 py-2 text-sm font-medium text-[#F3F4F6] hover:bg-[#2C2F34]"
-        >
-          {t.openReview}
-        </button>
-      </div>
-    </div>
+          </span>
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -400,37 +424,33 @@ export function SessionsView({ onOpenReview }: SessionsViewProps) {
   }
 
   const sessions = sessionsQ.data?.items ?? [];
+  const scanActive = busy || (liveProgress !== null && liveProgress.status !== "completed");
+  const scanPct =
+    liveProgress?.total && liveProgress.total > 0
+      ? Math.min(100, Math.round(((liveProgress.done ?? 0) / liveProgress.total) * 100))
+      : undefined;
 
   return (
-    <div className="mx-auto max-w-4xl px-6 py-8">
-      <div className="space-y-1">
-        <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">{t.sessionsTitle}</h1>
-        <p className="text-sm text-[#9CA3AF]">{t.sessionsSubtitle}</p>
+    <div className="mx-auto max-w-5xl px-6 pb-32 pt-12 sm:px-12">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <h1 className="text-lg font-semibold text-ink">{t.sessionsTitle}</h1>
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" icon={Play} disabled={busy} onClick={() => void handleRunDemo()}>
+            {t.runDemo}
+          </Button>
+          <Button
+            variant="primary"
+            icon={Folder}
+            disabled={busy}
+            onClick={() => void handlePickFolder()}
+          >
+            {t.pickFolder}
+          </Button>
+        </div>
       </div>
 
-      {/* Primary actions */}
-      <div className="mt-6 flex flex-wrap items-center gap-3">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void handlePickFolder()}
-          className="rounded-md bg-[#F3F4F6] px-4 py-2.5 text-sm font-medium text-[#1B1C1E] hover:bg-white disabled:opacity-50"
-        >
-          {t.pickFolder}
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void handleRunDemo()}
-          className="rounded-md border border-[#33363B] bg-[#242629] px-4 py-2.5 text-sm text-[#F3F4F6] hover:bg-[#2C2F34] disabled:opacity-50"
-        >
-          {t.runDemo}
-        </button>
-      </div>
-
-      {/* Direct path input fallback */}
       <form
-        className="mt-4 flex gap-2"
+        className="intent mt-8 flex items-center gap-2"
         onSubmit={(e) => {
           e.preventDefault();
           void runScan(folderInput);
@@ -441,82 +461,53 @@ export function SessionsView({ onOpenReview }: SessionsViewProps) {
           value={folderInput}
           onChange={(e) => setFolderInput(e.target.value)}
           placeholder={t.scanPathPlaceholder}
-          className="flex-1 rounded-md border border-[#33363B] bg-[#242629] px-3.5 py-2 text-sm text-[#F3F4F6] placeholder-[#6B7280]"
+          aria-label={t.scanPathPlaceholder}
+          className="field h-12 min-w-0 flex-1"
         />
-        <button
-          type="submit"
-          disabled={busy || !folderInput.trim()}
-          className="rounded-md border border-[#33363B] bg-[#242629] px-4 py-2 text-sm text-[#F3F4F6] hover:bg-[#2C2F34] disabled:opacity-40"
-        >
-          {t.startScan}
-        </button>
+        {folderInput.trim() && (
+          <Button type="submit" variant="primary" size="lg" disabled={busy} className="fade-enter">
+            {t.startScan}
+          </Button>
+        )}
       </form>
 
-      {/* Live SSE scan progress */}
-      {(busy || (liveProgress && liveProgress.status !== "completed")) && (
-        <div className="mt-4 flex items-center justify-between gap-4 rounded-md border border-[#33363B] bg-[#242629] px-4 py-3 text-sm">
-          <div className="space-y-1">
-            <div className="text-[#F3F4F6]">
-              {t.scanning}
-              {liveProgress?.stage ? ` (${liveProgress.stage})` : ""}
-              {liveProgress?.total
-                ? ` · ${liveProgress.done ?? 0} / ${liveProgress.total}`
-                : ""}
-            </div>
-            {liveProgress?.total ? (
-              <div className="h-1.5 w-64 overflow-hidden rounded-full bg-[#1B1C1E]">
-                <div
-                  className="h-full bg-[#5B8DEF]"
-                  style={{
-                    width: `${Math.min(100, Math.round(((liveProgress.done ?? 0) / liveProgress.total) * 100))}%`,
-                  }}
-                />
-              </div>
-            ) : null}
-          </div>
+      {scanActive && (
+        <div className="fade-enter mt-6 flex items-center gap-4 text-sm tabular-nums">
+          <span className="shrink-0 font-medium text-ink">
+            {t.scanning}
+            {liveProgress?.total ? ` ${liveProgress.done ?? 0} / ${liveProgress.total}` : ""}
+          </span>
+          <ProgressLine
+            value={scanPct}
+            indeterminate={scanPct === undefined}
+            className="min-w-0 flex-1"
+          />
+          {liveProgress?.stage && <span className="shrink-0 text-ink-2">{liveProgress.stage}</span>}
           {liveProgress?.jobId && (
-            <button
-              type="button"
-              onClick={() => void handlePauseResume()}
-              className="rounded border border-[#33363B] px-3 py-1.5 text-xs text-[#F3F4F6] hover:bg-[#2C2F34]"
-            >
+            <Button variant="secondary" size="sm" onClick={() => void handlePauseResume()}>
               {liveProgress.status === "paused" ? t.resumeScan : t.pauseScan}
-            </button>
+            </Button>
           )}
         </div>
       )}
 
-      {notice && (
-        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[#3D9A6B]/50 bg-[#3D9A6B]/10 px-4 py-2.5 text-sm text-[#A7F3D0]">
-          <span>{notice}</span>
-          {lastAppliedPlanId && (
-            <button
-              type="button"
-              onClick={() => void api.openPlanFolder(lastAppliedPlanId)}
-              className="rounded border border-[#A7F3D0]/40 px-2.5 py-1 text-xs text-[#ECFDF5] hover:bg-[#3D9A6B]/30"
-            >
-              {t.openTrashFolder}
-            </button>
-          )}
-        </div>
-      )}
-
-      {error && (
-        <div className="mt-4 rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-2.5 text-sm text-[#FCA5A5]">
-          {t.errorPrefix}
-          {error}
-        </div>
-      )}
-
-      {/* Session list */}
-      <div className="mt-8 border-t border-[#33363B]">
+      <div className="mt-16 flex flex-col gap-16">
         {sessionsQ.isLoading ? (
-          <p className="py-10 text-sm text-[#9CA3AF]">{t.loading}</p>
+          <Loading label={t.loading} />
         ) : sessions.length === 0 ? (
-          <div className="py-12 text-center">
-            <p className="text-base text-[#F3F4F6]">{t.emptySessions}</p>
-            <p className="mt-1 text-sm text-[#9CA3AF]">{t.emptySessionsHint}</p>
-          </div>
+          <EmptyState title={t.emptySessions}>
+            <Button variant="secondary" icon={Play} disabled={busy} onClick={() => void handleRunDemo()}>
+              {t.runDemo}
+            </Button>
+            <Button
+              variant="primary"
+              icon={Folder}
+              disabled={busy}
+              onClick={() => void handlePickFolder()}
+            >
+              {t.pickFolder}
+            </Button>
+          </EmptyState>
         ) : (
           sessions.map((sess) => (
             <SessionRow
@@ -532,6 +523,33 @@ export function SessionsView({ onOpenReview }: SessionsViewProps) {
           ))
         )}
       </div>
+
+      <NoticeDock>
+        {notice && (
+          <Notice
+            onDismiss={() => setNotice(null)}
+            dismissLabel={t.uiDismiss}
+            actions={
+              lastAppliedPlanId
+                ? [
+                    {
+                      label: t.openTrashFolder,
+                      onClick: () => void api.openPlanFolder(lastAppliedPlanId),
+                    },
+                  ]
+                : []
+            }
+          >
+            {notice}
+          </Notice>
+        )}
+        {error && (
+          <Notice tone="error" onDismiss={() => setError(null)} dismissLabel={t.uiDismiss}>
+            {t.errorPrefix}
+            {error}
+          </Notice>
+        )}
+      </NoticeDock>
 
       {(verifyingPlan || activeDraft) && (
         <QuarantineModal

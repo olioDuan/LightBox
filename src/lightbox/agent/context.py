@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Collection, Sequence
 from typing import Any, Literal
 
-from lightbox.models import ImageInput, Message, ToolCall, ToolResultBlock, ToolSchema
+from lightbox.models import (
+    ImageInput,
+    Message,
+    ToolCall,
+    ToolResultBlock,
+    ToolSchema,
+    find_absolute_path_spans,
+    redact_absolute_paths_in_text,
+)
 from lightbox.services import LightboxServices
 from lightbox.store import AgentEventRecord, AgentSessionRecord, SessionRecord
 from lightbox.tools import ToolRegistry
@@ -15,11 +22,6 @@ from lightbox.tools import ToolRegistry
 AgentStage = Literal["explore", "review", "propose"]
 STAGE_ORDER: tuple[AgentStage, ...] = ("explore", "review", "propose")
 STAGE_REBUILD_TOKEN_LIMIT = 30_000
-
-# Match POSIX/Windows absolute paths (mirrors OutboundPrivacyHook so user messages never trip it)
-_USER_ABS_PATH_RE = re.compile(
-    r"""(?<![A-Za-z0-9_])(/(?:Users|home|Volumes|mnt|media|tmp|private|var|opt|root)/[^\s"'`)\],;，。！？]+|[A-Za-z]:\\[^\s"'`)\],;，。！？]+)"""
-)
 
 # Strictly static prefix (NO dynamic timestamps or volatile counters) to maximize Anthropic Prompt Caching.
 _STATIC_SYSTEM_PROMPT = """\
@@ -92,16 +94,46 @@ def alias_paths_in_text(
             return f"{alias} (session_id={matched_sid})"
         return alias
 
-    # First replace any exact registered session root_paths (handles non-standard mount prefixes)
-    masked = text
+    # Collect candidate spans from:
+    # 1) Exact registered session root_paths (handles unmounted/non-standard roots)
+    # 2) Unified host-aware absolute path detector (handles spaces & arbitrary roots like /sessions/...)
+    candidate_spans: list[tuple[int, int]] = []
     for s in sorted(known_sessions, key=lambda item: len(item.root_path), reverse=True):
-        rp = s.root_path
-        if rp and len(rp) > 3 and rp in masked:
-            masked = masked.replace(rp, _register(rp))
+        rp = s.root_path.rstrip("/") if len(s.root_path) > 1 else s.root_path
+        if not rp or len(rp) <= 3:
+            continue
+        search_from = 0
+        while True:
+            idx = text.find(rp, search_from)
+            if idx < 0:
+                break
+            end = idx + len(rp)
+            # Ensure we don't slice off the middle of a longer directory name (e.g. /trip vs /trip2)
+            next_ch = text[end] if end < len(text) else ""
+            if not next_ch or not (next_ch.isalnum() or next_ch in {"_", "-"}):
+                candidate_spans.append((idx, end))
+            search_from = idx + 1
 
-    # Then replace any remaining POSIX/Windows absolute paths
-    masked = _USER_ABS_PATH_RE.sub(lambda m: _register(m.group(1)), masked)
-    return masked, aliases
+    candidate_spans.extend(find_absolute_path_spans(text))
+    if not candidate_spans:
+        return text, aliases
+
+    # Prefer longest spans first so e.g. `/tmp/2026 Japan Trip` wins over `/tmp/2026`
+    selected: list[tuple[int, int]] = []
+    for start, end in sorted(candidate_spans, key=lambda sp: (-(sp[1] - sp[0]), sp[0])):
+        if any(not (end <= s_start or start >= s_end) for s_start, s_end in selected):
+            continue
+        selected.append((start, end))
+    selected.sort(key=lambda sp: sp[0])
+
+    chunks: list[str] = []
+    cursor = 0
+    for start, end in selected:
+        chunks.append(text[cursor:start])
+        chunks.append(_register(text[start:end]))
+        cursor = end
+    chunks.append(text[cursor:])
+    return "".join(chunks), aliases
 
 
 def resolve_path_aliases_in_args(
@@ -141,9 +173,8 @@ def redact_path_aliases_in_text(text: str, path_aliases: dict[str, str]) -> str:
                 out = out.replace(real_norm, alias)
         except OSError:
             pass
-    # Defense-in-depth: scrub any unexpected absolute path from tool error strings
-    out = _USER_ABS_PATH_RE.sub("<redacted_path>", out)
-    return out
+    # Defense-in-depth: scrub any unexpected absolute path from tool outputs / user preferences
+    return redact_absolute_paths_in_text(out, replacement="<redacted_path>")
 
 
 def build_system_prompt(preferences_text: str = "") -> str:

@@ -38,7 +38,11 @@ from lightbox.models import (
 from lightbox.models.secrets import has_api_key
 from lightbox.paths import AppPaths, get_app_paths
 from lightbox.services.burst import BurstDetail, BurstService
-from lightbox.services.review import BucketName, ReviewService
+from lightbox.services.review import (
+    BucketName,
+    ReviewService,
+    extract_effective_preferences_for_prompt,
+)
 from lightbox.store import (
     JobItemRecord,
     JobRecord,
@@ -473,22 +477,13 @@ class TriageService:
         return member_ids, tuple(images)
 
     def _read_effective_preferences(self) -> str:
-        """Read accepted/user-edited text preferences from `preferences.md` for VLM alignment (SPEC §7.6)."""
-        pref_path = self.app_paths.preferences_file
-        if not pref_path.is_file():
-            return ""
-        try:
-            raw = pref_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            return ""
-        if not raw or "No custom aesthetic or culling preference rules have been approved yet." in raw:
-            return ""
-        substantive = [
-            line for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")
-        ]
-        if not substantive:
-            return ""
-        return raw[:2000]
+        """Read path-redacted active text preferences from `preferences.md` for VLM alignment (SPEC §7.6)."""
+        session_roots = [s.root_path for s in self.repo.list_sessions()]
+        return extract_effective_preferences_for_prompt(
+            self.app_paths,
+            max_chars=2000,
+            extra_paths=session_roots,
+        )
 
     def _build_yellow_messages(
         self,

@@ -54,6 +54,7 @@ from lightbox.agent.memory import (
     append_rule_to_preferences,
     extract_effective_preferences_for_prompt,
     read_preferences,
+    remove_rule_from_preferences,
     serialize_memory_rule,
     write_preferences,
 )
@@ -120,6 +121,7 @@ __all__ = [
     "next_stage",
     "read_preferences",
     "redact_path_aliases_in_text",
+    "remove_rule_from_preferences",
     "resolve_path_aliases_in_args",
     "serialize_memory_rule",
     "wrap_untrusted_metadata",

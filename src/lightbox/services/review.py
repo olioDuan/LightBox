@@ -27,6 +27,7 @@ from lightbox.i18n import (
     REASON_USER_UNSURE,
     is_tech_reject_reason,
 )
+from lightbox.models import redact_absolute_paths_in_text
 from lightbox.paths import AppPaths, get_app_paths
 from lightbox.store import (
     AssetRecord,
@@ -50,6 +51,44 @@ DEFAULT_PREFERENCES_MD = """\
 No custom aesthetic or culling preference rules have been approved yet.
 Approve rules in the Lightbox Insights view or edit this file directly.
 """
+_PREFERENCES_PLACEHOLDER_FRAGMENT = (
+    "No custom aesthetic or culling preference rules have been approved yet."
+)
+
+
+def extract_effective_preferences_for_prompt(
+    app_paths: AppPaths,
+    *,
+    max_chars: int = 3000,
+    extra_paths: Sequence[str] = (),
+) -> str:
+    """Return path-redacted active user preferences from `preferences.md` (empty if none set).
+
+    Strictly reads ONLY `preferences.md` (single source of truth) so `proposed` or `rejected`
+    rules in `memory_rules_meta` never leak into Agent or VLM prompts, and scrubs absolute local
+    paths so manual folder references never trip the outbound privacy hook.
+    """
+    pref = app_paths.preferences_file
+    if not pref.is_file():
+        return ""
+    try:
+        raw = pref.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not raw or _PREFERENCES_PLACEHOLDER_FRAGMENT in raw:
+        return ""
+
+    substantive = [
+        line for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")
+    ]
+    if not substantive:
+        return ""
+    safe = redact_absolute_paths_in_text(
+        raw,
+        replacement="<redacted_path>",
+        extra_paths=extra_paths,
+    )
+    return safe[:max_chars]
 
 
 @dataclass(frozen=True, slots=True)
@@ -964,4 +1003,5 @@ __all__ = [
     "PhotoListItem",
     "ReviewService",
     "SessionSummary",
+    "extract_effective_preferences_for_prompt",
 ]

@@ -1,7 +1,9 @@
 import { useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, photoImageUrl, type SearchMatchItem, type SearchStrictness } from "../api";
+import { Button, EmptyState, Icon, IconButton, Loading, Notice, NoticeDock, Tabs } from "../components/ui";
 import { useI18n } from "../i18n";
+import { ArrowLeft, Camera, ChevronDown, Location, Search, X } from "reicon-react";
 
 interface SearchViewProps {
   onOpenReview: (sessionId: string) => void;
@@ -29,78 +31,84 @@ function PhotoSearchCard({
   const dateStr = formatDate(item.capture_time);
 
   return (
-    <div className="group flex flex-col overflow-hidden rounded-lg border border-[#33363B] bg-[#242629] transition hover:border-[#4B5563]">
-      <div className="relative aspect-[4/3] w-full overflow-hidden bg-[#1B1C1E]">
-        <img
-          src={photoImageUrl(item.photo_id, "grid")}
-          alt={item.stem}
-          loading="lazy"
-          className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]"
-        />
+    <article className="intent group flex min-w-0 flex-col gap-2">
+      <div className="relative aspect-[4/3] w-full overflow-hidden rounded-tile bg-table">
+        <button
+          type="button"
+          onClick={() => onFindSimilar(item.photo_id)}
+          className="block h-full w-full"
+          aria-label={`${t.searchFindSimilar} ${item.stem}`}
+        >
+          <img
+            src={photoImageUrl(item.photo_id, "grid")}
+            alt={item.stem}
+            loading="lazy"
+            className="h-full w-full object-cover transition-transform duration-500 ease-out group-hover:scale-[1.03]"
+          />
+        </button>
 
-        {/* Top badges: cosine score & scene tag */}
-        <div className="pointer-events-none absolute inset-x-2 top-2 flex items-start justify-between gap-1.5">
+        <div className="reveal pointer-events-none absolute inset-x-2 top-2 flex items-start justify-between gap-2">
           {item.scene_label ? (
-            <span className="rounded bg-[#1B1C1E]/85 px-2 py-0.5 text-[11px] text-[#E5E7EB] backdrop-blur-sm">
+            <span className="rounded-chip bg-paper/90 px-2 py-1 text-xs font-medium text-ink">
               {item.scene_label}
             </span>
           ) : (
             <span />
           )}
           {showScore && (
-            <span className="rounded bg-[#1B1C1E]/85 px-1.5 py-0.5 font-mono text-[11px] text-[#93C5FD] tabular-nums backdrop-blur-sm">
+            <span className="rounded-chip bg-paper/90 px-2 py-1 text-xs font-medium text-ink tabular-nums">
               {item.score.toFixed(3)}
             </span>
           )}
         </div>
 
-        {/* Hover action overlay */}
-        <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1.5 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-2.5 pb-2 pt-6 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
-          <button
-            type="button"
-            onClick={() => onFindSimilar(item.photo_id)}
-            className="rounded bg-[#5B8DEF] px-2.5 py-1 text-xs font-medium text-white hover:bg-[#4A7CE0]"
-          >
+        <div className="reveal absolute inset-x-2 bottom-2 flex items-center justify-between gap-2">
+          <Button size="sm" variant="primary" onClick={() => onFindSimilar(item.photo_id)}>
             {t.searchFindSimilar}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            className="bg-paper/90"
             onClick={() => onOpenReview(item.session_id)}
-            className="rounded border border-[#4B5563] bg-[#1B1C1E]/90 px-2 py-1 text-xs text-[#E5E7EB] hover:bg-[#2C2F34]"
           >
             {t.searchOpenSession}
-          </button>
+          </Button>
         </div>
       </div>
 
-      <div className="flex flex-1 flex-col justify-between gap-1 p-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <span className="truncate text-xs font-medium text-[#F3F4F6]" title={item.stem}>
-            {item.stem}
-          </span>
-          <button
-            type="button"
-            onClick={() => onFindSimilar(item.photo_id)}
-            className="shrink-0 text-[11px] text-[#93C5FD] hover:underline"
-          >
-            {t.searchFindSimilar}
-          </button>
+      <div className="min-w-0 px-1">
+        <div className="truncate text-sm font-medium text-ink" title={item.stem}>
+          {item.stem}
         </div>
-        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 truncate text-[11px] text-[#9CA3AF]">
-          {item.location_label && (
-            <span className="inline-flex items-center rounded bg-[#3D9A6B]/15 px-1.5 py-0.25 text-[10px] font-medium text-[#A7F3D0]">
-              📍 {item.location_label}
-            </span>
-          )}
-          <span className="truncate">
-            {item.session_name}
-            {dateStr ? ` · ${dateStr}` : ""}
-          </span>
+        <div className="flex min-w-0 items-center gap-2 text-sm text-ink-2">
+          <span className="truncate">{item.session_name}</span>
+          {dateStr && <span className="shrink-0 tabular-nums text-ink-3">{dateStr}</span>}
         </div>
+        {item.location_label && (
+          <div className="-ml-1 flex min-w-0 items-center text-sm text-ink-2">
+            <Location size={16} strokeWidth={1.5} className="mx-1 shrink-0" />
+            <span className="truncate">{item.location_label}</span>
+          </div>
+        )}
         {item.exif_brief && (
-          <div className="truncate text-[11px] text-[#6B7280] tabular-nums">{item.exif_brief}</div>
+          <div className="truncate text-sm text-ink-3 tabular-nums" title={item.exif_brief}>
+            {item.exif_brief}
+          </div>
         )}
       </div>
+    </article>
+  );
+}
+
+function PhotoGrid({ children, dim = false }: { children: React.ReactNode; dim?: boolean }) {
+  return (
+    <div
+      className={`grid grid-cols-2 gap-x-4 gap-y-8 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 ${
+        dim ? "opacity-70" : ""
+      }`}
+    >
+      {children}
     </div>
   );
 }
@@ -246,65 +254,64 @@ export function SearchView({ onOpenReview }: SearchViewProps) {
         ? t.searchModeFallback
         : t.searchModeFilter;
 
+  const showWeakToggle = (n: number) => (
+    <Button variant="ghost" iconRight={ChevronDown} onClick={() => setShowWeak((v) => !v)}>
+      {showWeak ? t.searchHideWeak : t.searchShowWeak(n)}
+    </Button>
+  );
+
+  const renderCards = (items: SearchMatchItem[], showScore: boolean) =>
+    items.map((item) => (
+      <PhotoSearchCard
+        key={item.photo_id}
+        item={item}
+        showScore={showScore}
+        onFindSimilar={(pid) => {
+          setSimilarAnchorId(pid);
+          setShowWeak(false);
+        }}
+        onOpenReview={onOpenReview}
+      />
+    ));
+
+  const queryError =
+    error ??
+    (searchQ.error instanceof Error
+      ? searchQ.error.message
+      : similarQ.error instanceof Error
+        ? similarQ.error.message
+        : null);
+
   return (
-    <div className="mx-auto max-w-6xl px-6 py-8">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-medium tracking-tight text-[#F3F4F6]">{t.searchTitle}</h1>
-          <p className="text-sm text-[#9CA3AF]">{t.searchSubtitle}</p>
-        </div>
-
-        {sessions.length > 0 && (
-          <div className="flex items-center gap-3">
-            {searchData && (
-              <span className="text-xs text-[#9CA3AF] tabular-nums">
-                {t.searchIndexedSummary(searchData.indexed_count, searchData.total_candidates)}
-              </span>
-            )}
-            {(needsIndex || (searchData && searchData.indexed_count === 0)) && (
-              <button
-                type="button"
-                disabled={indexing}
-                onClick={() => void handleBuildIndex()}
-                className="rounded-md border border-[#5B8DEF]/50 bg-[#5B8DEF]/15 px-3 py-1.5 text-xs font-medium text-[#93C5FD] hover:bg-[#5B8DEF]/25 disabled:opacity-50"
-              >
-                {indexing ? t.searchBuildingIndex : t.searchBuildIndex}
-              </button>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Search bar */}
-      <form onSubmit={handleSubmit} className="mt-5 flex flex-col gap-2 sm:flex-row">
+    <div className="mx-auto max-w-6xl px-6 pb-32 pt-12 sm:px-12">
+      {/* Search field is the page */}
+      <form onSubmit={handleSubmit} className="relative">
+        <Search
+          size={20}
+          strokeWidth={1.5}
+          className="pointer-events-none absolute left-5 top-1/2 -translate-y-1/2 text-ink-2"
+          aria-hidden="true"
+        />
         <input
-          type="text"
+          type="search"
           value={draftQuery}
           onChange={(e) => setDraftQuery(e.target.value)}
           placeholder={t.searchPlaceholder}
-          className="flex-1 rounded-md border border-[#33363B] bg-[#242629] px-3.5 py-2.5 text-sm text-[#F3F4F6] placeholder-[#6B7280] focus:border-[#5B8DEF] focus:outline-none"
+          aria-label={t.searchAction}
+          className="field h-16 w-full rounded-panel pl-14 pr-40 text-base [&::-webkit-search-cancel-button]:hidden"
         />
-        <div className="flex gap-2">
-          <button
-            type="submit"
-            className="rounded-md bg-[#F3F4F6] px-4 py-2.5 text-sm font-medium text-[#1B1C1E] hover:bg-white"
-          >
-            {t.searchAction}
-          </button>
+        <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
           {(draftQuery || submittedQuery) && (
-            <button
-              type="button"
-              onClick={handleClearQuery}
-              className="rounded-md border border-[#33363B] bg-[#242629] px-3 py-2.5 text-sm text-[#D1D5DB] hover:bg-[#2C2F34]"
-            >
-              {t.searchClear}
-            </button>
+            <IconButton icon={X} label={t.searchClear} onClick={handleClearQuery} />
           )}
+          <Button type="submit" variant="primary" size="lg" className="h-12 rounded-[14px]">
+            {t.searchAction}
+          </Button>
         </div>
       </form>
 
-      {/* Filter controls: Session / Location / Camera / Light / Date / Match strictness */}
-      <div className="mt-3 flex flex-wrap items-center gap-2.5">
+      {/* Filters */}
+      <div className="mt-6 flex flex-wrap items-center gap-2">
         <select
           aria-label={t.searchAllSessions}
           value={sessionId}
@@ -312,7 +319,7 @@ export function SearchView({ onOpenReview }: SearchViewProps) {
             setSessionId(e.target.value);
             setShowWeak(false);
           }}
-          className="rounded-md border border-[#33363B] bg-[#242629] px-2.5 py-1.5 text-xs text-[#E5E7EB] focus:border-[#5B8DEF] focus:outline-none"
+          className={`field h-10 ${sessionId ? "font-medium" : "text-ink-2"}`}
         >
           <option value="">{t.searchAllSessions}</option>
           {sessions.map((s) => (
@@ -331,12 +338,12 @@ export function SearchView({ onOpenReview }: SearchViewProps) {
               setIgnoreLocation(false);
               setShowWeak(false);
             }}
-            className="rounded-md border border-[#33363B] bg-[#242629] px-2.5 py-1.5 text-xs text-[#E5E7EB] focus:border-[#5B8DEF] focus:outline-none"
+            className={`field h-10 ${location ? "font-medium" : "text-ink-2"}`}
           >
             <option value="">{t.searchAllLocations}</option>
             {locations.map((loc) => (
               <option key={loc.key} value={loc.key}>
-                📍 {loc.label}
+                {loc.label}
               </option>
             ))}
           </select>
@@ -346,7 +353,7 @@ export function SearchView({ onOpenReview }: SearchViewProps) {
           aria-label={t.searchAllCameras}
           value={camera}
           onChange={(e) => setCamera(e.target.value)}
-          className="rounded-md border border-[#33363B] bg-[#242629] px-2.5 py-1.5 text-xs text-[#E5E7EB] focus:border-[#5B8DEF] focus:outline-none"
+          className={`field h-10 ${camera ? "font-medium" : "text-ink-2"}`}
         >
           <option value="">{t.searchAllCameras}</option>
           {cameras.map((cam) => (
@@ -360,7 +367,7 @@ export function SearchView({ onOpenReview }: SearchViewProps) {
           aria-label={t.searchAllLights}
           value={lightBucket}
           onChange={(e) => setLightBucket(e.target.value)}
-          className="rounded-md border border-[#33363B] bg-[#242629] px-2.5 py-1.5 text-xs text-[#E5E7EB] focus:border-[#5B8DEF] focus:outline-none"
+          className={`field h-10 ${lightBucket ? "font-medium" : "text-ink-2"}`}
         >
           <option value="">{t.searchAllLights}</option>
           {Object.entries(t.searchLightLabels).map(([key, label]) => (
@@ -370,71 +377,58 @@ export function SearchView({ onOpenReview }: SearchViewProps) {
           ))}
         </select>
 
-        <label className="flex items-center gap-1.5 text-xs text-[#9CA3AF]">
-          <span>{t.searchDateFrom}</span>
+        <span className="flex items-center gap-1">
           <input
             type="date"
             value={dateFrom}
             onChange={(e) => setDateFrom(e.target.value)}
-            className="rounded-md border border-[#33363B] bg-[#242629] px-2 py-1 text-xs text-[#E5E7EB] focus:border-[#5B8DEF] focus:outline-none"
+            aria-label={t.searchDateFrom}
+            title={t.searchDateFrom}
+            className={`field h-10 ${dateFrom ? "" : "text-ink-2"}`}
           />
-        </label>
-
-        <label className="flex items-center gap-1.5 text-xs text-[#9CA3AF]">
-          <span>{t.searchDateTo}</span>
+          <span className="text-ink-3" aria-hidden="true">
+            –
+          </span>
           <input
             type="date"
             value={dateTo}
             onChange={(e) => setDateTo(e.target.value)}
-            className="rounded-md border border-[#33363B] bg-[#242629] px-2 py-1 text-xs text-[#E5E7EB] focus:border-[#5B8DEF] focus:outline-none"
+            aria-label={t.searchDateTo}
+            title={t.searchDateTo}
+            className={`field h-10 ${dateTo ? "" : "text-ink-2"}`}
           />
-        </label>
+        </span>
 
-        {/* Strictness segmented control */}
-        <div className="flex items-center gap-1 rounded-md border border-[#33363B] bg-[#242629] p-0.5 text-xs">
-          <span className="px-1.5 text-[11px] text-[#9CA3AF]">{t.searchStrictnessLabel}</span>
-          {(
-            [
-              ["strict", t.searchStrictnessStrict],
-              ["balanced", t.searchStrictnessBalanced],
-              ["relaxed", t.searchStrictnessRelaxed],
-            ] as const
-          ).map(([val, label]) => (
-            <button
-              key={val}
-              type="button"
-              onClick={() => {
-                setStrictness(val);
-                setShowWeak(false);
-              }}
-              className={`rounded px-2 py-0.5 text-[11px] transition ${
-                strictness === val
-                  ? "bg-[#F3F4F6] font-medium text-[#1B1C1E]"
-                  : "text-[#D1D5DB] hover:bg-[#2C2F34]"
-              }`}
-            >
-              {label}
-            </button>
-          ))}
+        <div className="flex items-center" title={t.searchStrictnessLabel}>
+          <Tabs
+            size="sm"
+            value={strictness}
+            items={[
+              { id: "strict", label: t.searchStrictnessStrict },
+              { id: "balanced", label: t.searchStrictnessBalanced },
+              { id: "relaxed", label: t.searchStrictnessRelaxed },
+            ]}
+            onChange={(val) => {
+              setStrictness(val);
+              setShowWeak(false);
+            }}
+          />
         </div>
 
         {hasFilters && (
-          <button
-            type="button"
-            onClick={handleResetFilters}
-            className="rounded-md border border-[#33363B] px-2.5 py-1.5 text-xs text-[#9CA3AF] hover:bg-[#242629] hover:text-[#F3F4F6]"
-          >
+          <Button variant="ghost" size="sm" onClick={handleResetFilters}>
             {t.searchResetFilters}
-          </button>
+          </Button>
         )}
       </div>
 
-      {/* Active smart location parse banner */}
+      {/* Detected place in the query */}
       {similarAnchorId === null &&
         submittedQuery &&
         (searchData?.detected_location_label || ignoreLocation) && (
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[#3D9A6B]/40 bg-[#3D9A6B]/10 px-3.5 py-2 text-xs text-[#A7F3D0]">
-            <span>
+          <div className="fade-enter mt-6 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+            <span className="flex items-center gap-1 text-ink">
+              <Icon as={Location} className="text-ink-2" />
               {ignoreLocation
                 ? t.searchLocationIgnoredBanner
                 : t.searchDetectedLocation(
@@ -443,251 +437,169 @@ export function SearchView({ onOpenReview }: SearchViewProps) {
                   )}
             </span>
             {ignoreLocation ? (
-              <button
-                type="button"
+              <Button
+                variant="ghost"
+                size="sm"
                 onClick={() => {
                   setIgnoreLocation(false);
                   setShowWeak(false);
                 }}
-                className="rounded border border-[#A7F3D0]/40 px-2.5 py-0.5 text-[#ECFDF5] hover:bg-[#3D9A6B]/25"
               >
                 {t.searchRestoreLocationBtn}
-              </button>
+              </Button>
             ) : (
               !location && (
-                <button
-                  type="button"
+                <Button
+                  variant="ghost"
+                  size="sm"
                   onClick={() => {
                     setIgnoreLocation(true);
                     setShowWeak(false);
                   }}
-                  className="rounded border border-[#A7F3D0]/40 px-2.5 py-0.5 text-[#ECFDF5] hover:bg-[#3D9A6B]/25"
                 >
                   {t.searchIgnoreLocationBtn}
-                </button>
+                </Button>
               )
             )}
           </div>
         )}
 
-      {notice && (
-        <div className="mt-4 rounded-md border border-[#3D9A6B]/50 bg-[#3D9A6B]/10 px-4 py-2.5 text-sm text-[#A7F3D0]">
-          {notice}
-        </div>
-      )}
-
-      {(error || searchQ.error || similarQ.error) && (
-        <div className="mt-4 rounded-md border border-[#DC4C46]/50 bg-[#DC4C46]/10 px-4 py-2.5 text-sm text-[#FCA5A5]">
-          {t.errorPrefix}
-          {error ??
-            (searchQ.error instanceof Error
-              ? searchQ.error.message
-              : similarQ.error instanceof Error
-                ? similarQ.error.message
-                : "")}
-        </div>
-      )}
-
-      {/* Similar photos view */}
       {similarAnchorId !== null ? (
-        <div className="mt-6 space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#33363B] bg-[#242629] p-3">
-            <div className="flex min-w-0 items-center gap-3">
+        <section className="mt-12 space-y-8">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex min-w-0 items-center gap-4">
+              <IconButton
+                icon={ArrowLeft}
+                label={t.searchBackToResults}
+                onClick={() => setSimilarAnchorId(null)}
+              />
               <img
                 src={photoImageUrl(similarAnchorId, "grid")}
                 alt=""
-                className="h-14 w-20 shrink-0 rounded bg-[#1B1C1E] object-cover"
+                className="h-16 w-24 shrink-0 rounded-chip bg-table object-cover"
               />
-              <div className="min-w-0 space-y-0.5">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-[#93C5FD]">
-                    {t.searchSimilarHeader}
-                  </span>
-                  {similarQ.data && (
-                    <span className="rounded bg-[#1B1C1E] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
-                      {similarQ.data.mode === "semantic"
-                        ? t.searchSimilarModeSemantic
-                        : t.searchSimilarModeFallback}
-                    </span>
-                  )}
-                </div>
-                <div className="truncate text-sm font-medium text-[#F3F4F6]">
+              <div className="min-w-0">
+                <h2 className="truncate text-lg font-semibold text-ink">
                   {similarQ.data?.anchor.stem ?? similarAnchorId}
-                </div>
-                {similarQ.data?.anchor.exif_brief && (
-                  <div className="truncate text-xs text-[#9CA3AF]">
-                    {similarQ.data.anchor.exif_brief}
-                  </div>
-                )}
+                </h2>
+                <p className="flex min-w-0 items-center gap-4 text-sm text-ink-2">
+                  <span className="shrink-0">{t.searchSimilarHeader}</span>
+                  {similarQ.data?.anchor.exif_brief && (
+                    <span className="truncate text-ink-3">{similarQ.data.anchor.exif_brief}</span>
+                  )}
+                </p>
               </div>
             </div>
-
-            <button
-              type="button"
-              onClick={() => setSimilarAnchorId(null)}
-              className="rounded-md border border-[#33363B] bg-[#1B1C1E] px-3 py-1.5 text-xs text-[#E5E7EB] hover:bg-[#2C2F34]"
-            >
-              {t.searchBackToResults}
-            </button>
+            {similarQ.data && (
+              <span className="text-sm text-ink-3">
+                {similarQ.data.mode === "semantic"
+                  ? t.searchSimilarModeSemantic
+                  : t.searchSimilarModeFallback}
+              </span>
+            )}
           </div>
 
           {similarQ.isLoading ? (
-            <p className="py-10 text-sm text-[#9CA3AF]">{t.loading}</p>
+            <Loading label={t.loading} />
           ) : (similarQ.data?.similar.length ?? 0) === 0 ? (
-            <div className="space-y-3 py-12 text-center text-sm text-[#9CA3AF]">
-              <p>{t.searchSimilarEmpty}</p>
-              {(similarQ.data?.weak_similar.length ?? 0) > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setShowWeak((v) => !v)}
-                  className="rounded-md border border-[#33363B] bg-[#242629] px-3.5 py-1.5 text-xs text-[#D1D5DB] hover:bg-[#2C2F34]"
-                >
-                  {showWeak
-                    ? t.searchHideWeak
-                    : t.searchShowWeak(similarQ.data!.weak_similar.length)}
-                </button>
-              )}
-            </div>
+            <EmptyState title={t.searchSimilarEmpty}>
+              {(similarQ.data?.weak_similar.length ?? 0) > 0 &&
+                showWeakToggle(similarQ.data!.weak_similar.length)}
+            </EmptyState>
           ) : (
-            <div className="space-y-4">
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                {(similarQ.data?.similar ?? []).map((item) => (
-                  <PhotoSearchCard
-                    key={item.photo_id}
-                    item={item}
-                    showScore
-                    onFindSimilar={(pid) => {
-                      setSimilarAnchorId(pid);
-                      setShowWeak(false);
-                    }}
-                    onOpenReview={onOpenReview}
-                  />
-                ))}
-              </div>
+            <>
+              <PhotoGrid>{renderCards(similarQ.data?.similar ?? [], true)}</PhotoGrid>
               {(similarQ.data?.weak_similar.length ?? 0) > 0 && (
-                <div className="border-t border-[#33363B] pt-3">
-                  <button
-                    type="button"
-                    onClick={() => setShowWeak((v) => !v)}
-                    className="rounded-md border border-[#33363B] bg-[#242629] px-3.5 py-1.5 text-xs text-[#9CA3AF] hover:bg-[#2C2F34] hover:text-[#F3F4F6]"
-                  >
-                    {showWeak
-                      ? t.searchHideWeak
-                      : t.searchShowWeak(similarQ.data!.weak_similar.length)}
-                  </button>
-                </div>
+                <div>{showWeakToggle(similarQ.data!.weak_similar.length)}</div>
               )}
-            </div>
+            </>
           )}
 
           {showWeak && (similarQ.data?.weak_similar.length ?? 0) > 0 && (
-            <div className="space-y-2.5 pt-2 opacity-80">
-              <p className="text-xs text-[#9CA3AF]">{t.searchWeakSectionHint}</p>
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                {similarQ.data!.weak_similar.map((item) => (
-                  <PhotoSearchCard
-                    key={item.photo_id}
-                    item={item}
-                    showScore
-                    onFindSimilar={(pid) => {
-                      setSimilarAnchorId(pid);
-                      setShowWeak(false);
-                    }}
-                    onOpenReview={onOpenReview}
-                  />
-                ))}
-              </div>
-            </div>
+            <PhotoGrid dim>{renderCards(similarQ.data!.weak_similar, true)}</PhotoGrid>
           )}
-        </div>
+        </section>
       ) : (
-        /* Search results grid */
-        <div className="mt-6 space-y-4">
+        <section className="mt-12 space-y-8">
           {searchData && (
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#33363B] pb-2 text-xs text-[#9CA3AF]">
-              <div className="flex flex-wrap items-center gap-2.5">
-                <span className="tabular-nums">{t.searchMatchCount(searchData.matches.length)}</span>
+            <div className="flex flex-wrap items-center justify-between gap-4 text-sm tabular-nums">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                <span className="font-medium text-ink">
+                  {t.searchMatchCount(searchData.matches.length)}
+                </span>
                 {searchData.score_threshold !== null && (
-                  <span className="rounded bg-[#1F2124] px-2 py-0.5 font-mono text-[11px] text-[#9CA3AF] tabular-nums">
+                  <span className="text-ink-3">
                     {t.searchThresholdHint(searchData.score_threshold.toFixed(3))}
                   </span>
                 )}
+                <span className="text-ink-3">{modeBadge}</span>
               </div>
-              <span className="rounded bg-[#242629] px-2 py-0.5 text-[#D1D5DB]">{modeBadge}</span>
+
+              {sessions.length > 0 && (
+                <div className="flex items-center gap-4">
+                  <span className="text-ink-3">
+                    {t.searchIndexedSummary(searchData.indexed_count, searchData.total_candidates)}
+                  </span>
+                  {(needsIndex || searchData.indexed_count === 0) && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      icon={Camera}
+                      disabled={indexing}
+                      onClick={() => void handleBuildIndex()}
+                    >
+                      {indexing ? t.searchBuildingIndex : t.searchBuildIndex}
+                    </Button>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
           {searchQ.isLoading ? (
-            <p className="py-10 text-sm text-[#9CA3AF]">{t.loading}</p>
+            <Loading label={t.loading} />
           ) : (searchData?.matches.length ?? 0) === 0 ? (
-            <div className="space-y-3 py-14 text-center">
-              <p className="text-base text-[#F3F4F6]">{t.searchNoResults}</p>
-              <p className="text-sm text-[#9CA3AF]">{t.searchNoResultsHint}</p>
-              {(searchData?.weak_matches.length ?? 0) > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setShowWeak((v) => !v)}
-                  className="rounded-md border border-[#33363B] bg-[#242629] px-3.5 py-1.5 text-xs text-[#D1D5DB] hover:bg-[#2C2F34]"
-                >
-                  {showWeak
-                    ? t.searchHideWeak
-                    : t.searchShowWeak(searchData!.weak_matches.length)}
-                </button>
+            <EmptyState title={t.searchNoResults}>
+              {(searchData?.weak_matches.length ?? 0) > 0 &&
+                showWeakToggle(searchData!.weak_matches.length)}
+              {hasFilters && (
+                <Button variant="secondary" onClick={handleResetFilters}>
+                  {t.searchResetFilters}
+                </Button>
               )}
-            </div>
+            </EmptyState>
           ) : (
-            <div className="space-y-4">
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                {(searchData?.matches ?? []).map((item) => (
-                  <PhotoSearchCard
-                    key={item.photo_id}
-                    item={item}
-                    showScore={searchData?.mode === "semantic"}
-                    onFindSimilar={(pid) => {
-                      setSimilarAnchorId(pid);
-                      setShowWeak(false);
-                    }}
-                    onOpenReview={onOpenReview}
-                  />
-                ))}
-              </div>
+            <>
+              <PhotoGrid>
+                {renderCards(searchData?.matches ?? [], searchData?.mode === "semantic")}
+              </PhotoGrid>
               {(searchData?.weak_matches.length ?? 0) > 0 && (
-                <div className="border-t border-[#33363B] pt-3">
-                  <button
-                    type="button"
-                    onClick={() => setShowWeak((v) => !v)}
-                    className="rounded-md border border-[#33363B] bg-[#242629] px-3.5 py-1.5 text-xs text-[#9CA3AF] hover:bg-[#2C2F34] hover:text-[#F3F4F6]"
-                  >
-                    {showWeak
-                      ? t.searchHideWeak
-                      : t.searchShowWeak(searchData!.weak_matches.length)}
-                  </button>
-                </div>
+                <div>{showWeakToggle(searchData!.weak_matches.length)}</div>
               )}
-            </div>
+            </>
           )}
 
           {showWeak && (searchData?.weak_matches.length ?? 0) > 0 && (
-            <div className="space-y-2.5 pt-2 opacity-80">
-              <p className="text-xs text-[#9CA3AF]">{t.searchWeakSectionHint}</p>
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                {searchData!.weak_matches.map((item) => (
-                  <PhotoSearchCard
-                    key={item.photo_id}
-                    item={item}
-                    showScore={searchData?.mode === "semantic"}
-                    onFindSimilar={(pid) => {
-                      setSimilarAnchorId(pid);
-                      setShowWeak(false);
-                    }}
-                    onOpenReview={onOpenReview}
-                  />
-                ))}
-              </div>
-            </div>
+            <PhotoGrid dim>
+              {renderCards(searchData!.weak_matches, searchData?.mode === "semantic")}
+            </PhotoGrid>
           )}
-        </div>
+        </section>
       )}
+
+      <NoticeDock>
+        {notice && (
+          <Notice onDismiss={() => setNotice(null)} dismissLabel={t.uiDismiss}>
+            {notice}
+          </Notice>
+        )}
+        {queryError && (
+          <Notice tone="error" onDismiss={error ? () => setError(null) : undefined} dismissLabel={t.uiDismiss}>
+            {t.errorPrefix}
+            {queryError}
+          </Notice>
+        )}
+      </NoticeDock>
     </div>
   );
 }
