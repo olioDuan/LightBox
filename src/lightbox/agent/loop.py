@@ -301,6 +301,21 @@ class AgentRunner:
                     max_photos=int(call.arguments.get("max_photos", 50)),
                 )
                 est_usd = est.est_usd
+                if est.requires_unpriced_confirmation:
+                    session_spent = self.services.repo.sum_llm_cost(session_id=sess.session_id)
+                    monthly_spent = self.services.repo.sum_llm_cost(since_ts=_month_start_ts())
+                    return {
+                        "scope": "unpriced_triage",
+                        "ask_kind": "unpriced_triage",
+                        "model_id": est.model_id,
+                        "unpriced_max_photos": est.unpriced_max_photos or 20,
+                        "total_units": est.total_units,
+                        "session_spent_usd": round(session_spent, 6),
+                        "monthly_spent_usd": round(monthly_spent, 6),
+                        "est_usd": 0.0,
+                        "suggested_budget_usd": None,
+                        "needs_monthly_bypass": False,
+                    }
             except Exception:
                 est_usd = 0.0
 

@@ -55,6 +55,10 @@ class AppPaths:
         return self.root / "server.lock"
 
     @property
+    def ai_connection_state_file(self) -> Path:
+        return self.root / "ai_connection_state.json"
+
+    @property
     def bin_dir(self) -> Path:
         return self.root / "bin"
 

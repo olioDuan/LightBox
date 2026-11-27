@@ -183,8 +183,7 @@ class IndependentVerifier:
     def resolve_reviewer_model(self, *, profile: str | None = None) -> VerifierModelChoice:
         """Select a cross-family reviewer model when available, falling back to same-family or skip."""
         router = self.services.model_router
-        prof_name = profile or self.services.config.model_profile
-        prof = router.models_config.profiles.get(prof_name)
+        _prof_name, prof = router.resolve_profile(profile)
         if prof is None:
             return VerifierModelChoice(None, None, False, skipped_reason="unknown_profile")
 
@@ -202,7 +201,7 @@ class IndependentVerifier:
                     cross_family=bool(agent_family and rev_spec.family != agent_family),
                 )
 
-        # Profile explicitly disables Layer 2 (e.g. `local` profile)
+        # Profile explicitly disables Layer 2 (e.g. `local` profile or UI `[ai]` default)
         if prof.reviewer == "none":
             return VerifierModelChoice(None, None, False, skipped_reason="disabled_in_profile")
 
@@ -213,7 +212,11 @@ class IndependentVerifier:
                 return True
             if spec.provider == "local":
                 return False
-            return has_api_key(spec.provider, app_paths=self.services.app_paths)
+            return has_api_key(
+                spec.provider,
+                app_paths=self.services.app_paths,
+                base_url=spec.base_url,
+            )
 
         # 2. Primary configured cross-family reviewer model
         primary_spec = router.models_config.models.get(prof.reviewer)

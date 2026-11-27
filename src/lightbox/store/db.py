@@ -391,6 +391,19 @@ MIGRATION_005_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("memory_rules_meta", "updated_at", "REAL"),
 )
 
+MIGRATION_006_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("llm_calls", "status", "TEXT NOT NULL DEFAULT 'ok'"),
+    ("llm_calls", "error_class", "TEXT"),
+    ("llm_calls", "connection_fingerprint", "TEXT"),
+    ("jobs", "owner_pid", "INTEGER"),
+    ("jobs", "owner_pid_started_at", "REAL"),
+    ("jobs", "owner_instance_id", "TEXT"),
+)
+
+MIGRATION_006_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_llm_calls_conn_fp_created ON llm_calls(connection_fingerprint, cache_hit, created_at)",
+)
+
 VEC_PHOTOS_DDL = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS vec_photos "
     "USING vec0(embedding float[768] distance_metric=cosine)"
@@ -402,6 +415,7 @@ MIGRATIONS: tuple[tuple[int, str, str | None], ...] = (
     (3, "003_t10_llm_calls_budget_and_cache", None),
     (4, "004_t18_people_classification", MIGRATION_004_SQL),
     (5, "005_t14_memory_rules_columns", None),
+    (6, "006_ai_connection_and_job_ownership", None),
 )
 
 
@@ -475,6 +489,8 @@ class Database:
                     _apply_migration_003(cur)
                 elif version == 5:
                     _apply_migration_005(cur)
+                elif version == 6:
+                    _apply_migration_006(cur)
                 cur.execute(
                     "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, name, time.time()),
@@ -535,6 +551,13 @@ def _apply_migration_003(cur: sqlite3.Cursor) -> None:
 def _apply_migration_005(cur: sqlite3.Cursor) -> None:
     """Idempotently add T14 status/text/timestamp columns on `memory_rules_meta`."""
     _apply_column_additions(cur, MIGRATION_005_COLUMNS)
+
+
+def _apply_migration_006(cur: sqlite3.Cursor) -> None:
+    """Idempotently add AI connection tracking on `llm_calls` and process ownership on `jobs`."""
+    _apply_column_additions(cur, MIGRATION_006_COLUMNS)
+    for idx_sql in MIGRATION_006_INDEXES:
+        cur.execute(idx_sql)
 
 
 def _apply_column_additions(

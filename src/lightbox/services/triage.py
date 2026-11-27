@@ -31,9 +31,11 @@ from lightbox.i18n import (
 )
 from lightbox.models import (
     BudgetExceededError,
+    CostClassification,
     ImageInput,
     Message,
     ModelRouter,
+    UnpricedTriageConfirmationRequiredError,
 )
 from lightbox.models.secrets import has_api_key
 from lightbox.paths import AppPaths, get_app_paths
@@ -113,6 +115,9 @@ class TriageEstimate:
     total_bursts_available: int = 0
     skipped_bursts_due_to_limit: int = 0
     note: str | None = None
+    cost_classification: CostClassification = "known_paid"
+    requires_unpriced_confirmation: bool = False
+    unpriced_max_photos: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +213,11 @@ class TriageService:
         selected_bursts = unconfirmed_bursts[:remaining_slots] if remaining_slots > 0 else []
         return selected_yellow, selected_bursts, total_yellow_available, total_bursts_available
 
+    def _unpriced_max_photos(self) -> int:
+        if self.config.ai is not None:
+            return self.config.ai.max_triage_photos_unpriced
+        return 20
+
     def estimate_triage(
         self,
         session_id: str,
@@ -217,14 +227,21 @@ class TriageService:
         session_budget_usd: float | None = None,
     ) -> TriageEstimate:
         """Estimate scope and USD cost for L3 VLM triage without invoking any model."""
+        prof_name = self.model_router.effective_profile_name(profile)
+        alias, spec = self.model_router.resolve_spec("triage_vlm", profile=profile)
+        cost_class = self.model_router.classify_cost(alias, spec)
+        requires_confirm = cost_class == "price_unknown"
+        unpriced_limit = self._unpriced_max_photos() if requires_confirm else None
+        effective_max_photos = (
+            min(max_photos, unpriced_limit) if unpriced_limit is not None else max_photos
+        )
+
         (
             yellow_photos,
             bursts,
             total_yellow_available,
             total_bursts_available,
-        ) = self._select_targets(session_id, max_photos=max_photos)
-        prof_name = profile or self.config.model_profile
-        alias, spec = self.model_router.resolve_spec("triage_vlm", profile=prof_name)
+        ) = self._select_targets(session_id, max_photos=effective_max_photos)
 
         # Conservative per-unit estimate: ~1,600 input tokens (2 stripped images + prompt) + ~120 output tokens
         per_unit_usd = (
@@ -238,7 +255,7 @@ class TriageService:
         note: str | None = None
         if skipped_bursts > 0:
             note = (
-                f"max_photos={max_photos} filled by {len(yellow_photos)} yellow photo(s); "
+                f"max_photos={effective_max_photos} filled by {len(yellow_photos)} yellow photo(s); "
                 f"{skipped_bursts} unconfirmed burst group(s) deferred to a later run or higher max_photos."
             )
 
@@ -260,7 +277,11 @@ class TriageService:
             model_alias=alias,
             model_id=spec.model_id,
             provider=spec.provider,
-            vlm_backend_ready=has_api_key(spec.provider, app_paths=self.app_paths),
+            vlm_backend_ready=has_api_key(
+                spec.provider,
+                app_paths=self.app_paths,
+                base_url=spec.base_url,
+            ),
             session_spent_usd=round(session_spent, 6),
             session_budget_usd=sess_limit,
             monthly_spent_usd=round(monthly_spent, 6),
@@ -269,6 +290,9 @@ class TriageService:
             total_bursts_available=total_bursts_available,
             skipped_bursts_due_to_limit=skipped_bursts,
             note=note,
+            cost_classification=cost_class,
+            requires_unpriced_confirmation=requires_confirm,
+            unpriced_max_photos=unpriced_limit,
         )
 
     def create_queued_job(
@@ -277,13 +301,16 @@ class TriageService:
         *,
         profile: str | None = None,
         session_budget_usd: float | None = None,
+        confirm_unpriced: bool = False,
     ) -> str:
         """Validate session + model credentials and persist a `queued` job row for async execution."""
         if self.repo.get_session(session_id) is None:
             raise ValueError(f"Unknown session_id: {session_id}")
-        prof_name = profile or self.config.model_profile
-        self.model_router.resolve_spec("triage_vlm", profile=prof_name)
-        self.model_router.get_model("triage_vlm", profile=prof_name)
+        alias, spec = self.model_router.resolve_spec("triage_vlm", profile=profile)
+        cost_class = self.model_router.classify_cost(alias, spec)
+        if cost_class == "price_unknown" and not confirm_unpriced:
+            raise UnpricedTriageConfirmationRequiredError(max_photos=self._unpriced_max_photos())
+        self.model_router.get_model("triage_vlm", profile=profile)
 
         eff_budget = (
             session_budget_usd
@@ -580,13 +607,23 @@ class TriageService:
         bypass_monthly_budget: bool = False,
         job_id: str | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
+        confirm_unpriced: bool = False,
     ) -> TriageResult:
         """Execute concurrent L3 VLM triage on uncertain photos and unconfirmed bursts."""
-        yellow_photos, bursts, _, _ = self._select_targets(session_id, max_photos=max_photos)
-        prof_name = profile or self.config.model_profile
-        _alias, spec = self.model_router.resolve_spec("triage_vlm", profile=prof_name)
+        alias, spec = self.model_router.resolve_spec("triage_vlm", profile=profile)
+        cost_class = self.model_router.classify_cost(alias, spec)
+        effective_max_photos = max_photos
+        if cost_class == "price_unknown":
+            unpriced_limit = self._unpriced_max_photos()
+            if not confirm_unpriced:
+                raise UnpricedTriageConfirmationRequiredError(max_photos=unpriced_limit)
+            effective_max_photos = min(max_photos, unpriced_limit)
+
+        yellow_photos, bursts, _, _ = self._select_targets(
+            session_id, max_photos=effective_max_photos
+        )
         # Validate adapter/key availability upfront before mutating jobs table
-        self.model_router.get_model("triage_vlm", profile=prof_name)
+        self.model_router.get_model("triage_vlm", profile=profile)
 
         eff_budget = (
             session_budget_usd
@@ -705,7 +742,7 @@ class TriageService:
                     response_schema=YellowTriageOutput,
                     max_tokens=512,
                     effort=spec.default_effort or "low",
-                    profile=prof_name,
+                    profile=profile,
                     session_id=session_id,
                     session_budget_usd=eff_budget,
                     bypass_monthly_budget=bypass_monthly_budget,
@@ -822,7 +859,7 @@ class TriageService:
                     response_schema=BurstTriageOutput,
                     max_tokens=512,
                     effort=spec.default_effort or "low",
-                    profile=prof_name,
+                    profile=profile,
                     session_id=session_id,
                     session_budget_usd=eff_budget,
                     bypass_monthly_budget=bypass_monthly_budget,
@@ -979,6 +1016,7 @@ class TriageService:
         bypass_monthly_budget: bool = False,
         job_id: str | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
+        confirm_unpriced: bool = False,
     ) -> TriageResult:
         """Synchronous wrapper around `run_triage` for CLI, worker threads, and sync ToolRegistry handlers."""
         coro = self.run_triage(
@@ -989,6 +1027,7 @@ class TriageService:
             bypass_monthly_budget=bypass_monthly_budget,
             job_id=job_id,
             on_progress=on_progress,
+            confirm_unpriced=confirm_unpriced,
         )
         try:
             asyncio.get_running_loop()

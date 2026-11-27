@@ -62,19 +62,14 @@ function PhotoSearchCard({
           )}
         </div>
 
-        <div className="reveal absolute inset-x-2 bottom-2 flex items-center justify-between gap-2">
-          <Button size="sm" variant="primary" onClick={() => onFindSimilar(item.photo_id)}>
-            {t.searchFindSimilar}
-          </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            className="bg-paper/90"
-            onClick={() => onOpenReview(item.session_id)}
-          >
-            {t.searchOpenSession}
-          </Button>
-        </div>
+        <Button
+          size="sm"
+          variant="secondary"
+          className="reveal absolute bottom-2 left-2 max-w-[calc(100%-16px)] bg-paper/95 shadow-[0_1px_4px_rgba(24,24,24,0.18)] hover:bg-paper"
+          onClick={() => onFindSimilar(item.photo_id)}
+        >
+          <span className="truncate">{t.searchFindSimilar}</span>
+        </Button>
       </div>
 
       <div className="min-w-0 px-1">
@@ -82,7 +77,14 @@ function PhotoSearchCard({
           {item.stem}
         </div>
         <div className="flex min-w-0 items-center gap-2 text-sm text-ink-2">
-          <span className="truncate">{item.session_name}</span>
+          <button
+            type="button"
+            onClick={() => onOpenReview(item.session_id)}
+            title={`${t.searchOpenSession}: ${item.session_name}`}
+            className="min-w-0 truncate text-left hover:text-ink hover:underline hover:decoration-1 hover:underline-offset-4"
+          >
+            {item.session_name}
+          </button>
           {dateStr && <span className="shrink-0 tabular-nums text-ink-3">{dateStr}</span>}
         </div>
         {item.location_label && (

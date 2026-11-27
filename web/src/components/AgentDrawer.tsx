@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
   type AgentEventItem,
   type AgentSessionDetail,
   type AgentTodoItem,
+  type AiConnectionState,
   type DraftObviousResponse,
   type VerifierReport,
 } from "../api";
 import { useI18n } from "../i18n";
+import { AiConnectionBar } from "./AiConnectionBar";
 import { QuarantineModal } from "./QuarantineModal";
 import { Button, Icon, IconButton, Kbd, ProgressLine } from "./ui";
 import { Check, Lightning, Plus, Send, Sparkles, X } from "reicon-react";
@@ -55,7 +57,18 @@ export function AgentDrawer({
   const [error, setError] = useState<string | null>(null);
   const [openingPlan, setOpeningPlan] = useState(false);
   const [approvalDraft, setApprovalDraft] = useState<DraftObviousResponse | null>(null);
+  const [aiConn, setAiConn] = useState<AiConnectionState | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  const handleConnectionLoaded = useCallback((state: AiConnectionState) => {
+    setAiConn(state);
+  }, []);
+
+  const agentRoleDisabled = Boolean(
+    aiConn?.configured &&
+      !aiConn.agent_ready &&
+      (aiConn.agent_probes !== null || aiConn.agent_error !== null),
+  );
 
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -202,6 +215,7 @@ export function AgentDrawer({
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      void queryClient.invalidateQueries({ queryKey: ["ai-connection"] });
       setRunning(false);
     }
   }
@@ -245,6 +259,7 @@ export function AgentDrawer({
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      void queryClient.invalidateQueries({ queryKey: ["ai-connection"] });
       setRunning(false);
     }
   }
@@ -294,7 +309,7 @@ export function AgentDrawer({
           aria-label={t.agentDrawerTitle}
         >
           {/* Header */}
-          <div className="shrink-0 space-y-6 px-6 pb-4 pt-6">
+          <div className="shrink-0 space-y-4 px-6 pb-4 pt-6">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <Icon as={Sparkles} />
@@ -310,6 +325,8 @@ export function AgentDrawer({
                 <IconButton icon={X} label={t.agentClose} onClick={onClose} />
               </div>
             </div>
+
+            <AiConnectionBar open={open} onConnectionLoaded={handleConnectionLoaded} />
 
             <div className="flex items-center gap-2">
               <select
@@ -333,7 +350,7 @@ export function AgentDrawer({
               </select>
               <Button
                 variant="secondary"
-                disabled={!selectedSessionId || running}
+                disabled={!selectedSessionId || running || agentRoleDisabled}
                 onClick={() => void handleRunSupervisor()}
               >
                 {t.agentSupervisorBtn}
@@ -570,9 +587,13 @@ export function AgentDrawer({
                     disabled={running}
                     onClick={() => void handleSendMessage({ message: "Approved", approveAsk: true })}
                   >
-                    {agentSession.pending_ask.suggested_budget_usd
-                      ? `${t.agentAskApprove} ($${agentSession.pending_ask.suggested_budget_usd.toFixed(2)})`
-                      : t.agentAskApprove}
+                    {agentSession.pending_ask.ask_kind === "unpriced_triage"
+                      ? t.agentAskUnpricedApprove(
+                          agentSession.pending_ask.unpriced_max_photos ?? 20,
+                        )
+                      : agentSession.pending_ask.suggested_budget_usd
+                        ? `${t.agentAskApprove} ($${agentSession.pending_ask.suggested_budget_usd.toFixed(2)})`
+                        : t.agentAskApprove}
                   </Button>
                   <Button
                     variant="ghost"
@@ -658,7 +679,7 @@ export function AgentDrawer({
             <input
               type="text"
               value={inputText}
-              disabled={!selectedSessionId || running}
+              disabled={!selectedSessionId || running || agentRoleDisabled}
               onChange={(e) => setInputText(e.target.value)}
               placeholder={t.agentInputPlaceholder}
               aria-label={t.agentInputPlaceholder}
@@ -670,7 +691,7 @@ export function AgentDrawer({
               label={t.agentSend}
               variant="primary"
               size="sm"
-              disabled={!selectedSessionId || running || !inputText.trim()}
+              disabled={!selectedSessionId || running || agentRoleDisabled || !inputText.trim()}
               className="absolute right-6 top-1/2 -translate-y-1/2 rounded-full"
             />
           </form>

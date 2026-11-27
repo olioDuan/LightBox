@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from lightbox.config import ModelSpec
 from lightbox.models.images import strip_metadata_and_encode
+from lightbox.models.provider_errors import extract_sdk_error_meta
 from lightbox.models.types import (
     GenerationResult,
     Message,
@@ -183,7 +184,12 @@ class AnthropicChatModel:
                 ) as client:
                     response = await client.messages.create(**cast(Any, kwargs))
         except anthropic.AnthropicError as exc:
-            raise ModelError(f"Anthropic request failed ({self.id}): {exc}") from exc
+            status_code, provider_code = extract_sdk_error_meta(exc)
+            raise ModelError(
+                f"Anthropic request failed ({self.id}): {exc}",
+                status_code=status_code,
+                provider_code=provider_code,
+            ) from exc
 
         latency_ms = max(0, int((time.monotonic() - started) * 1000))
         stop_reason = getattr(response, "stop_reason", None)

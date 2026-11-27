@@ -165,6 +165,7 @@ class ToolContext:
     base_url_resolver: Callable[[], str] | None = None
     progress_callback: Callable[[str, int, int], None] | None = None
     elicitation_approver: Callable[[str, int, str | None], bool] | None = None
+    triage_elicitation_approver: Callable[[str, int, str], bool] | None = None
     lang: str = "zh-CN"
     session_id: str | None = None
     agent_session_id: str | None = None
@@ -912,9 +913,56 @@ def _handle_triage_uncertain(
                 "session_budget_usd": est.session_budget_usd,
                 "monthly_spent_usd": est.monthly_spent_usd,
                 "monthly_budget_usd": est.monthly_budget_usd,
+                "cost_classification": est.cost_classification,
+                "requires_unpriced_confirmation": est.requires_unpriced_confirmation,
+                "unpriced_max_photos": est.unpriced_max_photos,
                 "review_url": ctx.review_url(args.session_id),
             }
         )
+
+    confirm_unpriced = False
+    try:
+        est = ctx.services.triage.estimate_triage(
+            args.session_id,
+            max_photos=args.max_photos,
+        )
+    except (ValueError, ModelError) as exc:
+        return ToolExecutionResult.error(
+            str(exc),
+            data={
+                "session_id": args.session_id,
+                "review_url": ctx.review_url(args.session_id),
+            },
+        )
+
+    if est.requires_unpriced_confirmation:
+        cap = est.unpriced_max_photos or 20
+        if ctx.budget_ask_approved:
+            confirm_unpriced = True
+        elif ctx.triage_elicitation_approver is not None:
+            approved = ctx.triage_elicitation_approver(args.session_id, cap, est.model_id)
+            if not approved:
+                return ToolExecutionResult.error(
+                    f"User declined unpriced batch triage confirmation for {est.model_id} (max {cap} photos).",
+                    data={
+                        "session_id": args.session_id,
+                        "requires_unpriced_confirmation": True,
+                        "unpriced_max_photos": cap,
+                        "review_url": ctx.review_url(args.session_id),
+                    },
+                )
+            confirm_unpriced = True
+        else:
+            return ToolExecutionResult.error(
+                f"Pricing is unknown for {est.model_id}; confirm running up to {cap} photos "
+                f"in Web UI ({ctx.review_url(args.session_id)}) or configure estimated token pricing.",
+                data={
+                    "session_id": args.session_id,
+                    "requires_unpriced_confirmation": True,
+                    "unpriced_max_photos": cap,
+                    "review_url": ctx.review_url(args.session_id),
+                },
+            )
 
     try:
         res = ctx.services.triage.run_triage_sync(
@@ -923,6 +971,7 @@ def _handle_triage_uncertain(
             session_budget_usd=ctx.session_budget_override_usd,
             bypass_monthly_budget=ctx.bypass_monthly_budget,
             on_progress=ctx.progress_callback,
+            confirm_unpriced=confirm_unpriced,
         )
     except (ValueError, MissingAPIKeyError, ModelError) as exc:
         return ToolExecutionResult.error(

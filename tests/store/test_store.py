@@ -63,8 +63,18 @@ def test_db_pragmas_and_idempotent_migrations(tmp_path: Path) -> None:
 
         first = db.migrate()
         second = db.migrate()
-        assert first == [1, 2, 3, 4, 5]
+        assert first == [1, 2, 3, 4, 5, 6]
         assert second == []
+
+        # Verify migration 006 columns exist on llm_calls and jobs
+        llm_cols_v6 = {
+            str(r["name"]) for r in db.conn.execute("PRAGMA table_info(llm_calls)").fetchall()
+        }
+        assert {"status", "error_class", "connection_fingerprint"} <= llm_cols_v6
+        job_cols_v6 = {
+            str(r["name"]) for r in db.conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        assert {"owner_pid", "owner_pid_started_at", "owner_instance_id"} <= job_cols_v6
 
         # Verify migration 005 memory_rules_meta columns exist
         mem_cols = {

@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from lightbox.models import (
     BudgetExceededError,
+    CallLimitExceededError,
     EmbedderError,
+    EndpointBindingError,
     FaceEmbedderError,
     MissingAPIKeyError,
     ModelError,
+    UnpricedTriageConfirmationRequiredError,
+)
+from lightbox.services.ai_connection import (
+    AI_PROVIDER_PRESETS,
+    MCPClientId,
+    ProbeAdapterFactory,
 )
 from lightbox.services.burst import BurstDetail, BurstService, ConfirmBurstResult
 from lightbox.services.context import LightboxServices
@@ -102,11 +110,13 @@ from lightbox.services.triage import (
 )
 
 __all__ = [
+    "AI_PROVIDER_PRESETS",
     "ApplyPlanResult",
     "ApprovalCodeError",
     "AutoScreenResult",
     "BucketName",
     "BudgetExceededError",
+    "CallLimitExceededError",
     "BurstDetail",
     "BurstService",
     "BurstTriageOutput",
@@ -136,6 +146,7 @@ __all__ = [
     "E1_MIN_REJECT_RECALL",
     "EmbedSessionResult",
     "EmbedderError",
+    "EndpointBindingError",
     "ExportGroupReport",
     "FaceEmbedderError",
     "FaceSlotInfo",
@@ -148,6 +159,7 @@ __all__ = [
     "IssuedApprovalCode",
     "JobStatusSummary",
     "LightboxServices",
+    "MCPClientId",
     "MCP_IMAGE_MAX_EDGE_PX",
     "McpImageMode",
     "MissingAPIKeyError",
@@ -165,6 +177,7 @@ __all__ = [
     "PlanError",
     "PlanService",
     "PlanStateError",
+    "ProbeAdapterFactory",
     "RestorePlanResult",
     "ReviewService",
     "SafeFSError",
@@ -184,6 +197,7 @@ __all__ = [
     "TriageResult",
     "TriageService",
     "UnnamedClusterInfo",
+    "UnpricedTriageConfirmationRequiredError",
     "YellowTriageOutput",
     "build_demo_dataset",
     "build_e1_dataset",

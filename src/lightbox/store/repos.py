@@ -183,6 +183,9 @@ class JobRecord:
     budget_usd: float = 0.50
     spent_usd: float = 0.0
     heartbeat_at: float | None = None
+    owner_pid: int | None = None
+    owner_pid_started_at: float | None = None
+    owner_instance_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +229,9 @@ class LLMCallRecord:
     created_at: float
     session_id: str | None = None
     cache_hit: bool = False
+    status: str = "ok"
+    error_class: str | None = None
+    connection_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +483,7 @@ def _row_to_burst_member(row: sqlite3.Row) -> BurstMemberRecord:
 
 
 def _row_to_job(row: sqlite3.Row) -> JobRecord:
+    keys = row.keys()
     return JobRecord(
         id=str(row["id"]),
         kind=str(row["kind"]),
@@ -487,6 +494,21 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         budget_usd=float(row["budget_usd"]),
         spent_usd=float(row["spent_usd"]),
         heartbeat_at=float(row["heartbeat_at"]) if row["heartbeat_at"] is not None else None,
+        owner_pid=(
+            int(row["owner_pid"])
+            if "owner_pid" in keys and row["owner_pid"] is not None
+            else None
+        ),
+        owner_pid_started_at=(
+            float(row["owner_pid_started_at"])
+            if "owner_pid_started_at" in keys and row["owner_pid_started_at"] is not None
+            else None
+        ),
+        owner_instance_id=(
+            str(row["owner_instance_id"])
+            if "owner_instance_id" in keys and row["owner_instance_id"] is not None
+            else None
+        ),
     )
 
 
@@ -518,6 +540,7 @@ def _row_to_override(row: sqlite3.Row) -> OverrideRecord:
 
 
 def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:
+    keys = row.keys()
     return LLMCallRecord(
         id=str(row["id"]),
         cache_key=str(row["cache_key"]) if row["cache_key"] is not None else None,
@@ -533,6 +556,17 @@ def _row_to_llm_call(row: sqlite3.Row) -> LLMCallRecord:
         created_at=float(row["created_at"]),
         session_id=str(row["session_id"]) if row["session_id"] is not None else None,
         cache_hit=bool(row["cache_hit"]),
+        status=str(row["status"]) if "status" in keys and row["status"] is not None else "ok",
+        error_class=(
+            str(row["error_class"])
+            if "error_class" in keys and row["error_class"] is not None
+            else None
+        ),
+        connection_fingerprint=(
+            str(row["connection_fingerprint"])
+            if "connection_fingerprint" in keys and row["connection_fingerprint"] is not None
+            else None
+        ),
     )
 
 
@@ -1178,9 +1212,10 @@ class LightboxRepository:
                 """
                 INSERT INTO jobs(
                     id, kind, session_id, status, paused_reason,
-                    budget_usd, spent_usd, heartbeat_at, created_at
+                    budget_usd, spent_usd, heartbeat_at, created_at,
+                    owner_pid, owner_pid_started_at, owner_instance_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -1192,6 +1227,9 @@ class LightboxRepository:
                     job.spent_usd,
                     job.heartbeat_at,
                     job.created_at,
+                    job.owner_pid,
+                    job.owner_pid_started_at,
+                    job.owner_instance_id,
                 ),
             )
 
@@ -1218,6 +1256,9 @@ class LightboxRepository:
         clear_paused_reason: bool = False,
         spent_usd: float | None = None,
         heartbeat_at: float | None = None,
+        owner_pid: int | None = None,
+        owner_pid_started_at: float | None = None,
+        owner_instance_id: str | None = None,
     ) -> None:
         with self.db.transaction() as cur:
             cur.execute(
@@ -1229,7 +1270,10 @@ class LightboxRepository:
                         ELSE COALESCE(?, paused_reason)
                     END,
                     spent_usd = COALESCE(?, spent_usd),
-                    heartbeat_at = COALESCE(?, heartbeat_at)
+                    heartbeat_at = COALESCE(?, heartbeat_at),
+                    owner_pid = COALESCE(?, owner_pid),
+                    owner_pid_started_at = COALESCE(?, owner_pid_started_at),
+                    owner_instance_id = COALESCE(?, owner_instance_id)
                 WHERE id = ?
                 """,
                 (
@@ -1238,6 +1282,9 @@ class LightboxRepository:
                     paused_reason,
                     spent_usd,
                     heartbeat_at,
+                    owner_pid,
+                    owner_pid_started_at,
+                    owner_instance_id,
                     job_id,
                 ),
             )
@@ -1692,9 +1739,10 @@ class LightboxRepository:
                 INSERT INTO llm_calls(
                     id, cache_key, role, provider, model,
                     in_tokens, out_tokens, cached_tokens, cost_usd,
-                    latency_ms, response_json, created_at, session_id, cache_hit
+                    latency_ms, response_json, created_at, session_id, cache_hit,
+                    status, error_class, connection_fingerprint
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.id,
@@ -1711,6 +1759,9 @@ class LightboxRepository:
                     record.created_at,
                     record.session_id,
                     int(record.cache_hit),
+                    record.status,
+                    record.error_class,
+                    record.connection_fingerprint,
                 ),
             )
 
@@ -1735,6 +1786,48 @@ class LightboxRepository:
         ).fetchone()
         return float(row["total"]) if row is not None else 0.0
 
+    def count_real_llm_calls(
+        self,
+        *,
+        session_id: str,
+        status: str | None = None,
+    ) -> int:
+        clauses = ["session_id = ?", "cache_hit = 0"]
+        params: list[Any] = [session_id]
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        row = self.db.conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM llm_calls WHERE {' AND '.join(clauses)}",
+            tuple(params),
+        ).fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
+    def list_real_llm_calls_by_fingerprint(
+        self,
+        connection_fingerprint: str,
+        *,
+        since_ts: float | None = None,
+        limit: int = 50,
+    ) -> list[LLMCallRecord]:
+        clamped = max(1, min(limit, 500))
+        clauses = ["connection_fingerprint = ?", "cache_hit = 0"]
+        params: list[Any] = [connection_fingerprint]
+        if since_ts is not None:
+            clauses.append("created_at > ?")
+            params.append(since_ts)
+        params.append(clamped)
+        rows = self.db.conn.execute(
+            f"""
+            SELECT * FROM llm_calls
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [_row_to_llm_call(row) for row in rows]
+
     def list_llm_calls(
         self,
         *,
@@ -1744,12 +1837,12 @@ class LightboxRepository:
         clamped = max(1, min(limit, 1000))
         if session_id is None:
             rows = self.db.conn.execute(
-                "SELECT * FROM llm_calls ORDER BY created_at DESC LIMIT ?",
+                "SELECT * FROM llm_calls ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (clamped,),
             ).fetchall()
         else:
             rows = self.db.conn.execute(
-                "SELECT * FROM llm_calls WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                "SELECT * FROM llm_calls WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 (session_id, clamped),
             ).fetchall()
         return [_row_to_llm_call(row) for row in rows]

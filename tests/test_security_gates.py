@@ -70,6 +70,59 @@ def test_ruff_tid251_blocks_os_replace(tmp_path: Path) -> None:
     assert "TID251" in proc.stdout
     assert "os.replace" in proc.stdout
 
+    ast_proc = subprocess.run(
+        [sys.executable, str(CHECK_NO_DELETE_SCRIPT), str(bad_file)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ast_proc.returncode == 1
+    assert "os.replace()" in ast_proc.stderr
+
+
+def test_config_io_allows_os_replace_but_still_blocks_delete_primitives() -> None:
+    """Verify check_no_delete whitelists os.replace ONLY for config_io.py while blocking unlink/remove."""
+    import ast
+    import importlib.util
+
+    config_io_file = REPO_ROOT / "src" / "lightbox" / "config_io.py"
+    ok_proc = subprocess.run(
+        [sys.executable, str(CHECK_NO_DELETE_SCRIPT), str(config_io_file)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ok_proc.returncode == 0, ok_proc.stderr
+
+    spec = importlib.util.spec_from_file_location("check_no_delete_mod", CHECK_NO_DELETE_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    sample = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "def f() -> None:\n"
+        "    os.replace('a', 'b')\n"
+        "    Path('a').unlink()\n"
+        "    os.unlink('a')\n"
+        "    os.remove('a')\n"
+    )
+    visitor = mod._NoDeleteVisitor(
+        config_io_file,
+        allow_cache_unlink=False,
+        allow_safe_fs_rename=False,
+        allow_config_io_replace=True,
+    )
+    visitor.visit(ast.parse(sample, filename=str(config_io_file)))
+    msgs = [v.message for v in visitor.violations]
+    assert len(msgs) == 3
+    assert any(".unlink()" in m for m in msgs)
+    assert any("os.unlink()" in m for m in msgs)
+    assert any("os.remove()" in m for m in msgs)
+    assert not any("os.replace()" in m for m in msgs)
+
 
 def test_ast_no_delete_blocks_path_rename(tmp_path: Path) -> None:
     bad_file = tmp_path / "bad_rename.py"

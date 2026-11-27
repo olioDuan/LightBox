@@ -11,15 +11,68 @@ from pydantic import BaseModel
 
 from lightbox.config import ModelSpec
 
-ProviderName = Literal["anthropic", "openai", "gemini", "local"]
+ProviderName = Literal["anthropic", "openai", "gemini", "local", "custom"]
+CostClassification = Literal["known_free", "known_paid", "price_unknown"]
 
 
 class ModelError(RuntimeError):
     """Base error for model adapter or routing failures."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        error_class: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.error_class = error_class
+        super().__init__(message)
+
 
 class MissingAPIKeyError(ModelError):
     """Raised when a required cloud provider API key is not configured."""
+
+
+class EndpointBindingError(ModelError):
+    """Raised when an API key is missing or bound to a different endpoint than requested."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        expected_endpoint: str | None = None,
+        bound_endpoint: str | None = None,
+    ) -> None:
+        self.expected_endpoint = expected_endpoint
+        self.bound_endpoint = bound_endpoint
+        super().__init__(message, error_class="endpoint_binding_mismatch")
+
+
+class CallLimitExceededError(ModelError):
+    """Raised when a `price_unknown` model reaches its per-session maximum call cap."""
+
+    def __init__(self, *, session_id: str, calls_made: int, max_calls: int) -> None:
+        self.session_id = session_id
+        self.calls_made = calls_made
+        self.max_calls = max_calls
+        super().__init__(
+            f"session_call_limit_exceeded ({session_id}): calls={calls_made} >= max={max_calls}",
+            error_class="session_call_limit_exceeded",
+        )
+
+
+class UnpricedTriageConfirmationRequiredError(ModelError):
+    """Raised when batch triage runs on a `price_unknown` model without explicit user confirmation."""
+
+    def __init__(self, *, max_photos: int) -> None:
+        self.max_photos = max_photos
+        super().__init__(
+            f"unpriced_triage_confirmation_required: pricing is unknown; confirm running up to {max_photos} photos or configure estimated token pricing.",
+            error_class="unpriced_triage_confirmation_required",
+        )
 
 
 class ModelHookDeniedError(ModelError):
@@ -45,7 +98,8 @@ class BudgetExceededError(ModelError):
         self.spent_usd = spent_usd
         self.budget_usd = budget_usd
         super().__init__(
-            f"budget_exceeded ({scope}): spent=${spent_usd:.4f} >= limit=${budget_usd:.4f}"
+            f"budget_exceeded ({scope}): spent=${spent_usd:.4f} >= limit=${budget_usd:.4f}",
+            error_class="local_budget_exceeded",
         )
 
 
@@ -266,7 +320,10 @@ def deserialize_cached_payload(
 
 __all__ = [
     "BudgetExceededError",
+    "CallLimitExceededError",
     "ChatModel",
+    "CostClassification",
+    "EndpointBindingError",
     "GenerationResult",
     "ImageInput",
     "Message",
@@ -280,6 +337,7 @@ __all__ = [
     "ToolCall",
     "ToolResultBlock",
     "ToolSchema",
+    "UnpricedTriageConfirmationRequiredError",
     "Usage",
     "compute_cost_usd",
     "deserialize_cached_payload",

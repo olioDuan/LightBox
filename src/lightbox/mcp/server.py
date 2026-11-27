@@ -45,6 +45,19 @@ class _PlanApprovalElicitation(BaseModel):
     )
 
 
+class _UnpricedTriageElicitation(BaseModel):
+    """MCP Elicitation confirmation form for running batch triage on an unpriced model."""
+
+    confirm: bool = Field(
+        default=False,
+        description="Set true to explicitly confirm running batch triage with unknown token pricing.",
+    )
+    max_photos: int = Field(
+        ge=1,
+        description="Enter the maximum photo cap shown in the prompt to confirm.",
+    )
+
+
 @dataclass(slots=True)
 class LightboxMCPBundle:
     """Container pairing the configured MCPServer instance with its ToolRegistry and LocalUIBridge."""
@@ -168,6 +181,7 @@ def create_mcp_server(
             progress_cb = _report
 
         elicitation_approver = None
+        triage_elicitation_approver = None
         if allow_elicitation and ctx is not None:
             caps = None
             try:
@@ -200,7 +214,32 @@ def create_mcp_server(
                         return False
                     return False
 
+                def _ask_triage_elicit(session_id: str, max_photos: int, model_id: str) -> bool:
+                    prompt = (
+                        f"Confirm Lightbox batch triage on session {session_id}?\n"
+                        f"Model: {model_id} (pricing unknown — USD cost cannot be estimated)\n"
+                        f"Maximum photos this run: {max_photos}"
+                    )
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            ctx.elicit(prompt, _UnpricedTriageElicitation),
+                            loop,
+                        )
+                        elicit_res = fut.result(timeout=120.0)
+                        if getattr(elicit_res, "action", None) == "accept":
+                            data = getattr(elicit_res, "data", None)
+                            if (
+                                data is not None
+                                and bool(getattr(data, "confirm", False))
+                                and int(getattr(data, "max_photos", -1)) == max_photos
+                            ):
+                                return True
+                    except Exception:
+                        return False
+                    return False
+
                 elicitation_approver = _ask_elicit
+                triage_elicitation_approver = _ask_triage_elicit
 
         def _execute_sync() -> ToolExecutionResult:
             with LightboxServices(app_paths=resolved_paths, migrate=False) as svcs:
@@ -210,6 +249,7 @@ def create_mcp_server(
                     base_url_resolver=ui_bridge.ensure_base_url,
                     progress_callback=progress_cb,
                     elicitation_approver=elicitation_approver,
+                    triage_elicitation_approver=triage_elicitation_approver,
                 )
                 return reg.execute(mcp_name, arguments, tctx)
 
@@ -378,6 +418,8 @@ def create_mcp_server(
             "lightbox_triage_uncertain",
             {"session_id": session_id, "max_photos": max_photos, "dry_run": dry_run},
             ctx,
+            allow_progress=True,
+            allow_elicitation=True,
         )
 
     @mcp.tool(

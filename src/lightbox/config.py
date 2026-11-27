@@ -5,7 +5,7 @@ from __future__ import annotations
 import tomllib
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from lightbox.paths import AppPaths, get_app_paths
 
@@ -131,6 +131,19 @@ tools = true
 json_schema = true
 prompt_cache = true
 
+[models.gpt-4o]
+provider = "openai"
+protocol = "openai_compat"
+family = "openai"
+model_id = "gpt-4o"
+input_cost_per_mtok = 2.50
+output_cost_per_mtok = 10.00
+cached_input_cost_per_mtok = 1.25
+vision = true
+tools = true
+json_schema = true
+prompt_cache = true
+
 [models.gpt-4o-mini]
 provider = "openai"
 protocol = "openai_compat"
@@ -195,6 +208,40 @@ class CacheConfig(BaseModel):
     preview_max_gb: float = Field(default=2.0, gt=0.0)
 
 
+AIProviderName = Literal["anthropic", "openai", "gemini", "ollama", "custom"]
+
+
+class ActiveAIConfig(BaseModel):
+    """Global `[ai]` connection configuration (never stores plaintext API keys)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: AIProviderName
+    agent_model: str = Field(min_length=1)
+    triage_model: str = Field(min_length=1)
+    base_url: str | None = None
+    reviewer: str = "none"
+    is_local_free: bool = False
+    input_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    output_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    triage_input_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    triage_output_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    max_session_calls: int = Field(default=20, ge=1, le=200)
+    max_triage_photos_unpriced: int = Field(default=20, ge=1, le=500)
+
+    @model_validator(mode="after")
+    def _validate_paired_costs(self) -> ActiveAIConfig:
+        if (self.input_cost_per_mtok is None) != (self.output_cost_per_mtok is None):
+            raise ValueError(
+                "input_cost_per_mtok and output_cost_per_mtok must both be set or both omitted."
+            )
+        if (self.triage_input_cost_per_mtok is None) != (self.triage_output_cost_per_mtok is None):
+            raise ValueError(
+                "triage_input_cost_per_mtok and triage_output_cost_per_mtok must both be set or both omitted."
+            )
+        return self
+
+
 class AppConfig(BaseModel):
     """Typed representation of `<APP_DATA_DIR>/config.toml`.
 
@@ -210,6 +257,7 @@ class AppConfig(BaseModel):
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     quarantine: QuarantineConfig = Field(default_factory=QuarantineConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
+    ai: ActiveAIConfig | None = None
 
 
 class ProfileRoles(BaseModel):
@@ -225,7 +273,7 @@ class ProfileRoles(BaseModel):
 class ModelSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    provider: Literal["anthropic", "openai", "gemini", "local"]
+    provider: Literal["anthropic", "openai", "gemini", "local", "custom"]
     protocol: Literal["anthropic", "openai_compat", "local_onnx"]
     family: str
     model_id: str
@@ -281,6 +329,8 @@ def load_models_config(
 
 
 __all__ = [
+    "AIProviderName",
+    "ActiveAIConfig",
     "AppConfig",
     "BudgetConfig",
     "CacheConfig",

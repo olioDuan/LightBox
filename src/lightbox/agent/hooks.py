@@ -315,6 +315,20 @@ class BudgetGuardHook:
                     max_photos=int(arguments.get("max_photos", 50)),
                 )
                 est_usd = est.est_usd
+                if est.requires_unpriced_confirmation and ctx.surface.startswith("agent"):
+                    cap = est.unpriced_max_photos or 20
+                    return HookResult.ask(
+                        f"Pricing is unknown for {est.model_id} (cannot estimate USD cost). "
+                        f"Approve to run batch triage on up to {cap} photo(s) ({est.total_units} queued).",
+                        hook_name=self.name,
+                        payload={
+                            "scope": "unpriced_triage",
+                            "ask_kind": "unpriced_triage",
+                            "model_id": est.model_id,
+                            "unpriced_max_photos": cap,
+                            "total_units": est.total_units,
+                        },
+                    )
             except Exception:
                 est_usd = 0.0
 

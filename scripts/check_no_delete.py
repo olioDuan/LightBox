@@ -35,14 +35,24 @@ SAFE_FS_RENAME_WHITELIST: frozenset[str] = frozenset(
     }
 )
 
+# Narrow whitelist for atomic <APP_DATA_DIR> config/dotenv os.replace ONLY.
+CONFIG_IO_REPLACE_WHITELIST: frozenset[str] = frozenset(
+    {
+        "src/lightbox/config_io.py",
+    }
+)
+
 FORBIDDEN_DELETE_ATTRS: frozenset[str] = frozenset({"unlink", "rmdir"})
 FORBIDDEN_RENAME_ATTRS: frozenset[str] = frozenset({"rename"})
 FORBIDDEN_MODULE_CALLS: dict[str, frozenset[str]] = {
-    "os": frozenset({"remove", "unlink", "rmdir", "replace"}),
+    "os": frozenset({"remove", "unlink", "rmdir"}),
     "shutil": frozenset({"rmtree", "move"}),
 }
 SAFE_FS_ONLY_MODULE_CALLS: dict[str, frozenset[str]] = {
     "os": frozenset({"rename"}),
+}
+CONFIG_IO_ONLY_MODULE_CALLS: dict[str, frozenset[str]] = {
+    "os": frozenset({"replace"}),
 }
 
 
@@ -71,18 +81,25 @@ class _NoDeleteVisitor(ast.NodeVisitor):
         *,
         allow_cache_unlink: bool,
         allow_safe_fs_rename: bool,
+        allow_config_io_replace: bool,
     ) -> None:
         self.file_path = file_path
         self.allow_cache_unlink = allow_cache_unlink
         self.allow_safe_fs_rename = allow_safe_fs_rename
+        self.allow_config_io_replace = allow_config_io_replace
         self.violations: list[Violation] = []
         # Track module aliases (`import os as o`) and direct symbol imports (`from os import remove as r`)
         self._module_aliases: dict[str, str] = {}
         self._banned_symbol_aliases: dict[str, str] = {}
         self._safe_fs_only_aliases: dict[str, str] = {}
+        self._config_io_only_aliases: dict[str, str] = {}
 
     def visit_Import(self, node: ast.Import) -> None:
-        tracked = set(FORBIDDEN_MODULE_CALLS) | set(SAFE_FS_ONLY_MODULE_CALLS)
+        tracked = (
+            set(FORBIDDEN_MODULE_CALLS)
+            | set(SAFE_FS_ONLY_MODULE_CALLS)
+            | set(CONFIG_IO_ONLY_MODULE_CALLS)
+        )
         for alias in node.names:
             if alias.name in tracked:
                 local_name = alias.asname or alias.name
@@ -103,6 +120,12 @@ class _NoDeleteVisitor(ast.NodeVisitor):
                 if alias.name in safe_fs_only:
                     local_name = alias.asname or alias.name
                     self._safe_fs_only_aliases[local_name] = f"{module}.{alias.name}"
+        if module in CONFIG_IO_ONLY_MODULE_CALLS:
+            config_io_only = CONFIG_IO_ONLY_MODULE_CALLS[module]
+            for alias in node.names:
+                if alias.name in config_io_only:
+                    local_name = alias.asname or alias.name
+                    self._config_io_only_aliases[local_name] = f"{module}.{alias.name}"
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -132,6 +155,21 @@ class _NoDeleteVisitor(ast.NodeVisitor):
                                 message=(
                                     f"Forbidden call `{orig_mod}.{func.attr}()` outside SafeFS "
                                     "(SPEC §10.2(2))."
+                                ),
+                            )
+                        )
+                    self.generic_visit(node)
+                    return
+                if orig_mod and func.attr in CONFIG_IO_ONLY_MODULE_CALLS.get(orig_mod, frozenset()):
+                    if not self.allow_config_io_replace:
+                        self.violations.append(
+                            Violation(
+                                path=self.file_path,
+                                line=node.lineno,
+                                col=node.col_offset,
+                                message=(
+                                    f"Forbidden call `{orig_mod}.{func.attr}()` outside config_io "
+                                    "(SPEC §10.2)."
                                 ),
                             )
                         )
@@ -185,6 +223,16 @@ class _NoDeleteVisitor(ast.NodeVisitor):
                         message=f"Forbidden call `{qualified}()` outside SafeFS (SPEC §10.2(2)).",
                     )
                 )
+            elif func.id in self._config_io_only_aliases and not self.allow_config_io_replace:
+                qualified = self._config_io_only_aliases[func.id]
+                self.violations.append(
+                    Violation(
+                        path=self.file_path,
+                        line=node.lineno,
+                        col=node.col_offset,
+                        message=f"Forbidden call `{qualified}()` outside config_io (SPEC §10.2).",
+                    )
+                )
 
         self.generic_visit(node)
 
@@ -198,6 +246,7 @@ def check_file(file_path: Path) -> list[Violation]:
         file_path,
         allow_cache_unlink=(rel in CACHE_CLEANUP_WHITELIST),
         allow_safe_fs_rename=(rel in SAFE_FS_RENAME_WHITELIST),
+        allow_config_io_replace=(rel in CONFIG_IO_REPLACE_WHITELIST),
     )
     visitor.visit(tree)
     return visitor.violations

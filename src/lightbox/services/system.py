@@ -8,12 +8,15 @@ import platform
 import sqlite3
 import subprocess
 import sys
+import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lightbox.config import AppConfig, load_config
+from lightbox.config import DEFAULT_CONFIG_TOML, AIProviderName, AppConfig, load_config
+from lightbox.config_io import atomic_update_text
 from lightbox.core import find_exiftool, find_face_model_path
 from lightbox.models import (
     find_face_embedder_model_path,
@@ -21,6 +24,17 @@ from lightbox.models import (
     find_siglip2_vision_path,
 )
 from lightbox.paths import AppPaths
+from lightbox.services.ai_connection import (
+    MCPClientId,
+    ProbeAdapterFactory,
+    delete_ai_connection,
+    detect_mcp_clients,
+    discover_ollama_models,
+    generate_mcp_snippet,
+    get_ai_connection_status,
+    save_ai_connection,
+    test_ai_connection,
+)
 from lightbox.store import Database, LightboxRepository
 
 
@@ -213,17 +227,143 @@ class SystemService:
         return load_config(self.app_paths)
 
     def update_settings(self, updates: dict[str, Any]) -> AppConfig:
-        """Validate and persist updated settings to `<APP_DATA_DIR>/config.toml` (forbids API keys)."""
-        current = load_config(self.app_paths).model_dump()
-        for key, value in updates.items():
-            if isinstance(value, dict) and isinstance(current.get(key), dict):
-                current[key] = {**current[key], **value}
-            else:
-                current[key] = value
-        validated = AppConfig.model_validate(current)
-        self.app_paths.ensure_dirs()
-        self.app_paths.config_file.write_text(_dump_config_toml(validated), encoding="utf-8")
-        return validated
+        """Validate and atomically persist updated settings inside the config_io lock (forbids API keys & `ai`)."""
+        if "ai" in updates:
+            raise ValueError("AI connection settings must be managed via /api/ai/connection.")
+
+        validated_holder: list[AppConfig] = []
+
+        def _transform(existing_text: str | None) -> str:
+            base_raw = (
+                tomllib.loads(existing_text)
+                if existing_text is not None and existing_text.strip()
+                else tomllib.loads(DEFAULT_CONFIG_TOML)
+            )
+            current = AppConfig.model_validate(base_raw).model_dump()
+            for key, value in updates.items():
+                if isinstance(value, dict) and isinstance(current.get(key), dict):
+                    current[key] = {**current[key], **value}
+                else:
+                    current[key] = value
+            validated = AppConfig.model_validate(current)
+            validated_holder.clear()
+            validated_holder.append(validated)
+            return _dump_config_toml(validated)
+
+        atomic_update_text(self.app_paths, self.app_paths.config_file, _transform)
+        return validated_holder[0]
+
+    # --- AI Connection, Probes, Ollama Discovery & Read-only MCP Clients ---
+
+    def get_ai_connection(self) -> dict[str, Any]:
+        """Return current AI connection status derived locally from fingerprint + SQLite calls."""
+        return get_ai_connection_status(self.app_paths, self.db)
+
+    def save_ai_connection(
+        self,
+        *,
+        provider: AIProviderName,
+        agent_model: str | None = None,
+        triage_model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        reviewer: str = "none",
+        is_local_free: bool = False,
+        input_cost_per_mtok: float | None = None,
+        output_cost_per_mtok: float | None = None,
+        triage_input_cost_per_mtok: float | None = None,
+        triage_output_cost_per_mtok: float | None = None,
+        max_session_calls: int = 20,
+        max_triage_photos_unpriced: int = 20,
+    ) -> dict[str, Any]:
+        """Atomically persist endpoint-bound secret (first) and `[ai]` section in `config.toml` (second)."""
+        return save_ai_connection(
+            self.app_paths,
+            self.db,
+            dump_config_fn=_dump_config_toml,
+            provider=provider,
+            agent_model=agent_model,
+            triage_model=triage_model,
+            base_url=base_url,
+            api_key=api_key,
+            reviewer=reviewer,
+            is_local_free=is_local_free,
+            input_cost_per_mtok=input_cost_per_mtok,
+            output_cost_per_mtok=output_cost_per_mtok,
+            triage_input_cost_per_mtok=triage_input_cost_per_mtok,
+            triage_output_cost_per_mtok=triage_output_cost_per_mtok,
+            max_session_calls=max_session_calls,
+            max_triage_photos_unpriced=max_triage_photos_unpriced,
+        )
+
+    def delete_ai_connection(self, *, delete_credential: bool = True) -> dict[str, Any]:
+        """Deactivate `[ai]`, delete non-env stored credentials, and re-resolve remaining source."""
+        return delete_ai_connection(
+            self.app_paths,
+            self.db,
+            dump_config_fn=_dump_config_toml,
+            delete_credential=delete_credential,
+        )
+
+    async def test_ai_connection(
+        self,
+        *,
+        provider: AIProviderName | None = None,
+        agent_model: str | None = None,
+        triage_model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        is_local_free: bool | None = None,
+        adapter_factory: ProbeAdapterFactory | None = None,
+        http_get_json: Callable[[str], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Run verifiable capability probes against Agent and Triage models and update fingerprint cache."""
+        return await test_ai_connection(
+            self.app_paths,
+            self.db,
+            provider=provider,
+            agent_model=agent_model,
+            triage_model=triage_model,
+            base_url=base_url,
+            api_key=api_key,
+            is_local_free=is_local_free,
+            adapter_factory=adapter_factory,
+            http_get_json=http_get_json,
+        )
+
+    def discover_ollama_models(
+        self,
+        *,
+        base_url: str | None = None,
+        http_get_json: Callable[[str], dict[str, Any]] | None = None,
+        http_post_json: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """List local Ollama models and theoretical context limits from `/api/tags` + `/api/show`."""
+        return discover_ollama_models(
+            self.app_paths,
+            base_url=base_url,
+            http_get_json=http_get_json,
+            http_post_json=http_post_json,
+        )
+
+    def detect_mcp_clients(
+        self,
+        *,
+        home_dir: Path | None = None,
+        platform_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Read-only inspection of external MCP client configuration status (never returns raw config)."""
+        return detect_mcp_clients(home_dir=home_dir, platform_name=platform_name)
+
+    def generate_mcp_snippet(
+        self,
+        client: MCPClientId,
+        *,
+        home_dir: Path | None = None,
+        platform_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate copy-paste MCP configuration snippet for a validated client enum."""
+        return generate_mcp_snippet(client, home_dir=home_dir, platform_name=platform_name)
 
     def pick_folder(self) -> str | None:
         """Invoke native OS folder picker dialog; returns selected path or None if canceled."""
@@ -338,6 +478,9 @@ class SystemService:
                     "cost_usd": round(c.cost_usd, 6),
                     "latency_ms": c.latency_ms,
                     "cache_hit": c.cache_hit,
+                    "status": c.status,
+                    "error_class": c.error_class,
+                    "connection_fingerprint": c.connection_fingerprint,
                     "session_id": c.session_id,
                     "created_at": c.created_at,
                 }
@@ -372,10 +515,35 @@ def _dump_config_toml(cfg: AppConfig) -> str:
             "",
             "[cache]",
             f"preview_max_gb = {cfg.cache.preview_max_gb:.2f}",
-            "",
         ]
     )
+    if cfg.ai is not None:
+        ai = cfg.ai
+        lines.extend(
+            [
+                "",
+                "[ai]",
+                f"provider = {_toml_str(ai.provider)}",
+                f"agent_model = {_toml_str(ai.agent_model)}",
+                f"triage_model = {_toml_str(ai.triage_model)}",
+            ]
+        )
+        if ai.base_url is not None:
+            lines.append(f"base_url = {_toml_str(ai.base_url)}")
+        lines.append(f"reviewer = {_toml_str(ai.reviewer)}")
+        lines.append(f"is_local_free = {'true' if ai.is_local_free else 'false'}")
+        if ai.input_cost_per_mtok is not None:
+            lines.append(f"input_cost_per_mtok = {ai.input_cost_per_mtok}")
+        if ai.output_cost_per_mtok is not None:
+            lines.append(f"output_cost_per_mtok = {ai.output_cost_per_mtok}")
+        if ai.triage_input_cost_per_mtok is not None:
+            lines.append(f"triage_input_cost_per_mtok = {ai.triage_input_cost_per_mtok}")
+        if ai.triage_output_cost_per_mtok is not None:
+            lines.append(f"triage_output_cost_per_mtok = {ai.triage_output_cost_per_mtok}")
+        lines.append(f"max_session_calls = {ai.max_session_calls}")
+        lines.append(f"max_triage_photos_unpriced = {ai.max_triage_photos_unpriced}")
+    lines.append("")
     return "\n".join(lines)
 
 
-__all__ = ["DoctorCheckItem", "DoctorReport", "SystemService"]
+__all__ = ["DoctorCheckItem", "DoctorReport", "SystemService", "_dump_config_toml"]

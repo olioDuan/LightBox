@@ -922,32 +922,63 @@ export function InsightsView({ activeTab, onChangeTab }: InsightsViewProps) {
                         <th className="h-10 pr-6 text-right font-normal">{t.tracesColTokens}</th>
                         <th className="h-10 pr-6 text-right font-normal">{t.tracesColLatency}</th>
                         <th className="h-10 pr-6 text-right font-normal">{t.tracesColCost}</th>
+                        <th className="h-10 pr-6 font-normal">{t.tracesColStatus}</th>
                         <th className="h-10 font-normal">{t.tracesColCache}</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {tracesQ.data.items.map((row) => (
-                        <tr key={row.id} className="hover:bg-table">
-                          <td className="h-12 whitespace-nowrap pr-6 text-ink-2">
-                            {new Date(row.created_at * 1000).toLocaleString()}
-                          </td>
-                          <td className="h-12 whitespace-nowrap pr-6 font-medium text-ink">
-                            {t.tracesRoleLabels[row.role] ?? row.role}
-                          </td>
-                          <td className="h-12 whitespace-nowrap pr-6 text-ink-2">{row.model}</td>
-                          <td className="h-12 whitespace-nowrap pr-6 text-right text-ink-2">
-                            {row.in_tokens.toLocaleString()} / {row.cached_tokens.toLocaleString()} /{" "}
-                            {row.out_tokens.toLocaleString()}
-                          </td>
-                          <td className="h-12 whitespace-nowrap pr-6 text-right text-ink-2">{row.latency_ms} ms</td>
-                          <td className="h-12 whitespace-nowrap pr-6 text-right text-ink">${row.cost_usd.toFixed(5)}</td>
-                          <td className="h-12 whitespace-nowrap">
-                            <span className={row.cache_hit ? "font-medium text-ink" : "text-ink-3"}>
-                              {row.cache_hit ? t.tracesCacheHitBadge : t.tracesCacheMissBadge}
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
+                      {tracesQ.data.items.map((row) => {
+                        const isErr = row.status === "error";
+                        const errLabel = row.error_class
+                          ? (t.aiErrorClassLabels[row.error_class] ?? row.error_class)
+                          : t.tracesStatusError;
+                        return (
+                          <tr key={row.id} className="hover:bg-table">
+                            <td className="h-12 whitespace-nowrap pr-6 text-ink-2">
+                              {new Date(row.created_at * 1000).toLocaleString()}
+                            </td>
+                            <td className="h-12 whitespace-nowrap pr-6 font-medium text-ink">
+                              {t.tracesRoleLabels[row.role] ?? row.role}
+                            </td>
+                            <td className="h-12 whitespace-nowrap pr-6 text-ink-2">{row.model}</td>
+                            <td className="h-12 whitespace-nowrap pr-6 text-right text-ink-2">
+                              {row.in_tokens.toLocaleString()} / {row.cached_tokens.toLocaleString()} /{" "}
+                              {row.out_tokens.toLocaleString()}
+                            </td>
+                            <td className="h-12 whitespace-nowrap pr-6 text-right text-ink-2">
+                              {row.latency_ms} ms
+                            </td>
+                            <td className="h-12 whitespace-nowrap pr-6 text-right text-ink">
+                              ${row.cost_usd.toFixed(5)}
+                            </td>
+                            <td className="h-12 whitespace-nowrap pr-6">
+                              {isErr ? (
+                                <span
+                                  className="inline-flex items-center gap-2 font-medium text-reject-ink"
+                                  title={row.error_class ?? undefined}
+                                >
+                                  <span className="h-2 w-2 shrink-0 rounded-full bg-reject" />
+                                  {errLabel}
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-2 text-ink-2">
+                                  <span className="h-2 w-2 shrink-0 rounded-full bg-keep" />
+                                  {t.tracesStatusOk}
+                                </span>
+                              )}
+                            </td>
+                            <td className="h-12 whitespace-nowrap">
+                              {isErr ? (
+                                <span className="text-ink-3">—</span>
+                              ) : (
+                                <span className={row.cache_hit ? "font-medium text-ink" : "text-ink-3"}>
+                                  {row.cache_hit ? t.tracesCacheHitBadge : t.tracesCacheMissBadge}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

@@ -75,6 +75,9 @@ ignore = ["E501"]
 # SafeFS is the sole module allowed to call os.rename (with prior non-overwrite check);
 # scripts/check_no_delete.py still blocks all other deletion/overwrite APIs inside safe_fs.py.
 "src/lightbox/fs/safe_fs.py" = ["TID251"]
+# config_io.py is the sole module allowed to call os.replace for atomic <APP_DATA_DIR> config writes;
+# scripts/check_no_delete.py still blocks all deletion/rename APIs inside config_io.py.
+"src/lightbox/config_io.py" = ["TID251"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -7,6 +7,7 @@ import {
   type Bucket,
   type DraftObviousResponse,
   type PhotoItem,
+  type TriageEstimateResponse,
 } from "../api";
 import { QuarantineModal } from "../components/QuarantineModal";
 import { verdictForPhoto } from "../components/photoMarks";
@@ -229,6 +230,9 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
   const [burstZoomed, setBurstZoomed] = useState(false);
   const [activeDraft, setActiveDraft] = useState<DraftObviousResponse | null>(null);
   const [verifyingPlan, setVerifyingPlan] = useState(false);
+  const [triageEstimate, setTriageEstimate] = useState<TriageEstimateResponse | null>(null);
+  const [triageLoading, setTriageLoading] = useState(false);
+  const [triageRunning, setTriageRunning] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const positionedTokenRef = useRef<number>(0);
@@ -666,10 +670,52 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
     }
   }, [refreshSession, sessionId, t.resetReviewConfirm]);
 
+  const handleOpenTriage = useCallback(async () => {
+    setError(null);
+    setToast(null);
+    setTriageLoading(true);
+    try {
+      const est = await api.estimateTriage(sessionId);
+      setTriageEstimate(est);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTriageLoading(false);
+    }
+  }, [sessionId]);
+
+  const handleConfirmTriage = useCallback(async () => {
+    if (!triageEstimate || triageRunning) return;
+    setError(null);
+    setTriageRunning(true);
+    try {
+      const res = await api.runTriage(sessionId, {
+        wait: true,
+        confirmUnpriced: triageEstimate.requires_unpriced_confirmation,
+      });
+      setTriageEstimate(null);
+      setToast(
+        t.triageDoneToast(
+          res.reviewed_yellow ?? 0,
+          res.reviewed_bursts ?? 0,
+          res.failed_count ?? 0,
+        ),
+      );
+      await refreshSession();
+      void queryClient.invalidateQueries({ queryKey: ["llm-traces"] });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setTriageEstimate(null);
+    } finally {
+      void queryClient.invalidateQueries({ queryKey: ["ai-connection"] });
+      setTriageRunning(false);
+    }
+  }, [queryClient, refreshSession, sessionId, t, triageEstimate, triageRunning]);
+
   // Global keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (activeDraft || verifyingPlan) return;
+      if (activeDraft || verifyingPlan || triageEstimate) return;
       if (showCompleteModal) {
         if (e.key === "Escape") {
           e.preventDefault();
@@ -767,6 +813,8 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
     photos.length,
     showCompleteModal,
     tab,
+    triageEstimate,
+    verifyingPlan,
   ]);
 
   const activeCounts = summary?.active_counts_by_bucket ?? summary?.counts_by_bucket ?? {};
@@ -826,7 +874,7 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
     <div className="flex h-[calc(100vh-64px)] flex-col bg-paper">
       {/* Row 1 — back arrow sits under the logo mark, the session name under the wordmark */}
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 sm:px-8">
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-6 gap-y-2">
+        <div className="flex min-w-[200px] flex-1 flex-wrap items-center gap-x-6 gap-y-2">
           <div className="flex min-w-0 items-center">
             <IconButton
               icon={ArrowLeft}
@@ -868,7 +916,17 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
           )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {(yellowCount > 0 || (summary?.unconfirmed_burst_count ?? 0) > 0) && (
+            <Button
+              variant="secondary"
+              icon={Sparkles}
+              disabled={triageLoading || triageRunning}
+              onClick={() => void handleOpenTriage()}
+            >
+              {triageRunning ? t.triageRunningBtn : t.triageRunBtn}
+            </Button>
+          )}
           {tab !== "revisit" &&
             tab !== "bursts" &&
             sessionStats.undecided.length > 0 &&
@@ -1377,6 +1435,100 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
               {sessionStats.undecided.length > 0 && (
                 <Button variant="primary" onClick={enterRevisitPass}>
                   {t.completeActionRevisit(sessionStats.undecided.length)}
+                </Button>
+              )}
+            </div>
+          </div>
+        </Dialog>
+      )}
+
+      {triageEstimate && (
+        <Dialog
+          labelledBy="triage-confirm-title"
+          onDismiss={triageRunning ? undefined : () => setTriageEstimate(null)}
+          width={520}
+        >
+          <div className="flex flex-col gap-6 p-8">
+            <div className="flex items-center justify-between gap-4">
+              <h2 id="triage-confirm-title" className="text-lg font-semibold text-ink">
+                {triageEstimate.requires_unpriced_confirmation
+                  ? t.triageModalUnpricedTitle
+                  : t.triageModalTitle}
+              </h2>
+              {!triageRunning && (
+                <IconButton
+                  icon={X}
+                  label={t.uiDismiss}
+                  onClick={() => setTriageEstimate(null)}
+                />
+              )}
+            </div>
+
+            {triageEstimate.total_units === 0 ? (
+              <p className="text-sm text-ink-2">{t.triageModalEmpty}</p>
+            ) : (
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm">
+                <div className="flex flex-col gap-1">
+                  <dt className="text-ink-3">{t.triageModalModelLabel}</dt>
+                  <dd className="truncate font-medium text-ink">{triageEstimate.model_id}</dd>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <dt className="text-ink-3">{t.triageModalUnitsLabel}</dt>
+                  <dd className="font-medium text-ink tabular-nums">
+                    {t.triageModalUnitsValue(
+                      triageEstimate.yellow_count,
+                      triageEstimate.burst_count,
+                    )}
+                  </dd>
+                </div>
+                <div className="col-span-2 flex flex-col gap-1">
+                  <dt className="text-ink-3">{t.triageModalCostLabel}</dt>
+                  <dd
+                    className={`font-medium tabular-nums ${
+                      triageEstimate.cost_classification === "price_unknown"
+                        ? "text-unsure-ink"
+                        : "text-ink"
+                    }`}
+                  >
+                    {triageEstimate.cost_classification === "known_free"
+                      ? t.aiCostLabels.known_free
+                      : triageEstimate.cost_classification === "price_unknown"
+                        ? t.aiCostLabels.price_unknown
+                        : `$${triageEstimate.est_usd.toFixed(4)}`}
+                  </dd>
+                </div>
+              </dl>
+            )}
+
+            {triageEstimate.requires_unpriced_confirmation && triageEstimate.total_units > 0 && (
+              <p className="rounded-panel bg-table px-4 py-3 text-sm leading-6 text-unsure-ink">
+                {t.triageModalUnpricedWarning(triageEstimate.unpriced_max_photos)}
+              </p>
+            )}
+
+            {!triageEstimate.vlm_backend_ready && triageEstimate.total_units > 0 && (
+              <p className="text-sm text-reject-ink">{t.triageModalNotReady}</p>
+            )}
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <Button
+                variant="ghost"
+                disabled={triageRunning}
+                onClick={() => setTriageEstimate(null)}
+              >
+                {t.triageModalCancel}
+              </Button>
+              {triageEstimate.total_units > 0 && (
+                <Button
+                  variant="primary"
+                  disabled={triageRunning || !triageEstimate.vlm_backend_ready}
+                  onClick={() => void handleConfirmTriage()}
+                >
+                  {triageRunning
+                    ? t.triageRunningBtn
+                    : triageEstimate.requires_unpriced_confirmation
+                      ? t.triageModalConfirmUnpriced(triageEstimate.unpriced_max_photos)
+                      : t.triageModalConfirm}
                 </Button>
               )}
             </div>

@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import { AgentDrawer } from "./components/AgentDrawer";
-import { Button, Loading, Tabs, type TabItem } from "./components/ui";
-import { Sparkles } from "reicon-react";
+import { SettingsModal } from "./components/SettingsModal";
+import { Button, IconButton, Loading, Tabs, type TabItem } from "./components/ui";
+import { Settings, Sparkles } from "reicon-react";
 import { getMessages, I18nContext, type Lang } from "./i18n";
 import { InsightsView } from "./views/InsightsView";
 import { PeopleView } from "./views/PeopleView";
@@ -54,6 +55,7 @@ export function App() {
   const [authState, setAuthState] = useState<"checking" | "authed" | "needs_confirm">("checking");
   const [authError, setAuthError] = useState<string | null>(null);
   const [agentOpen, setAgentOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Global ⌘K / Ctrl+K shortcut to toggle the built-in Agent side drawer
   useEffect(() => {
@@ -134,8 +136,8 @@ export function App() {
   return (
     <I18nContext.Provider value={i18nValue}>
       <div className="min-h-screen bg-paper text-ink">
-        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-6 bg-paper px-4 sm:px-8">
-          <div className="flex min-w-0 items-center gap-4 sm:gap-8">
+        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-4 bg-paper px-4 sm:px-8">
+          <div className="flex min-w-0 items-center gap-4 md:gap-8">
             <button
               type="button"
               onClick={() => navigate("/")}
@@ -162,17 +164,26 @@ export function App() {
 
           <div className="flex shrink-0 items-center gap-1">
             {authState === "authed" && (
-              <Button
-                variant={agentOpen ? "primary" : "ghost"}
-                size="sm"
-                icon={Sparkles}
-                aria-pressed={agentOpen}
-                aria-keyshortcuts="Meta+K Control+K"
-                title={`${t.navAgentBtn} ⌘K`}
-                onClick={() => setAgentOpen((prev) => !prev)}
-              >
-                <span className="hidden sm:inline">{t.navAgentBtn}</span>
-              </Button>
+              <>
+                <Button
+                  variant={agentOpen ? "primary" : "ghost"}
+                  size="sm"
+                  icon={Sparkles}
+                  aria-pressed={agentOpen}
+                  aria-keyshortcuts="Meta+K Control+K"
+                  title={`${t.navAgentBtn} ⌘K`}
+                  onClick={() => setAgentOpen((prev) => !prev)}
+                >
+                  <span className="hidden md:inline">{t.navAgentBtn}</span>
+                </Button>
+                <IconButton
+                  icon={Settings}
+                  label={t.settingsBtnLabel}
+                  size="sm"
+                  variant={settingsOpen ? "secondary" : "ghost"}
+                  onClick={() => setSettingsOpen(true)}
+                />
+              </>
             )}
             <Button
               variant="ghost"
@@ -216,11 +227,17 @@ export function App() {
         )}
 
         {authState === "authed" && (
-          <AgentDrawer
-            open={agentOpen}
-            activeSessionId={route.name === "review" ? route.sessionId : null}
-            onClose={() => setAgentOpen(false)}
-          />
+          <>
+            <AgentDrawer
+              open={agentOpen}
+              activeSessionId={route.name === "review" ? route.sessionId : null}
+              onClose={() => setAgentOpen(false)}
+            />
+            <SettingsModal
+              open={settingsOpen}
+              onClose={() => setSettingsOpen(false)}
+            />
+          </>
         )}
       </div>
     </I18nContext.Provider>

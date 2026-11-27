@@ -21,7 +21,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from lightbox import __version__
 from lightbox.agent import (
@@ -38,22 +38,27 @@ from lightbox.api.security import (
     SessionAuthState,
     set_session_cookie,
 )
+from lightbox.config import AIProviderName
 from lightbox.i18n import render_reasons
 from lightbox.paths import AppPaths, get_app_paths
 from lightbox.services import (
     BucketName,
     DestinationExistsError,
     EmbedderError,
+    EndpointBindingError,
     FaceEmbedderError,
     ImageSizeMode,
     LightboxServices,
+    MCPClientId,
     MissingAPIKeyError,
     ModelError,
     PeopleError,
     PlanError,
     PlanStateError,
+    ProbeAdapterFactory,
     SafeFSError,
     StalePlanError,
+    UnpricedTriageConfirmationRequiredError,
     build_demo_dataset,
 )
 
@@ -147,6 +152,54 @@ class TriageRequest(BaseModel):
     profile: Literal["balanced", "best", "local"] | None = None
     budget_usd: float | None = Field(default=None, ge=0.0)
     wait: bool = False
+    confirm_unpriced: bool = False
+
+
+class TestAIConnectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: AIProviderName | None = None
+    agent_model: str | None = None
+    triage_model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    is_local_free: bool | None = None
+
+
+class SaveAIConnectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: AIProviderName
+    agent_model: str | None = None
+    triage_model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    reviewer: Literal["none", "agent", "cross_family"] = "none"
+    is_local_free: bool = False
+    input_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    output_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    triage_input_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    triage_output_cost_per_mtok: float | None = Field(default=None, ge=0.0)
+    max_session_calls: int = Field(default=20, ge=1, le=200)
+    max_triage_photos_unpriced: int = Field(default=20, ge=1, le=500)
+
+    @model_validator(mode="after")
+    def _validate_paired_costs(self) -> SaveAIConnectionRequest:
+        if (self.input_cost_per_mtok is None) != (self.output_cost_per_mtok is None):
+            raise ValueError(
+                "input_cost_per_mtok and output_cost_per_mtok must both be set or both omitted."
+            )
+        if (self.triage_input_cost_per_mtok is None) != (self.triage_output_cost_per_mtok is None):
+            raise ValueError(
+                "triage_input_cost_per_mtok and triage_output_cost_per_mtok must both be set or both omitted."
+            )
+        return self
+
+
+class MCPSnippetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client: MCPClientId
 
 
 class PeopleIndexRequest(BaseModel):
@@ -304,6 +357,7 @@ def create_app(
     model_router_factory: Callable[[LightboxServices], Any] | None = None,
     embedder_factory: Callable[[LightboxServices], Any] | None = None,
     face_embedder_factory: Callable[[LightboxServices], Any] | None = None,
+    probe_adapter_factory: ProbeAdapterFactory | None = None,
 ) -> FastAPI:
     """Create the local-only FastAPI app with DNS-rebinding, Cookie, CSRF, REST, and SSE."""
     resolved_paths = app_paths or get_app_paths()
@@ -338,6 +392,7 @@ def create_app(
     app.state.model_router_factory = model_router_factory
     app.state.embedder_factory = embedder_factory
     app.state.face_embedder_factory = face_embedder_factory
+    app.state.probe_adapter_factory = probe_adapter_factory
     app.add_middleware(LocalSecurityMiddleware, allowed_port=port, auth=auth)
 
     # --- Local Liveness Probe (Host-checked, zero user data) ---
@@ -385,11 +440,113 @@ def create_app(
 
     @app.put("/api/settings")
     def put_settings(updates: dict[str, Any], svcs: SvcsDep) -> dict[str, Any]:
+        if "ai" in updates:
+            raise HTTPException(
+                status_code=422,
+                detail="AI connection settings must be managed via /api/ai/connection.",
+            )
         try:
             updated = svcs.system.update_settings(updates)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         return updated.model_dump()
+
+    # --- AI Connection, Verifiable Probes, Ollama & Read-only MCP Clients ---
+
+    @app.get("/api/ai/connection")
+    def get_ai_connection(svcs: SvcsDep) -> dict[str, Any]:
+        return svcs.system.get_ai_connection()
+
+    @app.post("/api/ai/connection/test")
+    async def test_ai_connection_route(
+        svcs: SvcsDep,
+        body: TestAIConnectionRequest | None = None,
+    ) -> dict[str, Any]:
+        req = body or TestAIConnectionRequest()
+        try:
+            return await svcs.system.test_ai_connection(
+                provider=req.provider,
+                agent_model=req.agent_model,
+                triage_model=req.triage_model,
+                base_url=req.base_url,
+                api_key=req.api_key,
+                is_local_free=req.is_local_free,
+                adapter_factory=probe_adapter_factory,
+            )
+        except EndpointBindingError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_class": "endpoint_binding_mismatch",
+                    "message": str(exc),
+                },
+            ) from None
+        except (MissingAPIKeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    @app.put("/api/ai/connection")
+    def put_ai_connection(
+        body: SaveAIConnectionRequest,
+        svcs: SvcsDep,
+    ) -> dict[str, Any]:
+        try:
+            return svcs.system.save_ai_connection(
+                provider=body.provider,
+                agent_model=body.agent_model,
+                triage_model=body.triage_model,
+                base_url=body.base_url,
+                api_key=body.api_key,
+                reviewer=body.reviewer,
+                is_local_free=body.is_local_free,
+                input_cost_per_mtok=body.input_cost_per_mtok,
+                output_cost_per_mtok=body.output_cost_per_mtok,
+                triage_input_cost_per_mtok=body.triage_input_cost_per_mtok,
+                triage_output_cost_per_mtok=body.triage_output_cost_per_mtok,
+                max_session_calls=body.max_session_calls,
+                max_triage_photos_unpriced=body.max_triage_photos_unpriced,
+            )
+        except EndpointBindingError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_class": "endpoint_binding_mismatch",
+                    "message": str(exc),
+                },
+            ) from None
+        except (MissingAPIKeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    @app.delete("/api/ai/connection")
+    def delete_ai_connection_route(
+        svcs: SvcsDep,
+        delete_credential: Annotated[bool, Query()] = True,
+    ) -> dict[str, Any]:
+        return svcs.system.delete_ai_connection(delete_credential=delete_credential)
+
+    @app.get("/api/ai/ollama/models")
+    async def list_ollama_models(
+        svcs: SvcsDep,
+        base_url: Annotated[str | None, Query()] = None,
+    ) -> dict[str, Any]:
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: svcs.system.discover_ollama_models(base_url=base_url)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    @app.get("/api/ai/mcp/clients")
+    def list_mcp_clients(svcs: SvcsDep) -> dict[str, Any]:
+        return svcs.system.detect_mcp_clients()
+
+    @app.post("/api/ai/mcp/snippet")
+    def create_mcp_snippet(
+        body: MCPSnippetRequest,
+        svcs: SvcsDep,
+    ) -> dict[str, Any]:
+        return svcs.system.generate_mcp_snippet(body.client)
 
     # --- Demo & Scan Jobs ---
 
@@ -1130,6 +1287,9 @@ def create_app(
                 "session_budget_usd": est.session_budget_usd,
                 "monthly_spent_usd": est.monthly_spent_usd,
                 "monthly_budget_usd": est.monthly_budget_usd,
+                "cost_classification": est.cost_classification,
+                "requires_unpriced_confirmation": est.requires_unpriced_confirmation,
+                "unpriced_max_photos": est.unpriced_max_photos,
             }
 
         # Validate session & credentials synchronously before spawning worker thread
@@ -1138,10 +1298,13 @@ def create_app(
                 session_id,
                 profile=req.profile,
                 session_budget_usd=req.budget_usd,
+                confirm_unpriced=req.confirm_unpriced,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
-        except MissingAPIKeyError as exc:
+        except UnpricedTriageConfirmationRequiredError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except (MissingAPIKeyError, EndpointBindingError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         except ModelError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from None
@@ -1153,6 +1316,7 @@ def create_app(
                 profile=req.profile,
                 session_budget_usd=req.budget_usd,
                 job_id=job_id,
+                confirm_unpriced=req.confirm_unpriced,
                 on_progress=lambda stage, done, total: event_bus.publish(
                     "job.progress",
                     {"job_id": job_id, "stage": stage, "done": done, "total": total},

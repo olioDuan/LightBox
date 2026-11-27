@@ -485,9 +485,13 @@ export interface AgentLatestPlan {
 export interface AgentPendingAsk {
   tool_call: { id: string; name: string; arguments: Record<string, unknown> };
   reason: string;
+  ask_kind?: "budget" | "unpriced_triage" | string;
   scope?: "session" | "monthly" | string;
   suggested_budget_usd?: number;
   needs_monthly_bypass?: boolean;
+  model_id?: string;
+  unpriced_max_photos?: number;
+  total_units?: number;
   completed_results?: Array<Record<string, unknown>>;
   remaining_calls?: Array<Record<string, unknown>>;
 }
@@ -525,6 +529,9 @@ export interface LlmTraceItem {
   latency_ms: number;
   cache_hit: boolean;
   session_id: string | null;
+  status?: "ok" | "error" | string;
+  error_class?: string | null;
+  connection_fingerprint?: string | null;
   created_at: number;
 }
 
@@ -585,6 +592,229 @@ export interface ConsolidateMemoryResponse {
   state: MemoryStateResponse;
 }
 
+export type AiProvider = "anthropic" | "openai" | "gemini" | "ollama" | "custom";
+export type AiConnectionStatus = "unconfigured" | "configured_unverified" | "connected" | "error";
+export type CredentialSource = "keyring" | "env" | "dotenv" | "none";
+export type CostClassification = "known_free" | "known_paid" | "price_unknown";
+
+export interface ProbeCheckResult {
+  ok: boolean;
+  error: string | null;
+}
+
+export interface AgentProbeReport {
+  vision: ProbeCheckResult;
+  tools: ProbeCheckResult;
+  json_schema: ProbeCheckResult;
+}
+
+export interface TriageProbeReport {
+  vision: ProbeCheckResult;
+  json_schema: ProbeCheckResult;
+  shared_with_agent?: boolean;
+}
+
+export interface AiConnectionErrorInfo {
+  error_class: string;
+  error_code?: string | null;
+  message: string;
+  occurred_at?: number;
+  role?: string;
+}
+
+export interface AiTransientNotice {
+  error_class: string;
+  occurred_at: number;
+  role?: string;
+}
+
+export interface AiPresetInfo {
+  agent_model: string;
+  triage_model: string;
+  default_base_url: string;
+  requires_api_key: boolean;
+}
+
+export interface AiConnectionState {
+  status: AiConnectionStatus;
+  configured: boolean;
+  provider: AiProvider | null;
+  agent_model: string | null;
+  triage_model: string | null;
+  base_url: string | null;
+  normalized_endpoint?: string;
+  reviewer: string;
+  review_mode: "rules_only" | "two_layer" | string;
+  is_local_free: boolean;
+  input_cost_per_mtok: number | null;
+  output_cost_per_mtok: number | null;
+  triage_input_cost_per_mtok: number | null;
+  triage_output_cost_per_mtok: number | null;
+  cost_classification: CostClassification | null;
+  triage_cost_classification: CostClassification | null;
+  max_session_calls: number;
+  max_triage_photos_unpriced: number;
+  credential_source: CredentialSource;
+  can_delete_credential: boolean;
+  key_suffix: string | null;
+  fingerprint: string | null;
+  verified_at: number | null;
+  agent_ready: boolean;
+  triage_ready: boolean;
+  agent_probes: AgentProbeReport | null;
+  triage_probes: TriageProbeReport | null;
+  agent_error: AiConnectionErrorInfo | null;
+  triage_error: AiConnectionErrorInfo | null;
+  error: AiConnectionErrorInfo | null;
+  transient_notice: AiTransientNotice | null;
+  presets: Record<string, AiPresetInfo>;
+}
+
+export interface AiConnectionTestResponse {
+  overall_ok: boolean;
+  status: AiConnectionStatus;
+  provider: AiProvider;
+  agent_model: string;
+  triage_model: string;
+  agent_ready: boolean;
+  triage_ready: boolean;
+  agent_probes: AgentProbeReport;
+  triage_probes: TriageProbeReport;
+  ollama_confirmed: boolean;
+  cost_classification: CostClassification;
+  fingerprint: string;
+  verified_at: number | null;
+  error_class: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  is_persistent_error: boolean;
+}
+
+export interface DeleteAiConnectionResponse extends AiConnectionState {
+  deactivated_provider: AiProvider | null;
+  credential_deleted: boolean;
+  remaining_credential_source: CredentialSource;
+  remaining_key_suffix: string | null;
+  remaining_can_delete_credential: boolean;
+}
+
+export interface OllamaModelItem {
+  name: string;
+  size_bytes: number | null;
+  context_length_limit: number | null;
+}
+
+export interface OllamaModelsResponse {
+  base_url: string;
+  openai_v1_url: string;
+  reachable: boolean;
+  ollama_confirmed: boolean;
+  models: OllamaModelItem[];
+  context_note: string;
+  error: string | null;
+}
+
+export type McpClientId = "claude_desktop" | "cursor" | "codex" | "claude_code";
+export type McpClientStatus =
+  | "configured"
+  | "not_configured"
+  | "not_installed"
+  | "invalid_path"
+  | "parse_error";
+
+export interface McpClientInfo {
+  client_id: McpClientId;
+  status: McpClientStatus;
+  config_exists: boolean;
+  lightbox_configured: boolean;
+  command_valid: boolean;
+  directory_valid: boolean;
+  config_path: string;
+}
+
+export interface McpClientsResponse {
+  clients: McpClientInfo[];
+}
+
+export interface McpSnippetResponse {
+  client_id: McpClientId;
+  format: "shell" | "toml" | "json";
+  config_path: string;
+  restart_required: boolean;
+  snippet: string;
+}
+
+export interface AppSettings {
+  language: Lang;
+  sensitivity: "conservative" | "standard";
+  model_profile: "local" | "balanced" | "best";
+  auto_supervisor: boolean;
+  budget: {
+    session_budget_usd: number;
+    monthly_budget_usd: number;
+  };
+  quarantine: {
+    strategy: "outside_library" | "sibling" | "subfolder";
+    auto_cleanup_days: number;
+  };
+  cache: {
+    max_gb: number;
+  };
+  ai: Record<string, unknown> | null;
+}
+
+export interface TriageEstimateResponse {
+  session_id: string;
+  dry_run: true;
+  yellow_count: number;
+  burst_count: number;
+  total_yellow_available: number;
+  total_bursts_available: number;
+  skipped_bursts_due_to_limit: number;
+  note: string | null;
+  total_units: number;
+  est_usd: number;
+  profile: string;
+  model_alias: string;
+  model_id: string;
+  provider: string;
+  vlm_backend_ready: boolean;
+  session_spent_usd: number;
+  session_budget_usd: number;
+  monthly_spent_usd: number;
+  monthly_budget_usd: number;
+  cost_classification: CostClassification;
+  requires_unpriced_confirmation: boolean;
+  unpriced_max_photos: number;
+}
+
+export interface TriageRunResponse {
+  job_id: string;
+  session_id: string;
+  status: string;
+  paused_reason?: string | null;
+  yellow_total?: number;
+  burst_total?: number;
+  reviewed_yellow?: number;
+  reviewed_bursts?: number;
+  failed_count?: number;
+  cache_hits?: number;
+  spent_usd?: number;
+  elapsed_s?: number;
+}
+
+export class ApiError extends Error {
+  status: number;
+  errorClass?: string;
+
+  constructor(message: string, status: number, errorClass?: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.errorClass = errorClass;
+  }
+}
+
 let csrfToken: string | null = null;
 
 export function setCsrfToken(token: string | null): void {
@@ -608,15 +838,29 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!resp.ok) {
     let detail = `HTTP ${resp.status}`;
+    let errorClass: string | undefined;
     try {
       const errJson = (await resp.json()) as { detail?: unknown };
       if (typeof errJson.detail === "string") {
         detail = errJson.detail;
+      } else if (errJson.detail && typeof errJson.detail === "object" && !Array.isArray(errJson.detail)) {
+        const obj = errJson.detail as { message?: unknown; error_class?: unknown };
+        if (typeof obj.error_class === "string") {
+          errorClass = obj.error_class;
+        }
+        if (typeof obj.message === "string" && obj.message) {
+          detail = obj.message;
+        }
+      } else if (Array.isArray(errJson.detail) && errJson.detail.length > 0) {
+        const first = errJson.detail[0] as { msg?: unknown };
+        if (typeof first?.msg === "string") {
+          detail = first.msg;
+        }
       }
     } catch {
       // ignore non-JSON error body
     }
-    throw new Error(detail);
+    throw new ApiError(detail, resp.status, errorClass);
   }
   return (await resp.json()) as T;
 }
@@ -854,11 +1098,124 @@ export const api = {
       },
     ),
 
+  getSettings: () => apiFetch<AppSettings>("/api/settings"),
+
+  updateSettings: (updates: {
+    language?: Lang;
+    sensitivity?: "conservative" | "standard";
+    model_profile?: "local" | "balanced" | "best";
+    auto_supervisor?: boolean;
+    budget?: {
+      session_budget_usd?: number;
+      monthly_budget_usd?: number;
+    };
+  }) =>
+    apiFetch<AppSettings>("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify(updates),
+    }),
+
   updateLanguage: (language: Lang) =>
     apiFetch<{ language: Lang }>("/api/settings", {
       method: "PUT",
       body: JSON.stringify({ language }),
     }),
+
+  getAiConnection: () => apiFetch<AiConnectionState>("/api/ai/connection"),
+
+  testAiConnection: (payload: {
+    provider?: AiProvider;
+    agent_model?: string;
+    triage_model?: string;
+    base_url?: string | null;
+    api_key?: string;
+    is_local_free?: boolean;
+  }) =>
+    apiFetch<AiConnectionTestResponse>("/api/ai/connection/test", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  saveAiConnection: (payload: {
+    provider: AiProvider;
+    agent_model?: string;
+    triage_model?: string;
+    base_url?: string | null;
+    api_key?: string;
+    reviewer?: string;
+    is_local_free?: boolean;
+    input_cost_per_mtok?: number | null;
+    output_cost_per_mtok?: number | null;
+    triage_input_cost_per_mtok?: number | null;
+    triage_output_cost_per_mtok?: number | null;
+    max_session_calls?: number;
+    max_triage_photos_unpriced?: number;
+  }) =>
+    apiFetch<AiConnectionState>("/api/ai/connection", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+
+  deleteAiConnection: (deleteCredential = true) =>
+    apiFetch<DeleteAiConnectionResponse>(
+      `/api/ai/connection?delete_credential=${deleteCredential ? "true" : "false"}`,
+      { method: "DELETE" },
+    ),
+
+  getOllamaModels: (baseUrl?: string) => {
+    const qs = baseUrl ? `?base_url=${encodeURIComponent(baseUrl)}` : "";
+    return apiFetch<OllamaModelsResponse>(`/api/ai/ollama/models${qs}`);
+  },
+
+  getMcpClients: () => apiFetch<McpClientsResponse>("/api/ai/mcp/clients"),
+
+  getMcpSnippet: (client: McpClientId) =>
+    apiFetch<McpSnippetResponse>("/api/ai/mcp/snippet", {
+      method: "POST",
+      body: JSON.stringify({ client }),
+    }),
+
+  estimateTriage: (
+    sessionId: string,
+    opts?: { maxPhotos?: number; profile?: string; budgetUsd?: number },
+  ) =>
+    apiFetch<TriageEstimateResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/triage`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          dry_run: true,
+          ...(opts?.maxPhotos !== undefined ? { max_photos: opts.maxPhotos } : {}),
+          ...(opts?.profile ? { profile: opts.profile } : {}),
+          ...(opts?.budgetUsd !== undefined ? { budget_usd: opts.budgetUsd } : {}),
+        }),
+      },
+    ),
+
+  runTriage: (
+    sessionId: string,
+    opts?: {
+      maxPhotos?: number;
+      profile?: string;
+      budgetUsd?: number;
+      wait?: boolean;
+      confirmUnpriced?: boolean;
+    },
+  ) =>
+    apiFetch<TriageRunResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/triage`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          dry_run: false,
+          wait: opts?.wait ?? true,
+          confirm_unpriced: opts?.confirmUnpriced ?? false,
+          ...(opts?.maxPhotos !== undefined ? { max_photos: opts.maxPhotos } : {}),
+          ...(opts?.profile ? { profile: opts.profile } : {}),
+          ...(opts?.budgetUsd !== undefined ? { budget_usd: opts.budgetUsd } : {}),
+        }),
+      },
+    ),
 
   searchPhotos: (opts: {
     q?: string;
