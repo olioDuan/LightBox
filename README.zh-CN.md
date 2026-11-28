@@ -1,5 +1,6 @@
 # LightBox
 
+[![PyPI](https://img.shields.io/pypi/v/lightbox-cull?style=flat-square&logo=pypi&logoColor=white&color=18181b)](https://pypi.org/project/lightbox-cull/)
 [![CI](https://img.shields.io/github/actions/workflow/status/olioDuan/LightBox/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/olioDuan/LightBox/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-18181b?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
 [![Zero Hard Delete](https://img.shields.io/badge/Safety-Zero%20Hard%20Delete-059669?style=flat-square)](scripts/check_no_delete.py)
@@ -21,38 +22,32 @@
 
 需要 Python 3.12+ 与 [uv](https://docs.astral.sh/uv/)。
 
+免克隆直接用浏览器打开：
+
 ```bash
-git clone https://github.com/olioDuan/LightBox.git
-cd LightBox
-uv sync --extra desktop
+uvx --from lightbox-cull lightbox ui
 ```
 
-启动桌面窗口：
+或直接启动原生桌面窗口：
 
 ```bash
-uv run lightbox app
+uvx --from 'lightbox-cull[desktop]' lightbox app
 ```
 
-生成系统双击启动图标（macOS `~/Applications/LightBox.app`、Windows `.lnk`、Linux `.desktop`）：
+如果想长期安装并生成系统双击启动图标（macOS `~/Applications/LightBox.app`、Windows `.lnk`、Linux `.desktop`）：
 
 ```bash
-uv run lightbox install-app
-```
-
-如果不想装 `pywebview`，直接用浏览器打开：
-
-```bash
-uv sync
-uv run lightbox ui
+uv tool install 'lightbox-cull[desktop]'
+lightbox install-app
 ```
 
 想先体验一下而不扫描自己的照片库：
 
 ```bash
-uv run lightbox demo
+uvx --from lightbox-cull lightbox demo
 ```
 
-可选扩展：HEIC 支持用 `uv sync --extra heic`；Linux 桌面窗口需要系统安装 GTK 绑定（`python3-gi gir1.2-webkit2-4.1`）或 `PySide6`。
+可选扩展：HEIC 支持可附加 `heic`（例如 `lightbox-cull[desktop,heic]`）；Linux 桌面窗口需要系统安装 GTK 绑定（`python3-gi gir1.2-webkit2-4.1`）或 `PySide6`。
 
 ## 方式二：接入 Claude / Cursor / Codex（Skill + MCP）
 
@@ -62,24 +57,33 @@ uv run lightbox demo
 
 ### 扫描本地整夹（MCP）
 
-把 MCP 配置指向本地仓库路径（也可以在软件内 **设置 -> 在 Claude / Cursor 中使用** 一键复制对应客户端的配置片段）：
+Claude Desktop / Cursor（也可以在软件内 **设置 -> 在 Claude / Cursor 中使用** 一键复制对应客户端的配置片段）：
 
 ```json
 {
   "mcpServers": {
     "lightbox": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/LightBox", "run", "lightbox", "mcp"]
+      "command": "uvx",
+      "args": ["--from", "lightbox-cull", "lightbox", "mcp"]
     }
   }
 }
 ```
 
-如果 GUI 客户端找不到 `uv`，将 `"uv"` 替换为终端 `which uv` 输出的绝对路径即可。
+Claude Code：
+
+```bash
+claude mcp add lightbox -- uvx --from lightbox-cull lightbox mcp
+```
+
+如果 GUI 客户端找不到 `uvx`，将 `"uvx"` 替换为终端 `which uvx` 输出的绝对路径即可。
 
 ## 本地开发与检查
 
 ```bash
+git clone https://github.com/olioDuan/LightBox.git
+cd LightBox
+uv sync
 uv run ruff check .
 uv run python scripts/check_no_delete.py
 uv run lint-imports

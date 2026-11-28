@@ -1,5 +1,6 @@
 # LightBox
 
+[![PyPI](https://img.shields.io/pypi/v/lightbox-cull?style=flat-square&logo=pypi&logoColor=white&color=18181b)](https://pypi.org/project/lightbox-cull/)
 [![CI](https://img.shields.io/github/actions/workflow/status/olioDuan/LightBox/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/olioDuan/LightBox/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-18181b?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
 [![Zero Hard Delete](https://img.shields.io/badge/Safety-Zero%20Hard%20Delete-059669?style=flat-square)](scripts/check_no_delete.py)
@@ -21,38 +22,32 @@ Local photo culling tool for photographers. Runs offline by default, never delet
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
+Run immediately in your browser without cloning:
+
 ```bash
-git clone https://github.com/olioDuan/LightBox.git
-cd LightBox
-uv sync --extra desktop
+uvx --from lightbox-cull lightbox ui
 ```
 
-Launch the desktop window:
+Or launch the native desktop window:
 
 ```bash
-uv run lightbox app
+uvx --from 'lightbox-cull[desktop]' lightbox app
 ```
 
-Or install a double-click app launcher (macOS `~/Applications/LightBox.app`, Windows `.lnk`, Linux `.desktop`):
+To install permanently and create a double-click app launcher (macOS `~/Applications/LightBox.app`, Windows `.lnk`, Linux `.desktop`):
 
 ```bash
-uv run lightbox install-app
-```
-
-Prefer running in your browser without `pywebview`:
-
-```bash
-uv sync
-uv run lightbox ui
+uv tool install 'lightbox-cull[desktop]'
+lightbox install-app
 ```
 
 Try it on generated sample photos without touching your own library:
 
 ```bash
-uv run lightbox demo
+uvx --from lightbox-cull lightbox demo
 ```
 
-Optional extras: `uv sync --extra heic` for HEIC support. On Linux, desktop mode requires system GTK (`python3-gi gir1.2-webkit2-4.1`) or `PySide6`.
+Optional extras: add `heic` (e.g. `lightbox-cull[desktop,heic]`) for HEIC support. On Linux, desktop mode requires system GTK (`python3-gi gir1.2-webkit2-4.1`) or `PySide6`.
 
 ## Option 2: Use with Claude, Cursor, or Codex (Skill + MCP)
 
@@ -62,24 +57,33 @@ Load `skills/lightbox-cull/SKILL.md` in your AI client (Codex, Claude Code, Curs
 
 ### Local folder workflows (MCP)
 
-Point your MCP client at the cloned repository (the in-app **Settings -> Use in Claude / Cursor** tab also generates ready-to-copy snippets for each client):
+Claude Desktop / Cursor (the in-app **Settings -> Use in Claude / Cursor** tab also generates ready-to-copy snippets for each client):
 
 ```json
 {
   "mcpServers": {
     "lightbox": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/LightBox", "run", "lightbox", "mcp"]
+      "command": "uvx",
+      "args": ["--from", "lightbox-cull", "lightbox", "mcp"]
     }
   }
 }
 ```
 
-GUI apps on macOS/Windows may not inherit your shell `PATH`; if needed, replace `"uv"` with the full path from `which uv`.
+Claude Code:
+
+```bash
+claude mcp add lightbox -- uvx --from lightbox-cull lightbox mcp
+```
+
+GUI apps on macOS/Windows may not inherit your shell `PATH`; if needed, replace `"uvx"` with the full path from `which uvx`.
 
 ## Development
 
 ```bash
+git clone https://github.com/olioDuan/LightBox.git
+cd LightBox
+uv sync
 uv run ruff check .
 uv run python scripts/check_no_delete.py
 uv run lint-imports
