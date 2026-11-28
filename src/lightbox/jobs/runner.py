@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 
+from lightbox.process_utils import get_process_create_time, is_process_owner_alive
 from lightbox.store import JobItemRecord, JobRecord, LightboxRepository
 
 HEARTBEAT_INTERVAL_S = 5.0
@@ -72,9 +75,12 @@ class JobRunner:
         session_id: str,
         job_id: str | None = None,
         budget_usd: float = 0.50,
+        owner_instance_id: str | None = None,
     ) -> JobRecord:
-        """Create a new job or resume an existing non-completed job."""
+        """Create a new job or resume an existing non-completed job, stamping process ownership."""
         now = time.time()
+        pid = os.getpid()
+        pid_started_at = get_process_create_time(pid)
         if job_id is not None:
             existing = self.repo.get_job(job_id)
             if existing is not None:
@@ -83,6 +89,9 @@ class JobRunner:
                     status="running",
                     clear_paused_reason=True,
                     heartbeat_at=now,
+                    owner_pid=pid,
+                    owner_pid_started_at=pid_started_at,
+                    owner_instance_id=owner_instance_id,
                 )
                 refreshed = self.repo.get_job(existing.id)
                 assert refreshed is not None
@@ -98,9 +107,58 @@ class JobRunner:
             budget_usd=budget_usd,
             spent_usd=0.0,
             heartbeat_at=now,
+            owner_pid=pid,
+            owner_pid_started_at=pid_started_at,
+            owner_instance_id=owner_instance_id,
         )
         self.repo.create_job(job)
         return job
+
+    def reconcile_orphaned_jobs(
+        self,
+        *,
+        current_instance_id: str | None = None,
+        live_instance_ids: Collection[str] | None = None,
+        legacy_stale_after_s: float = 300.0,
+    ) -> list[str]:
+        """Mark leftover `running`/`queued` jobs as `paused` ONLY when their owner process is dead or recycled.
+
+        Never pauses long-running jobs whose `(owner_pid, owner_pid_started_at)` still belongs
+        to a live process, and never pauses a same-PID job whose `owner_instance_id` still has
+        live daemon worker threads (prevents dual workers during desktop reconnect).
+        """
+        reconciled: list[str] = []
+        now = time.time()
+        my_pid = os.getpid()
+        live_set = set(live_instance_ids) if live_instance_ids is not None else set()
+        for job in self.repo.list_jobs():
+            if job.status not in {"running", "queued"}:
+                continue
+            if job.owner_pid is not None:
+                if not is_process_owner_alive(job.owner_pid, job.owner_pid_started_at):
+                    self.mark_paused(job.id, "owner_process_exited")
+                    reconciled.append(job.id)
+                    continue
+                # Same live process restarted an embedded server instance (e.g. desktop reconnect):
+                # ONLY mark paused if the previous instance has NO live workers still running!
+                if (
+                    job.owner_pid == my_pid
+                    and current_instance_id is not None
+                    and job.owner_instance_id is not None
+                    and job.owner_instance_id != current_instance_id
+                ):
+                    if job.owner_instance_id in live_set:
+                        continue
+                    self.mark_paused(job.id, "owner_instance_restarted")
+                    reconciled.append(job.id)
+                    continue
+            else:
+                # Legacy job row created before migration 006 (no owner_pid recorded)
+                hb = job.heartbeat_at if job.heartbeat_at is not None else job.created_at
+                if (now - hb) >= legacy_stale_after_s:
+                    self.mark_paused(job.id, "owner_unknown_stale")
+                    reconciled.append(job.id)
+        return reconciled
 
     def heartbeat(self, job_id: str) -> None:
         self.repo.update_job(job_id, heartbeat_at=time.time())
@@ -141,6 +199,7 @@ class JobRunner:
         max_workers: int = 1,
         use_process_pool: bool = False,
         on_progress: ProgressCallback | None = None,
+        stop_event: threading.Event | None = None,
     ) -> StageRunResult[TOut]:
         """Execute a stage idempotently with cache hits, resume skipping, retries, and heartbeat."""
         total = len(items)
@@ -294,6 +353,14 @@ class JobRunner:
 
                 paused_reason: str | None = None
                 while queue or in_flight:
+                    if stop_event is not None and stop_event.is_set() and paused_reason is None:
+                        paused_reason = "shutdown_requested"
+                        self.mark_paused(job_id, paused_reason)
+                        for pending_fut in list(in_flight.keys()):
+                            pending_fut.cancel()
+                        queue.clear()
+                        break
+
                     while queue and len(in_flight) < max_workers * 2 and paused_reason is None:
                         wi, prev_attempts = queue.pop(0)
                         fut = pool.submit(worker_fn, wi.payload)
@@ -302,9 +369,14 @@ class JobRunner:
                     if not in_flight:
                         break
 
+                    wait_timeout = (
+                        min(self.heartbeat_interval_s, 0.25)
+                        if stop_event is not None
+                        else self.heartbeat_interval_s
+                    )
                     done_futs, _ = wait(
                         set(in_flight.keys()),
-                        timeout=self.heartbeat_interval_s,
+                        timeout=wait_timeout,
                         return_when=FIRST_COMPLETED,
                     )
                     _maybe_heartbeat()
@@ -345,6 +417,20 @@ class JobRunner:
                     )
         else:
             for wi in pending_work:
+                if stop_event is not None and stop_event.is_set():
+                    self.mark_paused(job_id, "shutdown_requested")
+                    return StageRunResult(
+                        job_id=job_id,
+                        stage=stage,
+                        total=total,
+                        completed=completed,
+                        cache_hits=cache_hits,
+                        skipped_retryable=skipped_retryable,
+                        failed=failed,
+                        paused=True,
+                        paused_reason="shutdown_requested",
+                        results=results,
+                    )
                 cur_job = self.repo.get_job(job_id)
                 if cur_job is not None and cur_job.status == "paused":
                     return StageRunResult(

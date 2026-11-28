@@ -91,25 +91,47 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   if (!open) return null;
 
   const aiManaged = Boolean(aiConnQ.data?.configured || settingsQ.data?.ai);
+  const aiStatus = aiConnQ.data?.status;
+  const aiManagedDotClass =
+    aiStatus === "connected"
+      ? "bg-keep"
+      : aiStatus === "error"
+        ? "bg-reject"
+        : aiStatus === "configured_unverified"
+          ? "bg-unsure"
+          : "bg-ink-3";
+  const aiManagedLabel =
+    aiStatus === "error"
+      ? t.settingsProfileManagedByAiError
+      : aiStatus === "configured_unverified"
+        ? t.settingsProfileManagedByAiUnverified
+        : t.settingsProfileManagedByAi;
 
   async function handleSaveGeneral() {
-    setSaving(true);
     setSaveError(null);
     setSaveNotice(null);
-    const parsedSession = Number(sessionBudget);
-    const parsedMonthly = Number(monthlyBudget);
+    const trimmedSession = sessionBudget.trim();
+    const trimmedMonthly = monthlyBudget.trim();
+    const parsedSession = trimmedSession === "" ? Number.NaN : Number(trimmedSession);
+    const parsedMonthly = trimmedMonthly === "" ? Number.NaN : Number(trimmedMonthly);
+    if (
+      !Number.isFinite(parsedSession) ||
+      parsedSession < 0 ||
+      !Number.isFinite(parsedMonthly) ||
+      parsedMonthly < 0
+    ) {
+      setSaveError(t.settingsBudgetInvalidError);
+      return;
+    }
+    setSaving(true);
     try {
       const updated = await api.updateSettings({
         language: lang,
         sensitivity,
         ...(!aiManaged ? { model_profile: modelProfile } : {}),
         budget: {
-          ...(Number.isFinite(parsedSession) && parsedSession >= 0
-            ? { session_budget_usd: parsedSession }
-            : {}),
-          ...(Number.isFinite(parsedMonthly) && parsedMonthly >= 0
-            ? { monthly_budget_usd: parsedMonthly }
-            : {}),
+          session_budget_usd: parsedSession,
+          monthly_budget_usd: parsedMonthly,
         },
       });
       queryClient.setQueryData(["settings"], updated);
@@ -145,7 +167,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
 
   return (
     <Dialog labelledBy="settings-modal-title" onDismiss={onClose} width={600}>
-      <div className="flex max-h-[88vh] flex-col">
+      <div className="flex h-[min(600px,86vh)] flex-col">
         {/* Header */}
         <div className="flex shrink-0 flex-col gap-4 px-8 pb-4 pt-8">
           <div className="flex items-center justify-between gap-4">
@@ -209,8 +231,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     <span>{t.settingsModelProfile}</span>
                     {aiManaged && (
                       <span className="inline-flex items-center gap-1.5 rounded-chip bg-table px-2 py-0.5 text-xs font-medium text-ink">
-                        <span className="h-1.5 w-1.5 rounded-full bg-keep" />
-                        {t.settingsProfileManagedByAi}
+                        <span className={`h-1.5 w-1.5 rounded-full ${aiManagedDotClass}`} />
+                        {aiManagedLabel}
                       </span>
                     )}
                   </span>
@@ -312,13 +334,13 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 </ul>
               )}
 
-              {/* Selected client's native copy snippet */}
+              {/* Selected client's native copy snippet (flat single-surface layout, zero nested cards) */}
               {snippetLoading ? (
                 <Loading label={t.loading} className="py-6" />
               ) : snippetError ? (
                 <p className="text-sm text-reject-ink">{snippetError}</p>
               ) : snippet ? (
-                <div className="flex flex-col gap-3 rounded-panel bg-table p-4">
+                <div className="flex flex-col gap-3 pt-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
@@ -326,8 +348,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                           {t.mcpClientNames[snippet.client_id] ?? snippet.client_id}
                         </span>
                         {snippet.restart_required && (
-                          <span className="rounded-chip bg-paper px-2 py-0.5 text-xs text-ink-2">
-                            {t.mcpRestartBadge}
+                          <span className="text-xs text-ink-3">
+                            · {t.mcpRestartBadge}
                           </span>
                         )}
                       </div>
@@ -345,7 +367,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     </Button>
                   </div>
 
-                  <pre className="overflow-x-auto whitespace-pre rounded-btn bg-paper p-3 font-mono text-xs leading-5 text-ink">
+                  <pre className="overflow-x-auto whitespace-pre rounded-btn bg-table p-4 font-mono text-xs leading-5 text-ink">
                     {snippet.snippet}
                   </pre>
                 </div>

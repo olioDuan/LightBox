@@ -9,7 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +18,7 @@ from typing import Any
 from lightbox.config import DEFAULT_CONFIG_TOML, AIProviderName, AppConfig, load_config
 from lightbox.config_io import atomic_update_text
 from lightbox.core import find_exiftool, find_face_model_path
+from lightbox.jobs import JobRunner
 from lightbox.models import (
     find_face_embedder_model_path,
     find_siglip2_text_path,
@@ -34,6 +35,11 @@ from lightbox.services.ai_connection import (
     get_ai_connection_status,
     save_ai_connection,
     test_ai_connection,
+)
+from lightbox.services.app_installer import (
+    CommandRunner,
+    InstallAppResult,
+    install_desktop_app,
 )
 from lightbox.store import Database, LightboxRepository
 
@@ -365,6 +371,27 @@ class SystemService:
         """Generate copy-paste MCP configuration snippet for a validated client enum."""
         return generate_mcp_snippet(client, home_dir=home_dir, platform_name=platform_name)
 
+    def install_desktop_app(
+        self,
+        *,
+        include_desktop: bool = False,
+        target_dir: Path | None = None,
+        home_dir: Path | None = None,
+        platform_name: str | None = None,
+        python_executable: Path | None = None,
+        command_runner: CommandRunner | None = None,
+    ) -> InstallAppResult:
+        """Install native OS desktop launcher (macOS `.app`, Windows `.lnk`, Linux `.desktop`)."""
+        return install_desktop_app(
+            self.app_paths,
+            include_desktop=include_desktop,
+            target_dir=target_dir,
+            home_dir=home_dir,
+            platform_name=platform_name,
+            python_executable=python_executable,
+            command_runner=command_runner,
+        )
+
     def pick_folder(self) -> str | None:
         """Invoke native OS folder picker dialog; returns selected path or None if canceled."""
         if sys.platform == "darwin":
@@ -409,6 +436,19 @@ class SystemService:
             return True
         proc = subprocess.run(["xdg-open", str(target)], check=False, timeout=15)
         return proc.returncode == 0
+
+    def reconcile_orphaned_jobs(
+        self,
+        *,
+        current_instance_id: str | None = None,
+        live_instance_ids: Collection[str] | None = None,
+    ) -> list[str]:
+        """Heal leftover `running`/`queued` jobs whose owning OS process has exited or recycled PID."""
+        runner = JobRunner(LightboxRepository(self.db))
+        return runner.reconcile_orphaned_jobs(
+            current_instance_id=current_instance_id,
+            live_instance_ids=live_instance_ids,
+        )
 
     def record_audit_log(
         self,
@@ -546,4 +586,10 @@ def _dump_config_toml(cfg: AppConfig) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["DoctorCheckItem", "DoctorReport", "SystemService", "_dump_config_toml"]
+__all__ = [
+    "DoctorCheckItem",
+    "DoctorReport",
+    "InstallAppResult",
+    "SystemService",
+    "_dump_config_toml",
+]

@@ -122,7 +122,11 @@ class LocalUIBridge:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         if owned is not None:
-            clear_server_lock(app_paths=self.app_paths, only_if_pid=owned.pid)
+            clear_server_lock(
+                app_paths=self.app_paths,
+                only_if_pid=owned.pid,
+                only_if_instance_id=owned.instance_id,
+            )
 
     @property
     def owned_lock_info(self) -> ServerLockInfo | None:

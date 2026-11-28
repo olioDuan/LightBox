@@ -86,6 +86,14 @@ class AppPaths:
     def log_file(self) -> Path:
         return self.logs_dir / "lightbox.log"
 
+    @property
+    def desktop_log_file(self) -> Path:
+        return self.logs_dir / "desktop.log"
+
+    @property
+    def desktop_prev_log_file(self) -> Path:
+        return self.logs_dir / "desktop.prev.log"
+
     def ensure_dirs(self) -> None:
         """Create required application data subdirectories if missing."""
         for directory in (

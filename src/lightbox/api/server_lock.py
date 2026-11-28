@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from lightbox.paths import AppPaths, get_app_paths
+from lightbox.process_utils import is_pid_alive as _is_pid_alive
 
 LOCAL_HOST = "127.0.0.1"
 HEALTHZ_PATH = "/healthz"
@@ -31,18 +32,8 @@ class ServerLockInfo:
 
 
 def is_pid_alive(pid: int) -> bool:
-    """Return True if `pid` refers to an active OS process."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    """Return True if `pid` refers to an active OS process (cross-platform, no `os.kill(pid, 0)`)."""
+    return _is_pid_alive(pid)
 
 
 def is_server_responsive(info: ServerLockInfo, *, timeout_s: float = 0.5) -> bool:
@@ -158,16 +149,24 @@ def clear_server_lock(
     *,
     app_paths: AppPaths | None = None,
     only_if_pid: int | None = None,
+    only_if_instance_id: str | None = None,
 ) -> None:
     """Mark `<APP_DATA_DIR>/server.lock` as stopped without deleting files (no-unlink gate)."""
     paths = app_paths or get_app_paths()
     lock_path = paths.server_lock_file
     if not lock_path.is_file():
         return
-    if only_if_pid is not None:
+    if only_if_pid is not None or only_if_instance_id is not None:
         current = read_server_lock(app_paths=paths, check_alive=False)
-        if current is not None and current.pid != only_if_pid:
-            return
+        if current is not None:
+            if only_if_pid is not None and current.pid != only_if_pid:
+                return
+            if (
+                only_if_instance_id is not None
+                and current.instance_id
+                and current.instance_id != only_if_instance_id
+            ):
+                return
     lock_path.write_text(
         json.dumps({"pid": 0, "host": LOCAL_HOST, "port": 0, "stopped_at": time.time()}) + "\n",
         encoding="utf-8",

@@ -356,7 +356,75 @@ def ui(
         server.run()
     finally:
         fastapi_app.state.event_bus.close()
-        clear_server_lock(app_paths=paths, only_if_pid=os.getpid())
+        clear_server_lock(
+            app_paths=paths,
+            only_if_pid=os.getpid(),
+            only_if_instance_id=instance_id,
+        )
+
+
+@app.command(name="app")
+def desktop_app(
+    port: Annotated[
+        int,
+        typer.Option("--port", min=0, max=65535, help="Local TCP port on 127.0.0.1 (0 = auto)."),
+    ] = 0,
+) -> None:
+    """Launch Lightbox in a native desktop window (`pywebview`), falling back to browser UI if absent."""
+    from lightbox.cli.desktop import main as desktop_main
+
+    desktop_main(port=port)
+
+
+@app.command(name="install-app")
+def install_app(
+    desktop: Annotated[
+        bool,
+        typer.Option(
+            "--desktop",
+            help="Also place a Desktop alias/shortcut (macOS ~/Desktop, Windows Desktop, Linux Desktop).",
+        ),
+    ] = False,
+    target_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--dir",
+            help="Optional custom installation directory for the generated launcher.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON output."),
+    ] = False,
+) -> None:
+    """Install a native double-click desktop launcher (macOS .app / Windows .lnk / Linux .desktop)."""
+    with LightboxServices.open() as svcs:
+        try:
+            result = svcs.system.install_desktop_app(
+                include_desktop=desktop,
+                target_dir=target_dir,
+            )
+        except Exception as exc:
+            typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from None
+
+    if as_json:
+        typer.echo(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+        return
+
+    typer.echo(f"Installed LightBox launcher ({result.platform}): {result.primary_path}")
+    if result.desktop_path is not None:
+        typer.echo(f"Desktop shortcut : {result.desktop_path}")
+    target_cmd = (
+        f"{result.launcher_target} {' '.join(result.launcher_args)}"
+        if result.launcher_args
+        else str(result.launcher_target)
+    )
+    typer.echo(f"Target command   : {target_cmd} ({result.launcher_kind})")
+    if result.icon_path is not None:
+        typer.echo(f"Icon             : {result.icon_path}")
+    for note in result.notes:
+        typer.echo(f"Note             : {note}")
 
 
 @app.command()

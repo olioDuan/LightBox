@@ -13,6 +13,7 @@ from urllib.parse import urlparse, urlunparse
 
 import keyring
 
+from lightbox.config import AIConfigValidationError
 from lightbox.config_io import atomic_update_text
 from lightbox.logging import get_logger
 from lightbox.models.types import EndpointBindingError, MissingAPIKeyError
@@ -84,13 +85,22 @@ def mask_api_key_suffix(api_key: str) -> str:
 def _canonicalize_http_url(raw_url: str) -> str:
     cleaned = raw_url.strip()
     if not cleaned:
-        raise ValueError("Endpoint URL must not be empty.")
+        raise AIConfigValidationError(
+            "Endpoint URL must not be empty.",
+            error_class="invalid_base_url",
+        )
     parsed = urlparse(cleaned)
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
-        raise ValueError(f"Unsupported endpoint URL scheme {parsed.scheme!r}; only http/https allowed.")
+        raise AIConfigValidationError(
+            f"Unsupported endpoint URL scheme {parsed.scheme!r}; only http/https allowed.",
+            error_class="invalid_base_url",
+        )
     if not parsed.netloc:
-        raise ValueError(f"Invalid endpoint URL (missing host): {raw_url!r}")
+        raise AIConfigValidationError(
+            f"Invalid endpoint URL (missing host): {raw_url!r}",
+            error_class="invalid_base_url",
+        )
     host = parsed.netloc.lower()
     path = parsed.path.rstrip("/")
     return urlunparse((scheme, host, path, "", "", ""))
@@ -120,7 +130,10 @@ def normalize_endpoint(provider: str, base_url: str | None = None) -> str:
             return OFFICIAL_DEFAULT_ENDPOINTS[provider]
         if provider == "local":
             return "http://127.0.0.1:8080/v1"
-        raise ValueError(f"Provider {provider!r} requires an explicit base_url.")
+        raise AIConfigValidationError(
+            f"Provider {provider!r} requires an explicit base_url.",
+            error_class="missing_base_url",
+        )
     return _canonicalize_http_url(raw)
 
 

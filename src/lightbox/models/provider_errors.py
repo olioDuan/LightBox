@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +29,7 @@ TRANSIENT_ERROR_CLASSES: frozenset[str] = frozenset(
     {
         "rate_limited",
         "network_timeout",
+        "service_unreachable",
         "local_budget_exceeded",
         "session_call_limit_exceeded",
     }
@@ -113,6 +115,18 @@ def _extract_provider_code_from_body(body: Any) -> str | None:
     return None
 
 
+def _iter_exc_chain(exc: BaseException) -> list[BaseException]:
+    """Walk `__cause__` and `__context__` without cycling."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        chain.append(cur)
+        cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+    return chain
+
+
 def extract_sdk_error_meta(exc: BaseException) -> tuple[int | None, str | None]:
     """Extract `(status_code, provider_code)` safely from Anthropic/OpenAI SDK exceptions."""
     status_raw = getattr(exc, "status_code", None)
@@ -177,7 +191,7 @@ def classify_provider_error(provider: str, exc: BaseException) -> MappedProvider
         status_code = status_code if status_code is not None else c_status
         provider_code = provider_code or c_code
 
-    raw_code = provider_code or (str(status_code) if status_code is not None else type(exc).__name__)
+    raw_code = provider_code or (str(status_code) if status_code is not None else None)
 
     if preset_class:
         return MappedProviderError(
@@ -266,16 +280,53 @@ def classify_provider_error(provider: str, exc: BaseException) -> MappedProvider
             message=str(exc),
         )
 
-    # 4. Connection / timeout exception type or text heuristics
-    exc_chain_names = {type(exc).__name__.lower()}
-    if exc.__cause__ is not None:
-        exc_chain_names.add(type(exc.__cause__).__name__.lower())
-    if any(
-        any(tok in name for tok in ("timeout", "connection", "connecterror", "network"))
-        for name in exc_chain_names
-    ) or any(tok in msg_lower for tok in ("timed out", "connection error", "connection refused", "connect error")):
+    # 4. Connection / DNS / timeout exception chain & message heuristics
+    exc_chain = _iter_exc_chain(exc)
+    exc_chain_names = {type(item).__name__.lower() for item in exc_chain}
+    chain_text = " ".join(str(item).lower() for item in exc_chain)
+
+    if (
+        any(isinstance(item, TimeoutError) for item in exc_chain)
+        or any("timeout" in name for name in exc_chain_names)
+        or any(
+            tok in chain_text
+            for tok in ("timed out", "read timeout", "connect timeout", "request timeout", "deadline exceeded")
+        )
+    ):
         return MappedProviderError(
             error_class="network_timeout",
+            is_persistent=False,
+            raw_code=raw_code,
+            status_code=status_code,
+            message=str(exc),
+        )
+
+    if (
+        any(isinstance(item, (socket.gaierror, ConnectionError)) for item in exc_chain)
+        or any(
+            any(tok in name for tok in ("connecterror", "apiconnectionerror", "gaierror", "connection", "networkerror"))
+            for name in exc_chain_names
+        )
+        or any(
+            tok in chain_text
+            for tok in (
+                "nodename nor servname",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "getaddrinfo failed",
+                "failed to resolve",
+                "connection error",
+                "connection refused",
+                "connect error",
+                "network is unreachable",
+                "host is unreachable",
+                "cannot assign requested address",
+                "certificate verify failed",
+            )
+        )
+    ):
+        return MappedProviderError(
+            error_class="service_unreachable",
             is_persistent=False,
             raw_code=raw_code,
             status_code=status_code,

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import io
+import os
+import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -30,6 +32,7 @@ from lightbox.i18n import (
     REASON_VLM_UNSURE,
 )
 from lightbox.models import (
+    ACTIVE_AI_PROFILE_NAME,
     BudgetExceededError,
     CostClassification,
     ImageInput,
@@ -39,6 +42,8 @@ from lightbox.models import (
 )
 from lightbox.models.secrets import has_api_key
 from lightbox.paths import AppPaths, get_app_paths
+from lightbox.process_utils import get_process_create_time
+from lightbox.services.ai_connection import get_ai_connection_status
 from lightbox.services.burst import BurstDetail, BurstService
 from lightbox.services.review import (
     BucketName,
@@ -266,6 +271,23 @@ class TriageService:
             if session_budget_usd is not None
             else self.config.budget.session_budget_usd
         )
+        backend_ready = has_api_key(
+            spec.provider,
+            app_paths=self.app_paths,
+            base_url=spec.base_url,
+        )
+        if backend_ready and self.config.ai is not None and prof_name == ACTIVE_AI_PROFILE_NAME:
+            conn_status = get_ai_connection_status(self.app_paths, self.repo.db)
+            if (
+                conn_status.get("status") == "error"
+                or conn_status.get("triage_error") is not None
+                or (
+                    conn_status.get("triage_probes") is not None
+                    and not bool(conn_status.get("triage_ready"))
+                )
+            ):
+                backend_ready = False
+
         return TriageEstimate(
             session_id=session_id,
             dry_run=True,
@@ -277,11 +299,7 @@ class TriageService:
             model_alias=alias,
             model_id=spec.model_id,
             provider=spec.provider,
-            vlm_backend_ready=has_api_key(
-                spec.provider,
-                app_paths=self.app_paths,
-                base_url=spec.base_url,
-            ),
+            vlm_backend_ready=backend_ready,
             session_spent_usd=round(session_spent, 6),
             session_budget_usd=sess_limit,
             monthly_spent_usd=round(monthly_spent, 6),
@@ -302,6 +320,7 @@ class TriageService:
         profile: str | None = None,
         session_budget_usd: float | None = None,
         confirm_unpriced: bool = False,
+        owner_instance_id: str | None = None,
     ) -> str:
         """Validate session + model credentials and persist a `queued` job row for async execution."""
         if self.repo.get_session(session_id) is None:
@@ -319,6 +338,7 @@ class TriageService:
         )
         job_id = f"triage_{uuid.uuid4().hex[:12]}"
         now = time.time()
+        pid = os.getpid()
         self.repo.create_job(
             JobRecord(
                 id=job_id,
@@ -329,6 +349,9 @@ class TriageService:
                 budget_usd=eff_budget,
                 spent_usd=0.0,
                 heartbeat_at=now,
+                owner_pid=pid,
+                owner_pid_started_at=get_process_create_time(pid),
+                owner_instance_id=owner_instance_id,
             )
         )
         return job_id
@@ -608,6 +631,8 @@ class TriageService:
         job_id: str | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
         confirm_unpriced: bool = False,
+        stop_event: threading.Event | None = None,
+        owner_instance_id: str | None = None,
     ) -> TriageResult:
         """Execute concurrent L3 VLM triage on uncertain photos and unconfirmed bursts."""
         alias, spec = self.model_router.resolve_spec("triage_vlm", profile=profile)
@@ -631,6 +656,8 @@ class TriageService:
             else self.config.budget.session_budget_usd
         )
         now = time.time()
+        pid = os.getpid()
+        pid_started_at = get_process_create_time(pid)
         if job_id is not None and self.repo.get_job(job_id) is not None:
             resolved_job_id = job_id
             self.repo.update_job(
@@ -638,6 +665,9 @@ class TriageService:
                 status="running",
                 clear_paused_reason=True,
                 heartbeat_at=now,
+                owner_pid=pid,
+                owner_pid_started_at=pid_started_at,
+                owner_instance_id=owner_instance_id,
             )
         else:
             resolved_job_id = job_id or f"triage_{uuid.uuid4().hex[:12]}"
@@ -651,6 +681,9 @@ class TriageService:
                     budget_usd=eff_budget,
                     spent_usd=0.0,
                     heartbeat_at=now,
+                    owner_pid=pid,
+                    owner_pid_started_at=pid_started_at,
+                    owner_instance_id=owner_instance_id,
                 )
             )
 
@@ -729,12 +762,12 @@ class TriageService:
 
         async def _process_yellow(photo: PhotoRecord) -> None:
             nonlocal first_error
-            if budget_stop.is_set():
+            if budget_stop.is_set() or (stop_event is not None and stop_event.is_set()):
                 return
             try:
                 crop_img, ctx_img, crop_region = self._build_yellow_images(photo.id)
                 msgs = self._build_yellow_messages(photo, crop_img, ctx_img)
-                if budget_stop.is_set():
+                if budget_stop.is_set() or (stop_event is not None and stop_event.is_set()):
                     return
                 res = await self.model_router.generate(
                     role="triage_vlm",
@@ -846,12 +879,12 @@ class TriageService:
 
         async def _process_burst(burst_detail: BurstDetail) -> None:
             nonlocal first_error
-            if budget_stop.is_set():
+            if budget_stop.is_set() or (stop_event is not None and stop_event.is_set()):
                 return
             try:
                 member_ids, images = self._build_burst_images(burst_detail)
                 msgs = self._build_burst_messages(burst_detail, member_ids, images)
-                if budget_stop.is_set():
+                if budget_stop.is_set() or (stop_event is not None and stop_event.is_set()):
                     return
                 res = await self.model_router.generate(
                     role="triage_vlm",
@@ -944,9 +977,19 @@ class TriageService:
         failed_count = failed_yellow + failed_bursts
         reviewed_total = int(counts["reviewed_yellow"]) + int(counts["reviewed_bursts"])
 
-        if budget_stop.is_set():
+        if stop_event is not None and stop_event.is_set():
             status: TriageStatus = "paused"
-            paused_reason: str | None = "budget_exceeded"
+            paused_reason: str | None = "shutdown_requested"
+            self.repo.update_job(
+                resolved_job_id,
+                status="paused",
+                paused_reason="shutdown_requested",
+                spent_usd=spent,
+                heartbeat_at=time.time(),
+            )
+        elif budget_stop.is_set():
+            status = "paused"
+            paused_reason = "budget_exceeded"
             self.repo.update_job(
                 resolved_job_id,
                 status="paused",
@@ -1017,6 +1060,8 @@ class TriageService:
         job_id: str | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
         confirm_unpriced: bool = False,
+        stop_event: threading.Event | None = None,
+        owner_instance_id: str | None = None,
     ) -> TriageResult:
         """Synchronous wrapper around `run_triage` for CLI, worker threads, and sync ToolRegistry handlers."""
         coro = self.run_triage(
@@ -1028,6 +1073,8 @@ class TriageService:
             job_id=job_id,
             on_progress=on_progress,
             confirm_unpriced=confirm_unpriced,
+            stop_event=stop_event,
+            owner_instance_id=owner_instance_id,
         )
         try:
             asyncio.get_running_loop()

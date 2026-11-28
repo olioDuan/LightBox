@@ -123,6 +123,7 @@ interface ReviewViewProps {
   sessionId: string;
   onBack: () => void;
   onGoInsights: () => void;
+  onOpenAgent?: () => void;
 }
 
 function formatSeq(seqNo: number, total: number): string {
@@ -207,7 +208,7 @@ function getSlideVisual(
   };
 }
 
-export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps) {
+export function ReviewView({ sessionId, onBack, onGoInsights, onOpenAgent }: ReviewViewProps) {
   const { lang, t } = useI18n();
   const queryClient = useQueryClient();
 
@@ -232,11 +233,17 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
   const [verifyingPlan, setVerifyingPlan] = useState(false);
   const [triageEstimate, setTriageEstimate] = useState<TriageEstimateResponse | null>(null);
   const [triageLoading, setTriageLoading] = useState(false);
-  const [triageRunning, setTriageRunning] = useState(false);
+  const [triageStarting, setTriageStarting] = useState(false);
+  const [triageJob, setTriageJob] = useState<{ jobId: string; done: number; total: number } | null>(
+    null,
+  );
+  const [triageBlockedError, setTriageBlockedError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const positionedTokenRef = useRef<number>(0);
+  const finishedTriageJobRef = useRef<string | null>(null);
   const [justMarkedId, setJustMarkedId] = useJustMarked();
+  const triageRunning = triageStarting || triageJob !== null;
 
   // Reset per-session state when switching sessions
   useEffect(() => {
@@ -247,6 +254,9 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
     setSkippedIds([]);
     setLastAction(null);
     setSelectedIdx(0);
+    setTriageEstimate(null);
+    setTriageJob(null);
+    setTriageBlockedError(null);
     setToast(null);
     positionedTokenRef.current = 0;
     setAllEntryToken((tok) => tok + 1);
@@ -673,44 +683,185 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
   const handleOpenTriage = useCallback(async () => {
     setError(null);
     setToast(null);
+    setTriageBlockedError(null);
     setTriageLoading(true);
     try {
+      const conn = await queryClient.fetchQuery({
+        queryKey: ["ai-connection"],
+        queryFn: () => api.getAiConnection(),
+        staleTime: 0,
+      });
+      if (conn.configured && !conn.triage_ready) {
+        setTriageBlockedError(t.triageBlockedNotReady);
+        return;
+      }
       const est = await api.estimateTriage(sessionId);
+      if (est.total_units > 0 && !est.vlm_backend_ready) {
+        setTriageBlockedError(t.triageBlockedNotReady);
+        return;
+      }
       setTriageEstimate(est);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setTriageLoading(false);
     }
-  }, [sessionId]);
+  }, [queryClient, sessionId, t.triageBlockedNotReady]);
 
   const handleConfirmTriage = useCallback(async () => {
     if (!triageEstimate || triageRunning) return;
     setError(null);
-    setTriageRunning(true);
+    setTriageBlockedError(null);
+    setTriageStarting(true);
+    const totalUnits = triageEstimate.total_units;
+    const confirmUnpriced = triageEstimate.requires_unpriced_confirmation;
     try {
       const res = await api.runTriage(sessionId, {
-        wait: true,
-        confirmUnpriced: triageEstimate.requires_unpriced_confirmation,
+        wait: false,
+        confirmUnpriced,
       });
       setTriageEstimate(null);
-      setToast(
-        t.triageDoneToast(
-          res.reviewed_yellow ?? 0,
-          res.reviewed_bursts ?? 0,
-          res.failed_count ?? 0,
-        ),
-      );
-      await refreshSession();
-      void queryClient.invalidateQueries({ queryKey: ["llm-traces"] });
+      if (
+        res.status === "completed" ||
+        res.status === "completed_with_errors" ||
+        res.status === "paused" ||
+        res.status === "failed"
+      ) {
+        if (res.status === "failed") {
+          setError(t.triageFailedToast(res.paused_reason));
+        } else {
+          setToast(
+            t.triageDoneToast(
+              res.reviewed_yellow ?? 0,
+              res.reviewed_bursts ?? 0,
+              res.failed_count ?? 0,
+            ),
+          );
+        }
+        await refreshSession();
+        void queryClient.invalidateQueries({ queryKey: ["llm-traces"] });
+        void queryClient.invalidateQueries({ queryKey: ["ai-connection"] });
+      } else {
+        finishedTriageJobRef.current = null;
+        setTriageJob({ jobId: res.job_id, done: 0, total: totalUnits });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setTriageEstimate(null);
-    } finally {
       void queryClient.invalidateQueries({ queryKey: ["ai-connection"] });
-      setTriageRunning(false);
+    } finally {
+      setTriageStarting(false);
     }
   }, [queryClient, refreshSession, sessionId, t, triageEstimate, triageRunning]);
+
+  // Track async triage job progress via SSE with polling fallback
+  useEffect(() => {
+    if (!triageJob) return;
+    const activeJobId = triageJob.jobId;
+    let cancelled = false;
+
+    const finalize = (
+      status: string,
+      reviewedYellow: number,
+      reviewedBursts: number,
+      failedCount: number,
+      pausedReason?: string | null,
+    ) => {
+      if (cancelled || finishedTriageJobRef.current === activeJobId) return;
+      finishedTriageJobRef.current = activeJobId;
+      setTriageJob(null);
+      if (status === "failed") {
+        setError(t.triageFailedToast(pausedReason));
+      } else {
+        setToast(t.triageDoneToast(reviewedYellow, reviewedBursts, failedCount));
+      }
+      void refreshSession();
+      void queryClient.invalidateQueries({ queryKey: ["llm-traces"] });
+      void queryClient.invalidateQueries({ queryKey: ["ai-connection"] });
+    };
+
+    const isTerminal = (status?: string) =>
+      status === "completed" ||
+      status === "completed_with_errors" ||
+      status === "paused" ||
+      status === "failed";
+
+    const es = new EventSource(`/api/events?session_id=${encodeURIComponent(sessionId)}`);
+    const onProgress = (evt: MessageEvent<string>) => {
+      try {
+        const data = JSON.parse(evt.data) as {
+          job_id?: string;
+          done?: number;
+          total?: number;
+          status?: string;
+          paused_reason?: string | null;
+          reviewed_yellow?: number;
+          reviewed_bursts?: number;
+          failed_count?: number;
+        };
+        if (data.job_id !== activeJobId) return;
+        if (isTerminal(data.status)) {
+          finalize(
+            data.status!,
+            data.reviewed_yellow ?? 0,
+            data.reviewed_bursts ?? 0,
+            data.failed_count ?? 0,
+            data.paused_reason,
+          );
+          return;
+        }
+        setTriageJob((prev) =>
+          prev && prev.jobId === activeJobId
+            ? {
+                ...prev,
+                done: typeof data.done === "number" ? data.done : prev.done,
+                total: typeof data.total === "number" && data.total > 0 ? data.total : prev.total,
+              }
+            : prev,
+        );
+      } catch {
+        // ignore malformed SSE event
+      }
+    };
+    es.addEventListener("job.progress", onProgress as EventListener);
+
+    const pollTimer = window.setInterval(() => {
+      void api
+        .getJob(activeJobId)
+        .then((st) => {
+          if (cancelled) return;
+          if (isTerminal(st.status)) {
+            finalize(
+              st.status,
+              st.reviewed_yellow ?? st.done,
+              st.reviewed_bursts ?? 0,
+              st.failed_count ?? 0,
+              st.paused_reason,
+            );
+            return;
+          }
+          const processed = st.done + (st.failed_count ?? 0);
+          setTriageJob((prev) =>
+            prev && prev.jobId === activeJobId
+              ? {
+                  ...prev,
+                  done: Math.max(prev.done, processed),
+                  total: Math.max(prev.total, st.total),
+                }
+              : prev,
+          );
+        })
+        .catch(() => {
+          // transient poll failure; retry next tick
+        });
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      es.close();
+      window.clearInterval(pollTimer);
+    };
+  }, [queryClient, refreshSession, sessionId, t, triageJob?.jobId]);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -917,15 +1068,29 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {(yellowCount > 0 || (summary?.unconfirmed_burst_count ?? 0) > 0) && (
-            <Button
-              variant="secondary"
-              icon={Sparkles}
-              disabled={triageLoading || triageRunning}
-              onClick={() => void handleOpenTriage()}
-            >
-              {triageRunning ? t.triageRunningBtn : t.triageRunBtn}
-            </Button>
+          {triageJob ? (
+            <div className="inline-flex h-10 items-center gap-3 rounded-btn bg-table px-4 text-sm text-ink tabular-nums">
+              <ProgressLine
+                value={
+                  triageJob.total > 0
+                    ? Math.min(100, Math.round((triageJob.done / triageJob.total) * 100))
+                    : 0
+                }
+                className="w-20 shrink-0"
+              />
+              <span>{t.triageProgressLabel(triageJob.done, triageJob.total)}</span>
+            </div>
+          ) : (
+            (yellowCount > 0 || (summary?.unconfirmed_burst_count ?? 0) > 0) && (
+              <Button
+                variant="secondary"
+                icon={Sparkles}
+                disabled={triageLoading || triageRunning}
+                onClick={() => void handleOpenTriage()}
+              >
+                {triageRunning ? t.triageRunningBtn : t.triageRunBtn}
+              </Button>
+            )
           )}
           {tab !== "revisit" &&
             tab !== "bursts" &&
@@ -1370,6 +1535,28 @@ export function ReviewView({ sessionId, onBack, onGoInsights }: ReviewViewProps)
             ]}
           >
             {toast}
+          </Notice>
+        )}
+        {triageBlockedError && (
+          <Notice
+            tone="error"
+            onDismiss={() => setTriageBlockedError(null)}
+            dismissLabel={t.uiDismiss}
+            actions={
+              onOpenAgent
+                ? [
+                    {
+                      label: t.triageOpenAiConfigBtn,
+                      onClick: () => {
+                        setTriageBlockedError(null);
+                        onOpenAgent();
+                      },
+                    },
+                  ]
+                : undefined
+            }
+          >
+            {triageBlockedError}
           </Notice>
         )}
         {error && (

@@ -7,6 +7,7 @@ import {
   type AiConnectionTestResponse,
   type AiProvider,
   type OllamaModelsResponse,
+  type ProbeCheckResult,
 } from "../api";
 import { useI18n } from "../i18n";
 import { Button } from "./ui";
@@ -22,10 +23,51 @@ const PROVIDERS: AiProvider[] = ["anthropic", "openai", "gemini", "ollama", "cus
 function formatVerifiedTime(ts: number | null): string | null {
   if (!ts) return null;
   try {
-    return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const d = new Date(ts * 1000);
+    if (Number.isNaN(d.getTime())) return null;
+    const now = new Date();
+    const pad2 = (n: number) => String(n).padStart(2, "0");
+    const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    const sameDay =
+      d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() &&
+      d.getDate() === now.getDate();
+    if (sameDay && Math.abs(now.getTime() - d.getTime()) < 24 * 60 * 60 * 1000) {
+      return hm;
+    }
+    const md = `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    if (d.getFullYear() === now.getFullYear()) {
+      return `${md} ${hm}`;
+    }
+    return `${d.getFullYear()}-${md} ${hm}`;
   } catch {
     return null;
   }
+}
+
+const CONNECTIVITY_OR_ACCOUNT_ERROR_CLASSES = new Set([
+  "auth_failed",
+  "insufficient_balance",
+  "model_or_endpoint_unavailable",
+  "endpoint_binding_mismatch",
+  "service_unreachable",
+  "network_timeout",
+  "rate_limited",
+]);
+
+function isDisplayableErrorCode(
+  code: string | null | undefined,
+  errorClass: string | null | undefined,
+  knownClasses: Record<string, string>,
+): boolean {
+  if (!code) return false;
+  const trimmed = code.trim();
+  if (!trimmed) return false;
+  if (errorClass && trimmed === errorClass) return false;
+  if (trimmed in knownClasses) return false;
+  // Never leak Python internal exception class names (e.g. ModelError, ValueError, RuntimeError)
+  if (/^[A-Z][A-Za-z0-9_]*(Error|Exception)$/.test(trimmed)) return false;
+  return true;
 }
 
 function parseOptionalNumber(raw: string): number | null {
@@ -42,7 +84,28 @@ function formatKeySuffix(suffix: string | null | undefined): string {
     : `····${suffix}`;
 }
 
-function ProbeTag({ label, ok }: { label: string; ok: boolean }) {
+function ProbeTag({
+  label,
+  probe,
+  fallbackUntested,
+  untestedLabel,
+}: {
+  label: string;
+  probe: ProbeCheckResult;
+  fallbackUntested?: boolean;
+  untestedLabel: string;
+}) {
+  const status =
+    probe.status ?? (probe.ok ? "passed" : fallbackUntested ? "untested" : "failed");
+  if (status === "untested") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-ink-3">
+        <span>{label}</span>
+        <span>{untestedLabel}</span>
+      </span>
+    );
+  }
+  const ok = status === "passed";
   return (
     <span className={`inline-flex items-center gap-1 text-xs ${ok ? "text-keep-ink" : "text-reject-ink"}`}>
       {ok ? <Check size={12} strokeWidth={2} /> : <X size={12} strokeWidth={2} />}
@@ -89,6 +152,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [confirmDeleteCred, setConfirmDeleteCred] = useState(false);
   const [ollamaLoading, setOllamaLoading] = useState(false);
   const [ollamaData, setOllamaData] = useState<OllamaModelsResponse | null>(null);
   const [testResult, setTestResult] = useState<AiConnectionTestResponse | null>(null);
@@ -133,6 +197,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
     setTestResult(null);
     setFormError(null);
     setFormNotice(null);
+    setConfirmDeleteCred(false);
     setOllamaData(null);
     if (conn && conn.configured && conn.provider === next) {
       syncFormFromConn(conn);
@@ -142,7 +207,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
     setAgentModel(preset?.agent_model ?? "");
     setTriageModel(preset?.triage_model ?? "");
     setBaseUrl(next === "ollama" ? preset?.default_base_url ?? "http://127.0.0.1:11434" : "");
-    setIsLocalFree(next === "ollama");
+    setIsLocalFree(false);
     setInputCost("");
     setOutputCost("");
     setTriageInputCost("");
@@ -150,11 +215,38 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
     setShowPricing(false);
   }
 
+  function formatErrorClass(
+    errorClass: string | null | undefined,
+    errorCode?: string | null,
+    fallbackMsg?: string | null,
+  ): string {
+    if (errorClass) {
+      const mapped = t.aiErrorClassLabels[errorClass] ?? errorClass;
+      const suffix = isDisplayableErrorCode(errorCode, errorClass, t.aiErrorClassLabels)
+        ? ` (${errorCode})`
+        : "";
+      return `${mapped}${suffix}`;
+    }
+    return fallbackMsg || t.aiErrorClassLabels.request_failed;
+  }
+
   function formatApiError(err: unknown): string {
     if (err instanceof ApiError && err.errorClass && t.aiErrorClassLabels[err.errorClass]) {
       return t.aiErrorClassLabels[err.errorClass];
     }
     return err instanceof Error ? err.message : String(err);
+  }
+
+  function validateRequiredFields(): boolean {
+    if (provider === "custom" && !baseUrl.trim()) {
+      setFormError(t.aiErrorClassLabels.missing_base_url);
+      return false;
+    }
+    if (provider === "custom" && !agentModel.trim()) {
+      setFormError(t.aiErrorClassLabels.missing_model);
+      return false;
+    }
+    return true;
   }
 
   function validatePricingInputs(): {
@@ -214,7 +306,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
       triage_model: triageModel.trim() || undefined,
       base_url: baseUrl.trim() || null,
       ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
-      is_local_free: provider === "ollama" ? true : isLocalFree,
+      is_local_free: provider === "custom" ? isLocalFree : false,
       input_cost_per_mtok: costs.input_cost_per_mtok,
       output_cost_per_mtok: costs.output_cost_per_mtok,
       triage_input_cost_per_mtok: costs.triage_input_cost_per_mtok,
@@ -231,6 +323,8 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
   async function handleTestAndConnect() {
     setFormError(null);
     setFormNotice(null);
+    setConfirmDeleteCred(false);
+    if (!validateRequiredFields()) return;
     const costs = validatePricingInputs();
     if (!costs.ok) return;
 
@@ -242,7 +336,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
         triage_model: triageModel.trim() || undefined,
         base_url: baseUrl.trim() || null,
         ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
-        is_local_free: provider === "ollama" ? true : isLocalFree,
+        is_local_free: provider === "custom" ? isLocalFree : false,
       });
       setTestResult(res);
       if (res.overall_ok) {
@@ -250,12 +344,8 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
         setExpanded(false);
       } else {
         void queryClient.invalidateQueries({ queryKey: ["ai-connection"] });
-        if (res.error_class) {
-          const mapped = t.aiErrorClassLabels[res.error_class] ?? res.error_class;
-          const suffix = res.error_code ? ` (${res.error_code})` : "";
-          setFormError(`${mapped}${suffix}`);
-        } else if (res.error_message) {
-          setFormError(res.error_message);
+        if (res.error_class || res.error_message) {
+          setFormError(formatErrorClass(res.error_class, res.error_code, res.error_message));
         }
       }
     } catch (err) {
@@ -268,6 +358,8 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
   async function handleSaveOnly() {
     setFormError(null);
     setFormNotice(null);
+    setConfirmDeleteCred(false);
+    if (!validateRequiredFields()) return;
     const costs = validatePricingInputs();
     if (!costs.ok) return;
 
@@ -286,6 +378,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
   async function handleDelete(deleteCredential: boolean) {
     setFormError(null);
     setFormNotice(null);
+    setConfirmDeleteCred(false);
     setDeleting(true);
     try {
       const res = await api.deleteAiConnection(deleteCredential);
@@ -350,17 +443,21 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
 
   const errorBannerText = (() => {
     if (!conn || conn.status !== "error" || !conn.error) return null;
-    const cls = conn.error.error_class;
-    const base = t.aiErrorClassLabels[cls] ?? cls;
-    const code = conn.error.error_code ? ` (${conn.error.error_code})` : "";
+    const base = formatErrorClass(conn.error.error_class, conn.error.error_code, conn.error.message);
     const rolePrefix =
       conn.error.role === "triage_vlm"
         ? `${t.aiRoleTriage}: `
         : conn.error.role === "agent"
           ? `${t.aiRoleAgent}: `
           : "";
-    return `${rolePrefix}${base}${code}`;
+    return `${rolePrefix}${base}`;
   })();
+
+  const activeErrorClass = testResult?.error_class ?? conn?.error?.error_class ?? null;
+  const fallbackProbesUntested = Boolean(
+    activeErrorClass && CONNECTIVITY_OR_ACCOUNT_ERROR_CLASSES.has(activeErrorClass),
+  );
+  const showBannerError = Boolean(errorBannerText) && !(expanded && formError);
 
   const transientText = (() => {
     if (!conn?.transient_notice) return null;
@@ -415,7 +512,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
             )}
           </div>
 
-          {errorBannerText && <p className="text-xs text-reject-ink">{errorBannerText}</p>}
+          {showBannerError && <p className="text-xs text-reject-ink">{errorBannerText}</p>}
           {!errorBannerText && showRoleDegraded && (
             <p className="text-xs text-unsure-ink">{t.aiAgentDisabledHint}</p>
           )}
@@ -430,6 +527,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
           onClick={() => {
             setExpanded((prev) => !prev);
             setFormError(null);
+            setConfirmDeleteCred(false);
             if (!expanded && conn) {
               syncFormFromConn(conn);
             }
@@ -481,17 +579,26 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
 
           {/* Base URL (Ollama with model fetch, Custom required, Cloud optional) */}
           <div className="flex flex-col gap-1 text-xs text-ink-2">
-            <span>{provider === "ollama" ? t.aiFieldOllamaBaseUrl : t.aiFieldBaseUrl}</span>
+            <span>
+              {provider === "ollama"
+                ? t.aiFieldOllamaBaseUrl
+                : provider === "custom"
+                  ? t.aiFieldBaseUrlRequired
+                  : t.aiFieldBaseUrl}
+            </span>
             <div className="flex items-center gap-2">
               <input
                 type="text"
                 value={baseUrl}
                 disabled={busy}
+                required={provider === "custom"}
                 onChange={(e) => setBaseUrl(e.target.value)}
                 placeholder={
                   provider === "ollama"
                     ? "http://127.0.0.1:11434"
-                    : conn?.presets[provider]?.default_base_url || t.aiFieldBaseUrlOptional
+                    : provider === "custom"
+                      ? t.aiFieldBaseUrlRequiredPlaceholder
+                      : conn?.presets[provider]?.default_base_url || t.aiFieldBaseUrlOptional
                 }
                 className="field h-9 min-w-0 flex-1 bg-paper px-3 text-sm"
               />
@@ -671,16 +778,41 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
               {activeAgentProbes && (
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
                   <span className="font-medium text-ink">{t.aiRoleAgent}</span>
-                  <ProbeTag label={t.aiProbeVision} ok={activeAgentProbes.vision.ok} />
-                  <ProbeTag label={t.aiProbeTools} ok={activeAgentProbes.tools.ok} />
-                  <ProbeTag label={t.aiProbeJson} ok={activeAgentProbes.json_schema.ok} />
+                  <ProbeTag
+                    label={t.aiProbeVision}
+                    probe={activeAgentProbes.vision}
+                    fallbackUntested={fallbackProbesUntested}
+                    untestedLabel={t.aiProbeUntested}
+                  />
+                  <ProbeTag
+                    label={t.aiProbeTools}
+                    probe={activeAgentProbes.tools}
+                    fallbackUntested={fallbackProbesUntested}
+                    untestedLabel={t.aiProbeUntested}
+                  />
+                  <ProbeTag
+                    label={t.aiProbeJson}
+                    probe={activeAgentProbes.json_schema}
+                    fallbackUntested={fallbackProbesUntested}
+                    untestedLabel={t.aiProbeUntested}
+                  />
                 </div>
               )}
               {activeTriageProbes && (
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
                   <span className="font-medium text-ink">{t.aiRoleTriage}</span>
-                  <ProbeTag label={t.aiProbeVision} ok={activeTriageProbes.vision.ok} />
-                  <ProbeTag label={t.aiProbeJson} ok={activeTriageProbes.json_schema.ok} />
+                  <ProbeTag
+                    label={t.aiProbeVision}
+                    probe={activeTriageProbes.vision}
+                    fallbackUntested={fallbackProbesUntested}
+                    untestedLabel={t.aiProbeUntested}
+                  />
+                  <ProbeTag
+                    label={t.aiProbeJson}
+                    probe={activeTriageProbes.json_schema}
+                    fallbackUntested={fallbackProbesUntested}
+                    untestedLabel={t.aiProbeUntested}
+                  />
                 </div>
               )}
             </div>
@@ -710,8 +842,8 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
               </Button>
             </div>
 
-            {conn?.configured && (
-              <div className="flex items-center gap-1">
+            {conn?.configured && !confirmDeleteCred && (
+              <div className="flex items-center gap-3">
                 <Button
                   variant="ghost"
                   size="sm"
@@ -726,7 +858,7 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
                   icon={Trash}
                   disabled={busy || !conn.can_delete_credential}
                   title={!conn.can_delete_credential ? t.aiEnvDeleteDisabledHint : undefined}
-                  onClick={() => void handleDelete(true)}
+                  onClick={() => setConfirmDeleteCred(true)}
                   className={conn.can_delete_credential ? "text-reject-ink hover:text-reject" : ""}
                 >
                   {t.aiDeleteCredentialBtn}
@@ -734,6 +866,30 @@ export function AiConnectionBar({ open, onConnectionLoaded }: AiConnectionBarPro
               </div>
             )}
           </div>
+
+          {conn?.configured && confirmDeleteCred && (
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <span className="text-xs text-reject-ink">{t.aiDeleteCredentialConfirmText}</span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => setConfirmDeleteCred(false)}
+                >
+                  {t.aiDeleteCredentialCancelBtn}
+                </Button>
+                <Button
+                  variant="mark"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => void handleDelete(true)}
+                >
+                  {t.aiDeleteCredentialConfirmBtn}
+                </Button>
+              </div>
+            </div>
+          )}
 
           {conn?.configured && conn.credential_source === "env" && (
             <p className="text-xs text-ink-3">{t.aiEnvDeleteDisabledHint}</p>

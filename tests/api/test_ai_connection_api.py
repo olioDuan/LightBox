@@ -705,3 +705,112 @@ def test_settings_rejects_ai_and_mcp_routes_enforce_strict_safety(
     assert client.post("/api/ai/connection/test", json={}).status_code == 403
     assert client.delete("/api/ai/connection").status_code == 403
     assert client.post("/api/ai/mcp/snippet", json={"client": "codex"}).status_code == 403
+
+
+def test_dns_unreachable_probes_untested_validation_ollama_guard_and_claude_code_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import socket
+
+    # 1. DNS failure classifies as `service_unreachable` (NOT `network_timeout`) with raw_code=None (no `ModelError`)
+    dns_root = socket.gaierror(8, "nodename nor servname provided, or not known")
+    conn_exc = ConnectionError("Connection error.")
+    conn_exc.__cause__ = dns_root
+    wrapped_dns = ModelError("OpenAI-compatible request failed (m): Connection error.")
+    wrapped_dns.__cause__ = conn_exc
+
+    mapped_dns = classify_provider_error("custom", wrapped_dns)
+    assert mapped_dns.error_class == "service_unreachable"
+    assert mapped_dns.raw_code is None
+
+    # Timeout still classifies as `network_timeout` and never leaks Python class name
+    timeout_exc = ModelError("OpenAI-compatible request failed (m): Request timed out.")
+    timeout_exc.__cause__ = TimeoutError("timed out")
+    mapped_to = classify_provider_error("custom", timeout_exc)
+    assert mapped_to.error_class == "network_timeout"
+    assert mapped_to.raw_code is None
+
+    # 2. Unreachable probe aborts early and marks ALL agent & triage probes as `untested`
+    call_log: list[tuple[str, str]] = []
+    client, headers, _paths, _kr = _setup_client(
+        tmp_path,
+        monkeypatch,
+        probe_factory=lambda spec, _k: _ScriptedProbeAdapter(
+            spec,
+            vision_mode="raise",
+            error_to_raise=wrapped_dns,
+            call_log=call_log,
+        ),
+    )
+    r_unreach = client.post(
+        "/api/ai/connection/test",
+        json={
+            "provider": "custom",
+            "base_url": "https://nonexistent.invalid/v1",
+            "agent_model": "my-agent",
+            "triage_model": "my-triage",
+            "api_key": "sk-custom-9999",
+        },
+        headers=headers,
+    )
+    assert r_unreach.status_code == 200
+    d_unreach = r_unreach.json()
+    assert d_unreach["overall_ok"] is False
+    assert d_unreach["error_class"] == "service_unreachable"
+    assert d_unreach["error_code"] is None
+    assert d_unreach["agent_probes"]["vision"]["status"] == "untested"
+    assert d_unreach["agent_probes"]["tools"]["status"] == "untested"
+    assert d_unreach["agent_probes"]["json_schema"]["status"] == "untested"
+    assert d_unreach["triage_probes"]["vision"]["status"] == "untested"
+    assert d_unreach["triage_probes"]["json_schema"]["status"] == "untested"
+    assert call_log == [("my-agent", "vision")]
+
+    # 3. Custom provider without base_url returns structured `missing_base_url` error_class
+    r_no_base = client.put(
+        "/api/ai/connection",
+        json={"provider": "custom", "agent_model": "m1", "api_key": "sk-test-1234"},
+        headers=headers,
+    )
+    assert r_no_base.status_code == 400
+    assert r_no_base.json()["detail"]["error_class"] == "missing_base_url"
+
+    # 4. Unconfirmed Ollama cannot bypass `/api/tags` check via `is_local_free=True`
+    r_ollama_unconfirmed = client.put(
+        "/api/ai/connection",
+        json={
+            "provider": "ollama",
+            "base_url": "http://127.0.0.1:19999",
+            "agent_model": "qwen2.5vl:7b",
+            "triage_model": "qwen2.5vl:7b",
+            "is_local_free": True,
+        },
+        headers=headers,
+    )
+    assert r_ollama_unconfirmed.status_code == 200
+    assert r_ollama_unconfirmed.json()["is_local_free"] is False
+    assert r_ollama_unconfirmed.json()["cost_classification"] == "price_unknown"
+
+    # 5. Claude Code without ~/.claude.json, ~/.claude/, or `claude` binary reports `not_installed`
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: empty_home)
+    monkeypatch.setattr("lightbox.services.ai_connection.shutil.which", lambda _cmd: None)
+    r_mcp = client.get("/api/ai/mcp/clients")
+    assert r_mcp.status_code == 200
+    by_id = {c["client_id"]: c for c in r_mcp.json()["clients"]}
+    assert by_id["claude_code"]["status"] == "not_installed"
+    assert by_id["claude_desktop"]["status"] == "not_installed"
+    assert by_id["cursor"]["status"] == "not_installed"
+    assert by_id["codex"]["status"] == "not_installed"
+
+    # 6. Claude Code snippet quotes special shell characters with `shlex.quote`
+    monkeypatch.setattr(
+        "lightbox.services.ai_connection._resolve_mcp_launch_spec",
+        lambda: ("/opt/my uv/bin/uv", ["--directory", "/tmp/a$b'c d", "run", "lightbox", "mcp"]),
+    )
+    r_cc = client.post("/api/ai/mcp/snippet", json={"client": "claude_code"}, headers=headers)
+    assert r_cc.status_code == 200
+    snip = r_cc.json()["snippet"]
+    assert "'/opt/my uv/bin/uv'" in snip
+    assert "'/tmp/a$b'\"'\"'c d'" in snip

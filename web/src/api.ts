@@ -1,4 +1,5 @@
 import type { Lang } from "./i18n";
+import { waitForDesktopBridge } from "./desktop";
 
 export type Bucket = "red" | "yellow" | "normal" | "exempt";
 
@@ -599,6 +600,7 @@ export type CostClassification = "known_free" | "known_paid" | "price_unknown";
 
 export interface ProbeCheckResult {
   ok: boolean;
+  status?: "passed" | "failed" | "untested";
   error: string | null;
 }
 
@@ -788,6 +790,21 @@ export interface TriageEstimateResponse {
   unpriced_max_photos: number;
 }
 
+export interface JobStatusResponse {
+  job_id: string;
+  kind: string;
+  session_id: string;
+  status: string;
+  done: number;
+  total: number;
+  failed_count?: number;
+  reviewed_yellow?: number;
+  reviewed_bursts?: number;
+  spent_usd: number;
+  paused_reason: string | null;
+  heartbeat_at: number | null;
+}
+
 export interface TriageRunResponse {
   job_id: string;
   session_id: string;
@@ -886,6 +903,19 @@ export function photoFaceCropUrl(photoId: string, faceIdx: number, size = 160): 
 }
 
 export const api = {
+  async probeHealthz(): Promise<boolean> {
+    try {
+      const resp = await fetch("/healthz", {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  },
+
   async checkAuth(): Promise<{ authenticated: boolean; csrf_token: string } | null> {
     const resp = await fetch("/api/auth/me", { credentials: "same-origin" });
     if (resp.status === 401) {
@@ -951,10 +981,15 @@ export const api = {
       `/api/sessions/${encodeURIComponent(sessionId)}/bursts`,
     ),
 
-  pickFolder: () =>
-    apiFetch<{ path: string | null; canceled: boolean }>("/api/system/pick-folder", {
+  pickFolder: async (): Promise<{ path: string | null; canceled: boolean }> => {
+    const bridge = await waitForDesktopBridge();
+    if (bridge?.pick_folder) {
+      return bridge.pick_folder();
+    }
+    return apiFetch<{ path: string | null; canceled: boolean }>("/api/system/pick-folder", {
       method: "POST",
-    }),
+    });
+  },
 
   runDemoBootstrap: () =>
     apiFetch<ScanResponse & { demo_dir: string; generated_photos: number }>("/api/demo/bootstrap", {
@@ -967,6 +1002,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ folder_path: folderPath, wait }),
     }),
+
+  getJob: (jobId: string) =>
+    apiFetch<JobStatusResponse>(`/api/jobs/${encodeURIComponent(jobId)}`),
 
   pauseJob: (jobId: string) =>
     apiFetch<{ job_id: string; status: string }>(`/api/jobs/${encodeURIComponent(jobId)}/pause`, {

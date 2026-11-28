@@ -100,7 +100,12 @@ from lightbox.services.synth import (
     run_e1_evaluation,
     run_personal_eval,
 )
-from lightbox.services.system import DoctorCheckItem, DoctorReport, SystemService
+from lightbox.services.system import (
+    DoctorCheckItem,
+    DoctorReport,
+    InstallAppResult,
+    SystemService,
+)
 from lightbox.services.triage import (
     BurstTriageOutput,
     TriageEstimate,
@@ -156,6 +161,7 @@ __all__ = [
     "GroundTruthLabel",
     "HIGH_REJECT_RATIO_WARNING",
     "ImageSizeMode",
+    "InstallAppResult",
     "IssuedApprovalCode",
     "JobStatusSummary",
     "LightboxServices",

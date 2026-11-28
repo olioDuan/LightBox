@@ -6,8 +6,9 @@ import json
 import os
 import secrets
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -38,7 +39,7 @@ from lightbox.api.security import (
     SessionAuthState,
     set_session_cookie,
 )
-from lightbox.config import AIProviderName
+from lightbox.config import AIConfigValidationError, AIProviderName
 from lightbox.i18n import render_reasons
 from lightbox.paths import AppPaths, get_app_paths
 from lightbox.services import (
@@ -186,12 +187,14 @@ class SaveAIConnectionRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_paired_costs(self) -> SaveAIConnectionRequest:
         if (self.input_cost_per_mtok is None) != (self.output_cost_per_mtok is None):
-            raise ValueError(
-                "input_cost_per_mtok and output_cost_per_mtok must both be set or both omitted."
+            raise AIConfigValidationError(
+                "input_cost_per_mtok and output_cost_per_mtok must both be set or both omitted.",
+                error_class="invalid_pricing",
             )
         if (self.triage_input_cost_per_mtok is None) != (self.triage_output_cost_per_mtok is None):
-            raise ValueError(
-                "triage_input_cost_per_mtok and triage_output_cost_per_mtok must both be set or both omitted."
+            raise AIConfigValidationError(
+                "triage_input_cost_per_mtok and triage_output_cost_per_mtok must both be set or both omitted.",
+                error_class="invalid_pricing",
             )
         return self
 
@@ -347,6 +350,132 @@ def _get_svcs(request: Request) -> Iterator[LightboxServices]:
 SvcsDep = Annotated[LightboxServices, Depends(_get_svcs)]
 
 
+_LIVE_INSTANCE_WORKERS_LOCK = threading.Lock()
+_LIVE_INSTANCE_WORKERS: dict[str, int] = {}
+
+
+def get_live_worker_instance_ids() -> set[str]:
+    """Return `instance_id`s in the current process that still have live daemon worker threads."""
+    with _LIVE_INSTANCE_WORKERS_LOCK:
+        return {iid for iid, count in _LIVE_INSTANCE_WORKERS.items() if count > 0}
+
+
+class AppLifecycleController:
+    """Tracks in-flight synchronous file moves and cooperative daemon worker threads for safe shutdown."""
+
+    def __init__(self, event_bus: EventBus, *, instance_id: str = "") -> None:
+        self._event_bus = event_bus
+        self._instance_id = instance_id
+        self._lock = threading.Lock()
+        self._in_flight_file_ops = 0
+        self._workers: set[threading.Thread] = set()
+        self._file_ops_drained_callbacks: list[Callable[[], None]] = []
+        self.stop_event = threading.Event()
+
+    @property
+    def instance_id(self) -> str:
+        return self._instance_id
+
+    @property
+    def in_flight_file_ops(self) -> int:
+        with self._lock:
+            return self._in_flight_file_ops
+
+    def on_file_ops_drained(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked whenever `in_flight_file_ops` transitions down to 0."""
+        with self._lock:
+            self._file_ops_drained_callbacks.append(callback)
+
+    @contextmanager
+    def track_file_op(self) -> Iterator[None]:
+        with self._lock:
+            self._in_flight_file_ops += 1
+        try:
+            yield
+        finally:
+            callbacks: list[Callable[[], None]] = []
+            with self._lock:
+                prev = self._in_flight_file_ops
+                self._in_flight_file_ops = max(0, prev - 1)
+                if prev > 0 and self._in_flight_file_ops == 0:
+                    callbacks = list(self._file_ops_drained_callbacks)
+            for cb in callbacks:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+    def spawn_daemon_worker(
+        self,
+        *,
+        name: str,
+        target: Callable[[], None],
+    ) -> threading.Thread:
+        """Start and track a `daemon=True` background worker thread."""
+        holder: list[threading.Thread] = []
+        inst_id = self._instance_id
+
+        if inst_id:
+            with _LIVE_INSTANCE_WORKERS_LOCK:
+                _LIVE_INSTANCE_WORKERS[inst_id] = _LIVE_INSTANCE_WORKERS.get(inst_id, 0) + 1
+
+        def _wrapped() -> None:
+            try:
+                target()
+            finally:
+                with self._lock:
+                    if holder:
+                        self._workers.discard(holder[0])
+                if inst_id:
+                    with _LIVE_INSTANCE_WORKERS_LOCK:
+                        rem = _LIVE_INSTANCE_WORKERS.get(inst_id, 0) - 1
+                        if rem <= 0:
+                            _LIVE_INSTANCE_WORKERS.pop(inst_id, None)
+                        else:
+                            _LIVE_INSTANCE_WORKERS[inst_id] = rem
+
+        thread = threading.Thread(target=_wrapped, name=name, daemon=True)
+        holder.append(thread)
+        with self._lock:
+            self._workers.add(thread)
+        try:
+            thread.start()
+        except Exception:
+            with self._lock:
+                self._workers.discard(thread)
+            if inst_id:
+                with _LIVE_INSTANCE_WORKERS_LOCK:
+                    rem = _LIVE_INSTANCE_WORKERS.get(inst_id, 0) - 1
+                    if rem <= 0:
+                        _LIVE_INSTANCE_WORKERS.pop(inst_id, None)
+                    else:
+                        _LIVE_INSTANCE_WORKERS[inst_id] = rem
+            raise
+        return thread
+
+    def active_workers(self) -> list[threading.Thread]:
+        with self._lock:
+            alive = [t for t in self._workers if t.is_alive()]
+            self._workers.intersection_update(alive)
+            return alive
+
+    def request_shutdown(self, *, timeout_s: float = 8.0) -> bool:
+        """Signal cooperative stop to daemon workers, wait up to `timeout_s`, and close SSE event bus.
+
+        Returns True if all tracked daemon workers finished before the deadline; False on timeout.
+        """
+        self.stop_event.set()
+        deadline = time.monotonic() + max(0.05, timeout_s)
+        workers = self.active_workers()
+        for t in workers:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0.0:
+                break
+            t.join(timeout=remaining)
+        self._event_bus.close()
+        return all(not t.is_alive() for t in workers)
+
+
 def create_app(
     *,
     app_paths: AppPaths | None = None,
@@ -361,19 +490,25 @@ def create_app(
 ) -> FastAPI:
     """Create the local-only FastAPI app with DNS-rebinding, Cookie, CSRF, REST, and SSE."""
     resolved_paths = app_paths or get_app_paths()
-    # Migrate schema once at startup; per-request handles open lightweight WAL connections
-    with LightboxServices(app_paths=resolved_paths, migrate=True):
-        pass
+    resolved_instance_id = instance_id if instance_id is not None else secrets.token_hex(8)
+    # Migrate schema once at startup and heal orphaned jobs from dead/recycled owner processes,
+    # skipping any previous in-process instance that still has live daemon workers running.
+    with LightboxServices(app_paths=resolved_paths, migrate=True) as startup_svcs:
+        startup_svcs.system.reconcile_orphaned_jobs(
+            current_instance_id=resolved_instance_id,
+            live_instance_ids=get_live_worker_instance_ids(),
+        )
 
     auth = SessionAuthState(bootstrap_token=bootstrap_token)
     event_bus = EventBus()
-    resolved_instance_id = instance_id if instance_id is not None else secrets.token_hex(8)
+    lifecycle = AppLifecycleController(event_bus, instance_id=resolved_instance_id)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
+            lifecycle.stop_event.set()
             event_bus.close()
 
     app = FastAPI(
@@ -388,6 +523,7 @@ def create_app(
     app.state.port = port
     app.state.auth = auth
     app.state.event_bus = event_bus
+    app.state.lifecycle = lifecycle
     app.state.instance_id = resolved_instance_id
     app.state.model_router_factory = model_router_factory
     app.state.embedder_factory = embedder_factory
@@ -403,6 +539,7 @@ def create_app(
             "service": "lightbox",
             "pid": os.getpid(),
             "instance_id": resolved_instance_id,
+            "in_flight_file_ops": lifecycle.in_flight_file_ops,
         }
 
     # --- Auth Endpoints ---
@@ -455,6 +592,15 @@ def create_app(
 
     # --- AI Connection, Verifiable Probes, Ollama & Read-only MCP Clients ---
 
+    def _ai_validation_error_detail(exc: BaseException) -> dict[str, str]:
+        if isinstance(exc, EndpointBindingError):
+            return {"error_class": "endpoint_binding_mismatch", "message": str(exc)}
+        if isinstance(exc, MissingAPIKeyError):
+            return {"error_class": "missing_api_key", "message": str(exc)}
+        if isinstance(exc, AIConfigValidationError):
+            return {"error_class": exc.error_class, "message": str(exc)}
+        return {"error_class": "invalid_config", "message": str(exc)}
+
     @app.get("/api/ai/connection")
     def get_ai_connection(svcs: SvcsDep) -> dict[str, Any]:
         return svcs.system.get_ai_connection()
@@ -475,16 +621,11 @@ def create_app(
                 is_local_free=req.is_local_free,
                 adapter_factory=probe_adapter_factory,
             )
-        except EndpointBindingError as exc:
+        except (EndpointBindingError, MissingAPIKeyError, ValueError) as exc:
             raise HTTPException(
                 status_code=400,
-                detail={
-                    "error_class": "endpoint_binding_mismatch",
-                    "message": str(exc),
-                },
+                detail=_ai_validation_error_detail(exc),
             ) from None
-        except (MissingAPIKeyError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from None
 
     @app.put("/api/ai/connection")
     def put_ai_connection(
@@ -507,16 +648,11 @@ def create_app(
                 max_session_calls=body.max_session_calls,
                 max_triage_photos_unpriced=body.max_triage_photos_unpriced,
             )
-        except EndpointBindingError as exc:
+        except (EndpointBindingError, MissingAPIKeyError, ValueError) as exc:
             raise HTTPException(
                 status_code=400,
-                detail={
-                    "error_class": "endpoint_binding_mismatch",
-                    "message": str(exc),
-                },
+                detail=_ai_validation_error_detail(exc),
             ) from None
-        except (MissingAPIKeyError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from None
 
     @app.delete("/api/ai/connection")
     def delete_ai_connection_route(
@@ -535,7 +671,10 @@ def create_app(
                 lambda: svcs.system.discover_ollama_models(base_url=base_url)
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from None
+            raise HTTPException(
+                status_code=400,
+                detail=_ai_validation_error_detail(exc),
+            ) from None
 
     @app.get("/api/ai/mcp/clients")
     def list_mcp_clients(svcs: SvcsDep) -> dict[str, Any]:
@@ -603,6 +742,8 @@ def create_app(
                 sensitivity=body.sensitivity,
                 max_workers=body.max_workers,
                 enable_embed=body.enable_embed,
+                stop_event=lifecycle.stop_event,
+                owner_instance_id=resolved_instance_id,
                 on_progress=lambda stage, done, total: event_bus.publish(
                     "job.progress",
                     {"stage": stage, "done": done, "total": total},
@@ -640,7 +781,7 @@ def create_app(
                     bg_svcs.override_embedder(embedder_factory(bg_svcs))
                 _run_scan_with_events(bg_svcs)
 
-        threading.Thread(target=_bg, daemon=True).start()
+        lifecycle.spawn_daemon_worker(name="lightbox-bg-scan", target=_bg)
         return {"status": "queued", "folder_path": str(folder)}
 
     @app.get("/api/jobs/{job_id}")
@@ -656,6 +797,9 @@ def create_app(
             "status": st.status,
             "done": st.done,
             "total": st.total,
+            "failed_count": st.failed_count,
+            "reviewed_yellow": st.reviewed_yellow,
+            "reviewed_bursts": st.reviewed_bursts,
             "spent_usd": st.spent_usd,
             "paused_reason": st.paused_reason,
             "heartbeat_at": st.heartbeat_at,
@@ -1163,16 +1307,17 @@ def create_app(
         svcs: SvcsDep,
     ) -> dict[str, Any]:
         try:
-            res = await anyio.to_thread.run_sync(
-                lambda: svcs.people.export_groups(
-                    body.target_dir,
-                    session_id=body.session_id,
-                    group_keys=body.group_keys,
-                    include_unnamed=body.include_unnamed,
-                    include_no_face=body.include_no_face,
-                    lang=body.lang,
+            with lifecycle.track_file_op():
+                res = await anyio.to_thread.run_sync(
+                    lambda: svcs.people.export_groups(
+                        body.target_dir,
+                        session_id=body.session_id,
+                        group_keys=body.group_keys,
+                        include_unnamed=body.include_unnamed,
+                        include_no_face=body.include_no_face,
+                        lang=body.lang,
+                    )
                 )
-            )
         except PeopleError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         except SafeFSError as exc:
@@ -1299,6 +1444,7 @@ def create_app(
                 profile=req.profile,
                 session_budget_usd=req.budget_usd,
                 confirm_unpriced=req.confirm_unpriced,
+                owner_instance_id=resolved_instance_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
@@ -1317,6 +1463,8 @@ def create_app(
                 session_budget_usd=req.budget_usd,
                 job_id=job_id,
                 confirm_unpriced=req.confirm_unpriced,
+                stop_event=lifecycle.stop_event,
+                owner_instance_id=resolved_instance_id,
                 on_progress=lambda stage, done, total: event_bus.publish(
                     "job.progress",
                     {"job_id": job_id, "stage": stage, "done": done, "total": total},
@@ -1332,7 +1480,12 @@ def create_app(
                     "stage": "triage_vlm",
                     "done": res.reviewed_yellow + res.reviewed_bursts + res.failed_count,
                     "total": res.yellow_total + res.burst_total,
+                    "reviewed_yellow": res.reviewed_yellow,
+                    "reviewed_bursts": res.reviewed_bursts,
+                    "yellow_total": res.yellow_total,
+                    "burst_total": res.burst_total,
                     "failed_count": res.failed_count,
+                    "spent_usd": res.spent_usd,
                 },
                 session_id=session_id,
             )
@@ -1385,7 +1538,7 @@ def create_app(
                         session_id=session_id,
                     )
 
-        threading.Thread(target=_bg_triage, daemon=True).start()
+        lifecycle.spawn_daemon_worker(name=f"lightbox-bg-triage-{job_id}", target=_bg_triage)
         return {
             "job_id": job_id,
             "session_id": session_id,
@@ -1551,13 +1704,14 @@ def create_app(
             )
 
         try:
-            if plan.status in {"draft", "reviewed"}:
-                svcs.plan.approve_plan(plan_id, approved_by="web:user")
-            result = svcs.plan.apply_plan(
-                plan_id,
-                resume=(plan.status == "applying"),
-                compute_sha256=body.compute_sha256,
-            )
+            with lifecycle.track_file_op():
+                if plan.status in {"draft", "reviewed"}:
+                    svcs.plan.approve_plan(plan_id, approved_by="web:user")
+                result = svcs.plan.apply_plan(
+                    plan_id,
+                    resume=(plan.status == "applying"),
+                    compute_sha256=body.compute_sha256,
+                )
         except StalePlanError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except DestinationExistsError as exc:
@@ -1589,8 +1743,9 @@ def create_app(
     ) -> dict[str, Any]:
         req = body or RestorePlanRequest()
         try:
-            plan, _ = svcs.plan.get_plan(plan_id)
-            res = svcs.plan.restore_plan(plan_id, photo_ids=req.photo_ids)
+            with lifecycle.track_file_op():
+                plan, _ = svcs.plan.get_plan(plan_id)
+                res = svcs.plan.restore_plan(plan_id, photo_ids=req.photo_ids)
         except (PlanStateError, DestinationExistsError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except PlanError as exc:

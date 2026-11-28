@@ -211,6 +211,14 @@ class CacheConfig(BaseModel):
 AIProviderName = Literal["anthropic", "openai", "gemini", "ollama", "custom"]
 
 
+class AIConfigValidationError(ValueError):
+    """Typed AI connection configuration validation error carrying a stable `error_class`."""
+
+    def __init__(self, message: str, *, error_class: str) -> None:
+        super().__init__(message)
+        self.error_class = error_class
+
+
 class ActiveAIConfig(BaseModel):
     """Global `[ai]` connection configuration (never stores plaintext API keys)."""
 
@@ -232,12 +240,14 @@ class ActiveAIConfig(BaseModel):
     @model_validator(mode="after")
     def _validate_paired_costs(self) -> ActiveAIConfig:
         if (self.input_cost_per_mtok is None) != (self.output_cost_per_mtok is None):
-            raise ValueError(
-                "input_cost_per_mtok and output_cost_per_mtok must both be set or both omitted."
+            raise AIConfigValidationError(
+                "input_cost_per_mtok and output_cost_per_mtok must both be set or both omitted.",
+                error_class="invalid_pricing",
             )
         if (self.triage_input_cost_per_mtok is None) != (self.triage_output_cost_per_mtok is None):
-            raise ValueError(
-                "triage_input_cost_per_mtok and triage_output_cost_per_mtok must both be set or both omitted."
+            raise AIConfigValidationError(
+                "triage_input_cost_per_mtok and triage_output_cost_per_mtok must both be set or both omitted.",
+                error_class="invalid_pricing",
             )
         return self
 
@@ -329,6 +339,7 @@ def load_models_config(
 
 
 __all__ = [
+    "AIConfigValidationError",
     "AIProviderName",
     "ActiveAIConfig",
     "AppConfig",

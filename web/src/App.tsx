@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { AgentDrawer } from "./components/AgentDrawer";
 import { SettingsModal } from "./components/SettingsModal";
-import { Button, IconButton, Loading, Tabs, type TabItem } from "./components/ui";
+import { Button, IconButton, Loading, Notice, NoticeDock, Tabs, type TabItem } from "./components/ui";
+import { waitForDesktopBridge } from "./desktop";
 import { Settings, Sparkles } from "reicon-react";
 import { getMessages, I18nContext, type Lang } from "./i18n";
 import { InsightsView } from "./views/InsightsView";
@@ -56,6 +57,10 @@ export function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [agentOpen, setAgentOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [serverDisconnected, setServerDisconnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [closeBlockedNotice, setCloseBlockedNotice] = useState(false);
+  const healthFailuresRef = useRef(0);
 
   // Global ⌘K / Ctrl+K shortcut to toggle the built-in Agent side drawer
   useEffect(() => {
@@ -86,21 +91,110 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false;
-    void api
-      .checkAuth()
-      .then((res) => {
+    void (async () => {
+      try {
+        const res = await api.checkAuth();
         if (cancelled) return;
-        setAuthState(res ? "authed" : "needs_confirm");
-      })
-      .catch((err) => {
+        if (res) {
+          setAuthState("authed");
+          return;
+        }
+        // Only auto-establish session when running inside the pywebview desktop bridge
+        const bridge = await waitForDesktopBridge();
+        if (cancelled) return;
+        if (bridge !== null) {
+          await api.confirmLocalSession();
+          if (!cancelled) {
+            setAuthState("authed");
+          }
+          return;
+        }
+        setAuthState("needs_confirm");
+      } catch (err) {
         if (cancelled) return;
         setAuthError(err instanceof Error ? err.message : String(err));
         setAuthState("needs_confirm");
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
   }, []);
+
+  // Listen for desktop close-blocked notifications while file moves are in flight
+  useEffect(() => {
+    const onCloseBlocked = () => setCloseBlockedNotice(true);
+    window.addEventListener("lightbox:close-blocked", onCloseBlocked);
+    return () => window.removeEventListener("lightbox:close-blocked", onCloseBlocked);
+  }, []);
+
+  // Probe `/healthz`; only show disconnected banner after 3 consecutive failures
+  useEffect(() => {
+    if (authState !== "authed") return;
+    let cancelled = false;
+    let inFlight = false;
+
+    const checkHealth = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const ok = await api.probeHealthz();
+        if (cancelled) return;
+        if (ok) {
+          healthFailuresRef.current = 0;
+          setServerDisconnected(false);
+        } else {
+          healthFailuresRef.current += 1;
+          if (healthFailuresRef.current >= 3) {
+            setServerDisconnected(true);
+          }
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const timer = window.setInterval(() => {
+      void checkHealth();
+    }, 5000);
+    const onOnline = () => void checkHealth();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void checkHealth();
+      }
+    };
+    window.addEventListener("online", onOnline);
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener("online", onOnline);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [authState]);
+
+  async function handleReconnect() {
+    if (reconnecting) return;
+    setReconnecting(true);
+    try {
+      const bridge = await waitForDesktopBridge();
+      if (bridge?.reconnect) {
+        await bridge.reconnect();
+        return;
+      }
+      const ok = await api.probeHealthz();
+      if (ok) {
+        healthFailuresRef.current = 0;
+        setServerDisconnected(false);
+        window.location.reload();
+      }
+    } catch {
+      // keep disconnect banner visible so user can retry
+    } finally {
+      setReconnecting(false);
+    }
+  }
 
   const setLang = (next: Lang) => {
     setLangState(next);
@@ -210,6 +304,7 @@ export function App() {
             sessionId={route.sessionId}
             onBack={() => navigate("/")}
             onGoInsights={() => navigate("/insights?tab=trash")}
+            onOpenAgent={() => setAgentOpen(true)}
           />
         ) : route.name === "search" ? (
           <SearchView onOpenReview={(id) => navigate(`/sessions/${encodeURIComponent(id)}/review`)} />
@@ -238,6 +333,33 @@ export function App() {
               onClose={() => setSettingsOpen(false)}
             />
           </>
+        )}
+
+        {(serverDisconnected || closeBlockedNotice) && (
+          <NoticeDock bottom={24}>
+            {closeBlockedNotice && (
+              <Notice
+                tone="error"
+                onDismiss={() => setCloseBlockedNotice(false)}
+                dismissLabel={t.uiDismiss}
+              >
+                {t.desktopCloseBlockedToast}
+              </Notice>
+            )}
+            {serverDisconnected && (
+              <Notice
+                tone="error"
+                actions={[
+                  {
+                    label: reconnecting ? t.desktopReconnectingBtn : t.desktopReconnectBtn,
+                    onClick: () => void handleReconnect(),
+                  },
+                ]}
+              >
+                {t.desktopDisconnectedTitle}
+              </Notice>
+            )}
+          </NoticeDock>
         )}
       </div>
     </I18nContext.Provider>

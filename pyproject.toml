@@ -21,6 +21,7 @@ dependencies = [
     "opencv-python-headless>=5.1.0.95",
     "pillow>=11.0.0",
     "platformdirs>=4.3.0",
+    "psutil>=6.1.0",
     "pydantic>=2.10.0",
     "rawpy>=0.23.0",
     "sqlite-vec>=0.1.6",
@@ -34,9 +35,15 @@ dependencies = [
 heic = [
     "pillow-heif>=0.20.0",
 ]
+desktop = [
+    "pywebview>=5.3",
+]
 
 [project.scripts]
 lightbox = "lightbox.cli:main"
+
+[project.gui-scripts]
+lightbox-app = "lightbox.cli.desktop:main"
 
 [dependency-groups]
 dev = [
@@ -100,6 +107,8 @@ module = [
     "huggingface_hub.*",
     "tokenizers",
     "tokenizers.*",
+    "psutil",
+    "webview",
 ]
 ignore_missing_imports = true
 

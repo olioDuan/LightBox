@@ -6,6 +6,7 @@ import io
 import json
 import os
 import secrets
+import shlex
 import shutil
 import sys
 import time
@@ -22,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 from lightbox.config import (
     DEFAULT_CONFIG_TOML,
     ActiveAIConfig,
+    AIConfigValidationError,
     AIProviderName,
     AppConfig,
     ModelSpec,
@@ -303,6 +305,13 @@ _TRIAGE_ROLES: frozenset[str] = frozenset({"triage_vlm"})
 _ACCOUNT_WIDE_PERSISTENT_ERRORS: frozenset[str] = frozenset(
     {"auth_failed", "insufficient_balance", "endpoint_binding_mismatch"}
 )
+# Connectivity/auth/account/endpoint errors mean capability probes could not actually run against the model.
+_PROBE_ABORT_ERROR_CLASSES: frozenset[str] = (
+    PERSISTENT_ERROR_CLASSES | {"service_unreachable", "network_timeout", "rate_limited"}
+)
+_GLOBAL_PROBE_ABORT_ERROR_CLASSES: frozenset[str] = (
+    _ACCOUNT_WIDE_PERSISTENT_ERRORS | {"service_unreachable", "network_timeout", "rate_limited"}
+)
 
 
 def _derive_role_state_from_calls(
@@ -342,7 +351,7 @@ def _derive_role_state_from_calls(
             False,
             {
                 "error_class": err_cls,
-                "error_code": err_cls,
+                "error_code": None,
                 "message": f"Recent model call failed ({err_cls}).",
                 "occurred_at": latest_persistent.created_at,
                 "role": latest_persistent.role,
@@ -637,7 +646,10 @@ def _resolve_candidate_models(
     preset = AI_PROVIDER_PRESETS[provider]
     resolved_agent = (agent_model or "").strip() or str(preset["agent_model"])
     if not resolved_agent:
-        raise ValueError(f"agent_model is required for provider {provider!r}.")
+        raise AIConfigValidationError(
+            f"agent_model is required for provider {provider!r}.",
+            error_class="missing_model",
+        )
     resolved_triage = (triage_model or "").strip() or str(preset["triage_model"]) or resolved_agent
     return resolved_agent, resolved_triage
 
@@ -687,13 +699,15 @@ def save_ai_connection(
         )
 
     # Validate new ActiveAIConfig upfront (e.g. paired cost check) before writing secrets
+    # Ollama free status is strictly determined by backend `/api/tags` confirmation, never forced via is_local_free.
+    effective_local_free = bool(is_local_free) if provider == "custom" else False
     new_ai = ActiveAIConfig(
         provider=provider,
         agent_model=resolved_agent,
         triage_model=resolved_triage,
         base_url=stored_base_url,
         reviewer=reviewer,
-        is_local_free=is_local_free,
+        is_local_free=effective_local_free,
         input_cost_per_mtok=input_cost_per_mtok,
         output_cost_per_mtok=output_cost_per_mtok,
         triage_input_cost_per_mtok=triage_input_cost_per_mtok,
@@ -815,7 +829,10 @@ async def test_ai_connection(
 
     eff_provider = provider or (saved_ai.provider if saved_ai is not None else None)
     if eff_provider is None:
-        raise ValueError("No provider specified and no active [ai] connection configured.")
+        raise AIConfigValidationError(
+            "No provider specified and no active [ai] connection configured.",
+            error_class="invalid_config",
+        )
 
     eff_agent_raw = agent_model if agent_model is not None else (
         saved_ai.agent_model if saved_ai is not None and saved_ai.provider == eff_provider else None
@@ -832,9 +849,13 @@ async def test_ai_connection(
     )
     eff_base = (eff_base_raw or "").strip() or None
     eff_is_local_free = (
-        is_local_free
-        if is_local_free is not None
-        else (saved_ai.is_local_free if saved_ai is not None else False)
+        (
+            is_local_free
+            if is_local_free is not None
+            else (saved_ai.is_local_free if saved_ai is not None else False)
+        )
+        if eff_provider == "custom"
+        else False
     )
 
     # Validate endpoint & resolve secret (enforcing strict endpoint binding!)
@@ -896,46 +917,69 @@ async def test_ai_connection(
 
     first_exc: BaseException | None = None
     first_detail: str | None = None
+    global_abort = False
 
-    def _capture_err(detail: str | None, exc: BaseException | None) -> bool:
-        nonlocal first_exc, first_detail
+    def _capture_err(detail: str | None, exc: BaseException | None) -> tuple[bool, bool]:
+        """Return `(abort_model_probes, was_untested_transport_or_account_error)`."""
+        nonlocal first_exc, first_detail, global_abort
         if exc is not None and first_exc is None:
             first_exc = exc
         if detail and first_detail is None:
             first_detail = detail
         if exc is not None:
             mapped = classify_provider_error(eff_provider, exc)
-            return mapped.is_persistent
-        return False
+            if mapped.error_class in _GLOBAL_PROBE_ABORT_ERROR_CLASSES:
+                global_abort = True
+            if mapped.error_class in _PROBE_ABORT_ERROR_CLASSES:
+                return True, True
+        return False, False
+
+    def _probe_entry(ok: bool, err: str | None, *, untested: bool = False) -> dict[str, Any]:
+        if untested:
+            return {"ok": False, "status": "untested", "error": err}
+        return {"ok": ok, "status": "passed" if ok else "failed", "error": err}
 
     # 1. Agent model probes: Vision + Tools + JSON Schema
     a_vis_ok, a_vis_err, a_vis_exc = await _run_vision_probe(agent_adapter)
-    abort_agent = _capture_err(a_vis_err, a_vis_exc)
+    abort_agent, a_vis_untested = _capture_err(a_vis_err, a_vis_exc)
+    a_vis_entry = _probe_entry(a_vis_ok, a_vis_err, untested=a_vis_untested)
 
     if abort_agent:
-        a_tools_ok, a_tools_err = False, a_vis_err
-        a_json_ok, a_json_err = False, a_vis_err
+        a_tools_ok = False
+        a_json_ok = False
+        a_tools_entry = _probe_entry(False, None, untested=True)
+        a_json_entry = _probe_entry(False, None, untested=True)
     else:
         a_tools_ok, a_tools_err, a_tools_exc = await _run_tools_probe(agent_adapter)
-        abort_agent = _capture_err(a_tools_err, a_tools_exc)
+        abort_agent, a_tools_untested = _capture_err(a_tools_err, a_tools_exc)
+        a_tools_entry = _probe_entry(a_tools_ok, a_tools_err, untested=a_tools_untested)
         if abort_agent:
-            a_json_ok, a_json_err = False, a_tools_err
+            a_json_ok = False
+            a_json_entry = _probe_entry(False, None, untested=True)
         else:
             a_json_ok, a_json_err, a_json_exc = await _run_json_probe(agent_adapter)
-            _capture_err(a_json_err, a_json_exc)
+            _, a_json_untested = _capture_err(a_json_err, a_json_exc)
+            a_json_entry = _probe_entry(a_json_ok, a_json_err, untested=a_json_untested)
 
     agent_probes = {
-        "vision": {"ok": a_vis_ok, "error": a_vis_err},
-        "tools": {"ok": a_tools_ok, "error": a_tools_err},
-        "json_schema": {"ok": a_json_ok, "error": a_json_err},
+        "vision": a_vis_entry,
+        "tools": a_tools_entry,
+        "json_schema": a_json_entry,
     }
     agent_ready = a_vis_ok and a_tools_ok and a_json_ok
 
     # 2. Triage model probes: share results when model_id matches Agent model!
     shared_with_agent = eff_triage == eff_agent
     if shared_with_agent:
-        t_vis_ok, t_vis_err = a_vis_ok, a_vis_err
-        t_json_ok, t_json_err = a_json_ok, a_json_err
+        t_vis_ok = a_vis_ok
+        t_json_ok = a_json_ok
+        t_vis_entry = dict(a_vis_entry)
+        t_json_entry = dict(a_json_entry)
+    elif global_abort:
+        t_vis_ok = False
+        t_json_ok = False
+        t_vis_entry = _probe_entry(False, None, untested=True)
+        t_json_entry = _probe_entry(False, None, untested=True)
     else:
         triage_adapter = _build_probe_adapter(
             triage_spec,
@@ -943,16 +987,19 @@ async def test_ai_connection(
             adapter_factory=adapter_factory,
         )
         t_vis_ok, t_vis_err, t_vis_exc = await _run_vision_probe(triage_adapter)
-        abort_triage = _capture_err(t_vis_err, t_vis_exc)
+        abort_triage, t_vis_untested = _capture_err(t_vis_err, t_vis_exc)
+        t_vis_entry = _probe_entry(t_vis_ok, t_vis_err, untested=t_vis_untested)
         if abort_triage:
-            t_json_ok, t_json_err = False, t_vis_err
+            t_json_ok = False
+            t_json_entry = _probe_entry(False, None, untested=True)
         else:
             t_json_ok, t_json_err, t_json_exc = await _run_json_probe(triage_adapter)
-            _capture_err(t_json_err, t_json_exc)
+            _, t_json_untested = _capture_err(t_json_err, t_json_exc)
+            t_json_entry = _probe_entry(t_json_ok, t_json_err, untested=t_json_untested)
 
     triage_probes = {
-        "vision": {"ok": t_vis_ok, "error": t_vis_err},
-        "json_schema": {"ok": t_json_ok, "error": t_json_err},
+        "vision": t_vis_entry,
+        "json_schema": t_json_entry,
         "shared_with_agent": shared_with_agent,
     }
     triage_ready = t_vis_ok and t_json_ok
@@ -1208,7 +1255,13 @@ def detect_mcp_clients(
         parent_exists = cfg_path.parent.is_dir()
 
         if not config_exists:
-            status = "not_configured" if (parent_exists or cid == "claude_code") else "not_installed"
+            if cid == "claude_code":
+                installed = (cfg_path.parent / ".claude").is_dir() or (
+                    shutil.which("claude") is not None
+                )
+                status = "not_configured" if installed else "not_installed"
+            else:
+                status = "not_configured" if parent_exists else "not_installed"
             results.append(
                 {
                     "client_id": cid,
@@ -1313,7 +1366,7 @@ def generate_mcp_snippet(
     cfg_path = _mcp_client_config_path(client, home_dir=home_dir, platform_name=platform_name)
 
     if client == "claude_code":
-        quoted_parts = [json.dumps(p) if " " in p else p for p in [cmd, *args]]
+        quoted_parts = [shlex.quote(p) for p in [cmd, *args]]
         snippet = f"claude mcp add --scope user lightbox -- {' '.join(quoted_parts)}"
         return {
             "client_id": client,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -113,6 +114,9 @@ class JobStatusSummary:
     paused_reason: str | None
     heartbeat_at: float | None
     stage: str = "analyze"
+    failed_count: int = 0
+    reviewed_yellow: int = 0
+    reviewed_bursts: int = 0
 
 
 def _resolve_face_model_info(
@@ -257,6 +261,8 @@ class ScanService:
         worker_override: Any = None,
         enable_embed: bool = False,
         embedder: Embedder | None = None,
+        stop_event: threading.Event | None = None,
+        owner_instance_id: str | None = None,
     ) -> ScanResult:
         """Scan `folder_path` end-to-end with resumable caching, burst detection, and verdicts."""
         started = time.monotonic()
@@ -303,6 +309,7 @@ class ScanService:
             session_id=session_id,
             job_id=job_id,
             budget_usd=self.config.budget.session_budget_usd,
+            owner_instance_id=owner_instance_id,
         )
 
         # 2. Stage 1: Ingest directory & persist photos / assets / EXIF
@@ -556,6 +563,7 @@ class ScanService:
             max_workers=effective_workers,
             use_process_pool=use_pool,
             on_progress=on_progress,
+            stop_event=stop_event,
         )
 
         if stage_res.paused:
@@ -752,6 +760,9 @@ class ScanService:
             raise ValueError(f"Unknown job_id: {job_id}")
         items = self.repo.list_job_items(job_id)
         done = sum(1 for it in items if it.status == "done")
+        failed_count = sum(1 for it in items if it.status == "failed")
+        reviewed_yellow = sum(1 for it in items if it.stage == "triage_yellow" and it.status == "done")
+        reviewed_bursts = sum(1 for it in items if it.stage == "triage_burst" and it.status == "done")
         stage = "done" if job.status == "completed" else (items[0].stage if items else "queued")
         return JobStatusSummary(
             job_id=job.id,
@@ -764,6 +775,9 @@ class ScanService:
             paused_reason=job.paused_reason,
             heartbeat_at=job.heartbeat_at,
             stage=stage,
+            failed_count=failed_count,
+            reviewed_yellow=reviewed_yellow,
+            reviewed_bursts=reviewed_bursts,
         )
 
     def pause_job(self, job_id: str, *, reason: str = "user_paused") -> JobStatusSummary:
